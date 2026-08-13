@@ -1,0 +1,45 @@
+---
+import type { Article } from '../lib/articles';
+import { hrefFor, slugFor } from '../lib/articles';
+import { SERIES, type SeriesId } from '../lib/series';
+import { withBase } from '../lib/paths';
+
+interface Props {
+  articles: Article[];
+  activeSlug?: string;
+  series: SeriesId;
+}
+
+const { articles, activeSlug, series } = Astro.props;
+const meta = SERIES[series];
+---
+
+<div class="sticky top-24 w-64">
+  <div class="mb-4">
+    <a href={withBase(meta.href)} class="flex items-center gap-2 text-sm font-semibold text-gray-900 transition-colors hover:text-[#007aff] dark:text-white dark:hover:text-[#0a84ff]">
+      <span>{meta.title}</span>
+    </a>
+    <p class="mt-1 text-xs leading-relaxed text-gray-400 dark:text-gray-500">{articles.length} 篇文章</p>
+  </div>
+
+  <nav class="sidebar-scroll max-h-[calc(100vh-140px)] space-y-1 overflow-y-auto pr-2" aria-label={`${meta.title}文章目录`}>
+    {articles.map((article) => {
+      const slug = slugFor(article);
+      const active = slug === activeSlug;
+      return (
+        <a
+          href={withBase(hrefFor(article))}
+          class:list={[
+            'block rounded-lg px-3 py-2 text-sm leading-5 transition-all duration-200',
+            active
+              ? 'bg-gray-100 font-semibold text-gray-900 dark:bg-white/[0.08] dark:text-white'
+              : 'text-gray-500 hover:bg-gray-100/70 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-white/[0.06] dark:hover:text-white',
+          ]}
+        >
+          <span class="mr-2 font-mono text-xs text-gray-400">{String(article.data.order).padStart(2, '0')}</span>
+          {article.data.title}
+        </a>
+      );
+    })}
+  </nav>
+</div>

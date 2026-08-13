@@ -1,0 +1,99 @@
+---
+import Header from '../components/Header.astro';
+import Search from '../components/Search.astro';
+import CopyButton from '../components/CopyButton.astro';
+import '../styles/global.css';
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+
+const siteName = 'EE & Edge AI Guide';
+const { title = siteName, description = '从嵌入式系统到 CUDA/NPU 与端侧 AI 部署的系统化知识库。' } = Astro.props;
+const pageTitle = title === siteName ? title : `${title} | ${siteName}`;
+const canonicalURL = new URL(Astro.url.pathname, Astro.site);
+---
+
+<!doctype html>
+<html lang="zh-CN" class="scroll-smooth">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="description" content={description} />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="canonical" href={canonicalURL} />
+    <meta name="generator" content={Astro.generator} />
+    <meta name="theme-color" content="#007aff" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={canonicalURL} />
+    <meta property="og:title" content={pageTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content={siteName} />
+    <title>{pageTitle}</title>
+    <script is:inline>
+      if (
+        localStorage.getItem('color-theme') === 'dark' ||
+        (!('color-theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)
+      ) {
+        document.documentElement.classList.add('dark');
+      } else {
+        document.documentElement.classList.remove('dark');
+      }
+    </script>
+  </head>
+  <body class="flex min-h-screen flex-col bg-[#fafafa] font-sans text-gray-900 transition-colors duration-300 dark:bg-[#0a0a0a] dark:text-gray-100">
+    <a href="#main-content" class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[100] focus:rounded-lg focus:bg-[#007aff] focus:px-4 focus:py-2 focus:text-sm focus:font-medium focus:text-white">
+      跳到主要内容
+    </a>
+
+    <Header />
+    <div id="reading-progress" class="fixed left-0 top-0 z-[60] h-[2px] bg-gradient-to-r from-[#007aff] via-[#5856D6] to-[#AF52DE] transition-all duration-150" style="width: 0%"></div>
+
+    <main id="main-content" class="flex-1 pt-16">
+      <slot />
+    </main>
+
+    <footer class="mt-auto border-t border-gray-200/60 bg-white/50 py-8 transition-colors duration-300 dark:border-white/[0.06] dark:bg-white/[0.02]">
+      <div class="mx-auto flex max-w-7xl flex-col items-center justify-between gap-4 px-6 md:flex-row">
+        <p class="text-xs text-gray-400 dark:text-gray-500">&copy; {new Date().getFullYear()} EE & Edge AI Guide. Built for systematic learning.</p>
+        <div class="flex items-center gap-4">
+          <a href="https://github.com" target="_blank" rel="noopener noreferrer" class="text-xs text-gray-400 transition-colors hover:text-[#007aff] dark:text-gray-500">GitHub</a>
+          <a href="#main-content" class="text-xs text-gray-400 transition-colors hover:text-[#007aff] dark:text-gray-500">Top</a>
+        </div>
+      </div>
+    </footer>
+
+    <button id="back-to-top" class="fixed bottom-8 right-8 z-50 flex h-11 w-11 items-center justify-center rounded-full bg-[#007aff] text-white opacity-0 shadow-lg transition-all duration-300 hover:bg-[#0062cc] pointer-events-none" aria-label="回到顶部">
+      <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M5 10l7-7m0 0l7 7m-7-7v18" />
+      </svg>
+    </button>
+
+    <Search />
+    <CopyButton />
+
+    <script>
+      const progressBar = document.getElementById('reading-progress');
+      const backToTopBtn = document.getElementById('back-to-top');
+      const header = document.getElementById('site-header');
+
+      window.addEventListener('scroll', () => {
+        const winScroll = document.body.scrollTop || document.documentElement.scrollTop;
+        const height = document.documentElement.scrollHeight - document.documentElement.clientHeight;
+        const scrolled = height > 0 ? (winScroll / height) * 100 : 0;
+        if (progressBar) progressBar.style.width = scrolled + '%';
+
+        if (header) header.classList.toggle('is-scrolled', winScroll > 20);
+        if (backToTopBtn) {
+          backToTopBtn.classList.toggle('opacity-100', winScroll > 500);
+          backToTopBtn.classList.toggle('pointer-events-auto', winScroll > 500);
+          backToTopBtn.classList.toggle('opacity-0', winScroll <= 500);
+          backToTopBtn.classList.toggle('pointer-events-none', winScroll <= 500);
+        }
+      });
+
+      backToTopBtn?.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+    </script>
+  </body>
+</html>

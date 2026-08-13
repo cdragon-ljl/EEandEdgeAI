@@ -1,0 +1,106 @@
+---
+import { withBase } from '../lib/paths';
+---
+
+<div id="search-modal" class="fixed inset-0 z-[100] hidden items-start justify-center bg-gray-900/50 px-4 pb-10 pt-20 backdrop-blur-sm">
+  <div class="relative flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl ring-1 ring-black/5 dark:bg-gray-900">
+    <div class="flex items-center justify-between border-b border-gray-100 p-4 dark:border-white/10">
+      <h2 class="text-lg font-semibold text-gray-900 dark:text-white">搜索</h2>
+      <button id="close-search" type="button" class="rounded-md p-1 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-gray-200" aria-label="关闭搜索">
+        <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" />
+        </svg>
+      </button>
+    </div>
+    <div class="overflow-y-auto p-6">
+      <div id="search" class="w-full" data-pagefind-root={withBase('/pagefind/')}></div>
+      <p id="search-fallback" class="hidden text-sm text-gray-500 dark:text-gray-400">生产构建后会生成全文搜索索引。</p>
+    </div>
+  </div>
+</div>
+
+<script>
+  let initialized = false;
+  let loading = false;
+  const modal = document.getElementById('search-modal');
+  const closeButton = document.getElementById('close-search');
+  const fallback = document.getElementById('search-fallback');
+
+  function focusSearch() {
+    window.setTimeout(() => {
+      const input = document.querySelector('.pagefind-ui__search-input');
+      if (input instanceof HTMLInputElement) input.focus();
+    }, 100);
+  }
+
+  function initPagefind() {
+    if (initialized || !('PagefindUI' in window)) return;
+    // @ts-expect-error Pagefind injects a global constructor.
+    new window.PagefindUI({
+      element: '#search',
+      showSubResults: true,
+      showImages: false,
+      resetStyles: false,
+      baseUrl: import.meta.env.BASE_URL === '/' ? '/' : `${import.meta.env.BASE_URL}/`,
+      pageSize: 6,
+      translations: {
+        placeholder: '搜索文档...',
+        clear_search: '清除',
+        load_more: '加载更多结果',
+        search_label: '搜索此站点',
+        filters_label: '过滤',
+        zero_results: '没有找到关于 [SEARCH_TERM] 的结果',
+        many_results: '[COUNT] 个关于 [SEARCH_TERM] 的结果',
+        one_result: '1 个关于 [SEARCH_TERM] 的结果',
+        searching: '正在搜索 [SEARCH_TERM]...',
+      },
+    });
+    initialized = true;
+    focusSearch();
+  }
+
+  function loadPagefind() {
+    if (initialized) {
+      focusSearch();
+      return;
+    }
+    if (loading) return;
+    loading = true;
+    const script = document.createElement('script');
+    const basePath = import.meta.env.BASE_URL === '/' ? '' : import.meta.env.BASE_URL;
+    script.src = `${basePath}/pagefind/pagefind-ui.js`;
+    script.onload = initPagefind;
+    script.onerror = () => {
+      fallback?.classList.remove('hidden');
+      loading = false;
+    };
+    document.head.appendChild(script);
+  }
+
+  function openSearch() {
+    modal?.classList.remove('hidden');
+    modal?.classList.add('flex');
+    document.body.style.overflow = 'hidden';
+    loadPagefind();
+  }
+
+  function closeSearch() {
+    modal?.classList.add('hidden');
+    modal?.classList.remove('flex');
+    document.body.style.overflow = '';
+  }
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'k' && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      openSearch();
+    }
+    if (event.key === 'Escape') closeSearch();
+  });
+
+  closeButton?.addEventListener('click', closeSearch);
+  modal?.addEventListener('click', (event) => {
+    if (event.target === modal) closeSearch();
+  });
+  document.addEventListener('open-search', openSearch);
+</script>

@@ -1,0 +1,45 @@
+---
+import type { Article } from '../lib/articles';
+import { hrefFor } from '../lib/articles';
+import { withBase } from '../lib/paths';
+
+interface Props {
+  previous?: Article;
+  next?: Article;
+}
+
+const { previous, next } = Astro.props;
+---
+
+<nav class="mt-16 grid grid-cols-2 gap-4 border-t border-gray-200 pt-8 dark:border-white/[0.06]" aria-label="上一篇和下一篇">
+  {previous ? (
+    <a href={withBase(hrefFor(previous))} class="group cursor-pointer rounded-xl border border-gray-200 p-5 transition-all duration-300 hover:border-gray-300 hover:shadow-lg dark:border-white/[0.06] dark:hover:border-white/[0.12]">
+      <span class="mb-2 flex items-center gap-1.5 text-xs text-gray-400 dark:text-gray-500">
+        <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 19.5 3 12m0 0 7.5-7.5M3 12h18" />
+        </svg>
+        上一篇
+      </span>
+      <span class="text-sm font-medium text-gray-900 transition-colors duration-200 group-hover:text-[#007aff] dark:text-white dark:group-hover:text-[#0a84ff]">
+        {previous.data.title}
+      </span>
+    </a>
+  ) : (
+    <div></div>
+  )}
+  {next ? (
+    <a href={withBase(hrefFor(next))} class="group cursor-pointer rounded-xl border border-gray-200 p-5 text-right transition-all duration-300 hover:border-gray-300 hover:shadow-lg dark:border-white/[0.06] dark:hover:border-white/[0.12]">
+      <span class="mb-2 flex items-center justify-end gap-1.5 text-xs text-gray-400 dark:text-gray-500">
+        下一篇
+        <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M13.5 4.5 21 12m0 0-7.5 7.5M21 12H3" />
+        </svg>
+      </span>
+      <span class="text-sm font-medium text-gray-900 transition-colors duration-200 group-hover:text-[#007aff] dark:text-white dark:group-hover:text-[#0a84ff]">
+        {next.data.title}
+      </span>
+    </a>
+  ) : (
+    <div></div>
+  )}
+</nav>

@@ -1,0 +1,37 @@
+---
+import { getCollection, render } from 'astro:content';
+import ArticleLayout from '../../layouts/ArticleLayout.astro';
+import { bySeries, isSeriesId, slugFor } from '../../lib/articles';
+
+export async function getStaticPaths() {
+  const articles = await getCollection('articles', ({ data }) => !data.draft);
+
+  return articles.map((article) => ({
+    params: {
+      series: article.data.series,
+      slug: slugFor(article),
+    },
+    props: {
+      article,
+    },
+  }));
+}
+
+const { article } = Astro.props;
+const allArticles = await getCollection('articles', ({ data }) => !data.draft);
+const series = article.data.series;
+
+if (!isSeriesId(series)) {
+  return Astro.redirect('/');
+}
+
+const articles = bySeries(allArticles, series);
+const currentIndex = articles.findIndex((item) => item.id === article.id);
+const previous = currentIndex > 0 ? articles[currentIndex - 1] : undefined;
+const next = currentIndex >= 0 && currentIndex < articles.length - 1 ? articles[currentIndex + 1] : undefined;
+const { Content, headings } = await render(article);
+---
+
+<ArticleLayout article={article} articles={articles} headings={headings} previous={previous} next={next}>
+  <Content />
+</ArticleLayout>

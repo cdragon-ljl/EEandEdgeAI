@@ -1,0 +1,22 @@
+<button
+  type="button"
+  class="rounded-lg p-2 text-gray-500 transition-colors duration-200 hover:bg-gray-100/70 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-white/[0.06] dark:hover:text-white"
+  aria-label="切换深浅色模式"
+  data-theme-toggle
+>
+  <svg class="h-5 w-5 dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+    <path stroke-linecap="round" stroke-linejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.36 6.36-.7-.7M6.34 6.34l-.7-.7m12.02 0-.7.7M6.34 17.66l-.7.7M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8z" />
+  </svg>
+  <svg class="hidden h-5 w-5 dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+    <path stroke-linecap="round" stroke-linejoin="round" d="M20.9 13.5A8.5 8.5 0 1 1 10.5 3.1a7 7 0 0 0 10.4 10.4z" />
+  </svg>
+</button>
+
+<script>
+  document.querySelector('[data-theme-toggle]')?.addEventListener('click', () => {
+    const root = document.documentElement;
+    const nextTheme = root.classList.contains('dark') ? 'light' : 'dark';
+    root.classList.toggle('dark', nextTheme === 'dark');
+    localStorage.setItem('color-theme', nextTheme);
+  });
+</script>

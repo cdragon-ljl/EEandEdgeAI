@@ -1,0 +1,13 @@
+---
+import SiteLayout from '../layouts/SiteLayout.astro';
+import { withBase } from '../lib/paths';
+---
+
+<SiteLayout title="页面未找到" description="没有找到对应的文章页面。">
+  <main class="relative mx-auto flex min-h-[60vh] max-w-2xl flex-col items-start justify-center px-6 py-20">
+    <p class="text-xs font-semibold uppercase tracking-[0.18em] text-[#007aff] dark:text-[#0a84ff]">404</p>
+    <h1 class="mt-3 text-4xl font-bold text-gray-900 dark:text-white">页面未找到</h1>
+    <p class="mt-4 text-base leading-8 text-gray-500 dark:text-gray-400">这个地址下没有可阅读的文章，回到首页可以重新进入三个系列。</p>
+    <a href={withBase('/')} class="mt-6 rounded-xl bg-gray-900 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-gray-800 dark:bg-white dark:text-gray-900 dark:hover:bg-gray-100">返回首页</a>
+  </main>
+</SiteLayout>

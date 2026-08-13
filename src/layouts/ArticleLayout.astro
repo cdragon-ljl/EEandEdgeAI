@@ -1,0 +1,87 @@
+---
+import type { MarkdownHeading } from 'astro';
+import type { Article } from '../lib/articles';
+import { slugFor } from '../lib/articles';
+import { SERIES } from '../lib/series';
+import SiteLayout from './SiteLayout.astro';
+import SeriesSidebar from '../components/SeriesSidebar.astro';
+import TableOfContents from '../components/TableOfContents.astro';
+import ArticlePager from '../components/ArticlePager.astro';
+
+interface Props {
+  article: Article;
+  articles: Article[];
+  headings: MarkdownHeading[];
+  previous?: Article;
+  next?: Article;
+}
+
+const { article, articles, headings, previous, next } = Astro.props;
+const meta = SERIES[article.data.series];
+const activeSlug = slugFor(article);
+---
+
+<SiteLayout title={article.data.title} description={article.data.description}>
+  <div class="mx-auto flex max-w-[1500px] gap-10 px-6 py-12">
+    <aside class="hidden lg:block">
+      <SeriesSidebar articles={articles} activeSlug={activeSlug} series={article.data.series} />
+    </aside>
+
+    <article class="min-w-0 flex-1" data-pagefind-body>
+      <header class="mb-10 border-b border-gray-200 pb-8 dark:border-white/[0.06]">
+        <div class="mb-5 flex items-center gap-3">
+          <span class="inline-flex items-center gap-1.5 rounded-md bg-gray-100 px-3 py-1 text-xs font-medium text-gray-600 dark:bg-white/[0.06] dark:text-gray-400">
+            {meta.title}
+          </span>
+          <span class="text-xs text-gray-400 dark:text-gray-500">
+            <time datetime={article.data.pubDate.toISOString()}>
+              {article.data.pubDate.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' })}
+            </time>
+          </span>
+        </div>
+
+        <h1 class="mb-4 text-3xl font-bold leading-tight text-gray-900 dark:text-white md:text-4xl">
+          {article.data.title}
+        </h1>
+        <p class="text-lg leading-relaxed text-gray-500 dark:text-gray-400">
+          {article.data.description}
+        </p>
+
+        {article.data.tags.length > 0 && (
+          <div class="mt-5 flex flex-wrap gap-2">
+            {article.data.tags.map((tag) => (
+              <span class="rounded-md border border-gray-200 bg-gray-50 px-2.5 py-0.5 text-xs font-medium text-gray-500 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-gray-400">
+                {tag}
+              </span>
+            ))}
+          </div>
+        )}
+      </header>
+
+      <div
+        class="prose prose-gray max-w-none dark:prose-invert
+          prose-headings:font-bold prose-headings:text-gray-900 dark:prose-headings:text-white
+          prose-h2:mt-8 prose-h2:border-b prose-h2:border-gray-100 prose-h2:pb-3 prose-h2:text-2xl dark:prose-h2:border-white/[0.06]
+          prose-h3:mt-6 prose-h3:text-xl
+          prose-p:leading-[1.72] prose-p:text-gray-600 dark:prose-p:text-gray-300
+          prose-li:text-gray-600 dark:prose-li:text-gray-300
+          prose-a:font-medium prose-a:text-[#007aff] prose-a:no-underline hover:prose-a:underline dark:prose-a:text-[#0a84ff]
+          prose-strong:text-gray-900 dark:prose-strong:text-white
+          prose-hr:border-gray-100 dark:prose-hr:border-white/[0.06]
+          prose-blockquote:not-italic prose-blockquote:rounded-r-lg prose-blockquote:border-l-[#007aff] prose-blockquote:bg-blue-50/50 prose-blockquote:py-1 dark:prose-blockquote:bg-blue-900/10
+          prose-code:rounded-md prose-code:bg-blue-50 prose-code:px-1.5 prose-code:py-0.5 prose-code:text-[0.875em] prose-code:font-normal prose-code:text-[#007aff] prose-code:before:content-none prose-code:after:content-none dark:prose-code:bg-blue-900/20 dark:prose-code:text-[#0a84ff]
+          prose-img:rounded-xl prose-img:border prose-img:border-gray-200 prose-img:shadow-sm dark:prose-img:border-white/[0.08]
+          prose-pre:!m-0 prose-pre:!rounded-none prose-pre:!p-0
+          prose-table:text-sm prose-th:bg-gray-50 prose-th:px-4 prose-th:py-2.5 prose-td:px-4 prose-td:py-2.5 dark:prose-th:bg-white/[0.04]"
+      >
+        <slot />
+      </div>
+
+      <ArticlePager previous={previous} next={next} />
+    </article>
+
+    <aside class="hidden xl:block">
+      <TableOfContents headings={headings} />
+    </aside>
+  </div>
+</SiteLayout>

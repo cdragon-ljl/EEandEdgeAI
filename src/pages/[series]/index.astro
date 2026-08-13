@@ -1,0 +1,51 @@
+---
+import { getCollection } from 'astro:content';
+import SiteLayout from '../../layouts/SiteLayout.astro';
+import ArticleCard from '../../components/ArticleCard.astro';
+import SeriesSidebar from '../../components/SeriesSidebar.astro';
+import { bySeries } from '../../lib/articles';
+import { SERIES, SERIES_ORDER, type SeriesId } from '../../lib/series';
+
+export function getStaticPaths() {
+  return SERIES_ORDER.map((series) => ({ params: { series }, props: { series } }));
+}
+
+interface Props {
+  series: SeriesId;
+}
+
+const { series } = Astro.props;
+const meta = SERIES[series];
+const allArticles = await getCollection('articles', ({ data }) => !data.draft);
+const articles = bySeries(allArticles, series);
+---
+
+<SiteLayout title={meta.title} description={meta.description}>
+  <section class="relative overflow-hidden border-b border-gray-100 py-16 dark:border-white/[0.04]">
+    <div class="pointer-events-none absolute inset-0">
+      <div class="home-bg-grid absolute inset-0"></div>
+      <div class="absolute left-1/3 top-0 h-[360px] w-[360px] rounded-full bg-blue-500/[0.07] blur-[110px] dark:bg-blue-500/[0.12]"></div>
+      <div class="absolute bottom-0 left-0 right-0 h-24 bg-gradient-to-t from-[#fafafa] to-transparent dark:from-[#0a0a0a]"></div>
+    </div>
+    <div class="relative z-10 mx-auto max-w-5xl px-6 text-center">
+      <p class="mb-4 inline-flex rounded-full border border-gray-200 bg-white/80 px-4 py-1.5 text-sm text-gray-600 backdrop-blur-sm dark:border-white/10 dark:bg-white/5 dark:text-gray-400">
+        {meta.label}
+      </p>
+      <h1 class="mb-4 text-4xl font-bold tracking-tight text-gray-900 dark:text-white md:text-5xl">
+        {meta.title}
+      </h1>
+      <p class="mx-auto max-w-2xl text-base leading-8 text-gray-500 dark:text-gray-400">
+        {meta.description}
+      </p>
+    </div>
+  </section>
+
+  <main class="mx-auto grid max-w-[1320px] gap-8 px-6 py-12 lg:grid-cols-[260px_minmax(0,1fr)]">
+    <aside class="hidden lg:block">
+      <SeriesSidebar articles={articles} series={series} />
+    </aside>
+    <section class="grid gap-5 md:grid-cols-2">
+      {articles.map((article) => <ArticleCard article={article} />)}
+    </section>
+  </main>
+</SiteLayout>
