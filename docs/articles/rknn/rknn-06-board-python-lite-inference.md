@@ -1,211 +1,269 @@
 ---
-title: "板端 Python 推理：rknn-toolkit-lite 快速验证"
-description: "系列：RKNN 端侧部署实战：基于 RV1126 的模型转换与部署"
+title: "RKNN 端侧部署实战 · 第6期：板端 Python 推理：rknn-toolkit-lite 三行跑模型"
+description: "使用 rknn-toolkit-lite 在 RV1126 板端快速验证 .rknn 模型，适合调试和原型验证。"
 pubDate: "2026-08-09"
 series: "rknn"
 order: 6
-tags: ["RKNN", "RKNN 端侧 AI 部署"]
+tags: ["RKNN", "Python", "rknn-toolkit-lite", "板端推理"]
 draft: false
 ---
+
 > 系列：RKNN 端侧部署实战：基于 RV1126 的模型转换与部署
-> 前置：已完成 INT8 量化模型 + 板端 C 五步流程理解
-> 配套硬件：RV1126 开发板
+> 前置：已有一代工具链转出的 .rknn 模型
+> 场景：快速验证模型效果、写原型脚本、调试数据流
 
-## 0. 本节目标
+## 0. 本期目标
 
-上节用 C 实现了板端推理。但 C 版本适合**量产代码**，不适合**快速验证**——换个模型要重编译、调试输出要自己写。板端 Python 推理用 `rknn-toolkit-lite`，模型加载、推理、结果打印全在解释器里，是原型开发的利器。
+上一期我们用 C 语言写了完整的五步 API，那是生产级路线。但日常开发中，**验证一个模型在板子上跑出来的效果**，用 C 太重：编译、拷贝、部署，改一行参数就要重来一遍。
 
-本节完成：
+板端 Python 推理（`rknn-toolkit-lite`）把 C 的五个 API 封装成三个方法，让你**在板子上直接跑 Python 脚本推理**：
 
-1. 板端安装 `rknn-toolkit-lite`（与 PC 端 `rknn-toolkit` 区别要分清）；
-2. 用 Python 三行核心 API 跑通分类；
-3. 用真实摄像头/图片做快速模型验证（同一个 `.rknn`，C/Python 结果一致）。
-
-## 1. rknn-toolkit-lite 是什么
-
-**定义 1（rknn-toolkit-lite）**：运行在**板端**的 Python 推理库，基于 `librknnmrt.so` 封装。它**只做推理，不做转换**——模型必须在 PC 上先用完整版 rknn-toolkit 转好。
-
-| 项目 | PC 端 rknn-toolkit | 板端 rknn-toolkit-lite |
-|:---|:---|:---|
-| 运行位置 | x86_64 PC | RV1126 板子 |
-| 版本 | 1.7.x | 1.7.x（与 PC 端配套） |
-| 类名 | `RKNN` | `RKNNLite` |
-| 功能 | 转换 + 量化 + 模拟推理 | **仅推理** |
-| 底层 | 模拟器 | `librknnmrt.so`（真实 NPU） |
-| 依赖 | 一堆转换库（onnx/tf 等） | 轻量，适合板端 |
-
-**装错就乱套**：PC 上不能装 lite（没有转换功能），板子上不建议装完整版（依赖太重）。记住：**转换在 PC，推理在板；完整版转换，lite 推理**。
-
-【图1：PC 转换 → 板端 lite 推理的数据流】
-
-```text
-PC (rknn-toolkit)                      RV1126 板子 (rknn-toolkit-lite)
-┌───────────────────┐                  ┌──────────────────────────┐
-│ model.onnx        │                  │ RKNNLite()               │
-│   │ convert       │  拷贝 .rknn      │   ├─ load_rknn()         │
-│   ▼               │ ──────────────▶ │   ├─ init_runtime()       │
-│ model.rknn        │                  │   ├─ inference(inputs)    │
-└───────────────────┘                  │   └─ release()            │
-                                       └──────────────────────────┘
+```python
+rknn_lite.load_rknn("model.rknn")   # 1. 加载模型
+rknn_lite.init_runtime()            # 2. 初始化运行时
+outputs = rknn_lite.inference([img])  # 3. 推理
 ```
 
-> 图1 生图 prompt：左右两栏流程图，白色背景。左栏蓝色标题"PC：rknn-toolkit"：model.onnx 经过 convert 变成 model.rknn；中间箭头标注"拷贝 .rknn 到板子"；右栏绿色标题"RV1126：rknn-toolkit-lite"：列出 RKNNLite()、load_rknn()、init_runtime()、inference()、release() 五个步骤。扁平插画风，比例 16:9，中文标注。
+本期完成三件事：
 
-## 2. 板端安装
+1. 搞清楚 `rknn-toolkit-lite` 和 PC 端 `rknn-toolkit` 的关系；
+2. 在板子上装好 Python 推理环境，跑通 MobileNetV2；
+3. 对比 C 版与 Python 版，理解什么时候该用哪个。
 
-### 2.1 安装
+## 1. 三个"rknn"到底谁是谁
 
-在**板子**上执行（RV1126 的 Linux SDK 通常自带 Python 3，若没有先 `opkg install python3 python3-pip`）：
+RKNN 生态里有三样名字很像的东西，先彻底分清：
+
+| 名字 | 运行位置 | 干什么 | 对应你的用法 |
+|:---|:---|:---|:---|
+| **rknn-toolkit**（完整版） | PC（x86） | 模型转换、量化、PC 模拟推理 | `RKNN()`，你在 PC 上转换时用的 |
+| **rknn-toolkit-lite** | 板子（ARM） | 板端 Python 推理 | `RKNNLite()`，本期主角 |
+| **librknnmrt.so** | 板子（ARM） | C 推理运行时库 | C 程序链接它；lite 底层也是它 |
+
+一句话：**`rknn-toolkit-lite` 是 `librknnmrt.so` 的 Python 封装**，专门为板子设计。
+
+```mermaid
+flowchart LR
+    subgraph PC["PC 端（x86）"]
+        TK["rknn-toolkit 完整版<br/>转换 + 量化 + 模拟"]
+        M["model.onnx"] --> TK --> RK["model_int8.rknn"]
+    end
+    subgraph BOARD["板端（ARM）"]
+        PY["rknn-toolkit-lite<br/>RKNNLite（Python）"]
+        C["librknnmrt.so<br/>rknn_api（C）"]
+        N["NPU"]
+    end
+    RK -->|"拷贝 .rknn"| PY
+    RK -->|"拷贝 .rknn"| C
+    PY -->|"底层调用"| N
+    C -->|"底层调用"| N
+
+    style PC fill:#e0f2fe
+    style BOARD fill:#d1fae5
+    style N fill:#fef3c7
+```
+
+> ⚠️ **版本红线**：RV1126 是第一代 NPU 平台，配套的是 **rknn-toolkit 1.7.x 与 rknn-toolkit-lite 1.7.x**。RKNN-Toolkit2 是 RK3566/3568/3588 等二代平台的工具，**不能混用**。装 lite 时务必下载 1.x 版本，否则 `import rknnlite` 会失败或行为异常。
+
+## 2. 板端 Python 环境搭建
+
+### 2.1 准备 .whl 文件
+
+在 PC 端从官方 release 下载 `rknn-toolkit-lite-1.7.x-cp38-cp38-linux_armv7l.whl`（一代平台是 armv7l，32 位 Python 3.8/3.9 视 SDK 而定）。
+
+**注意 Python 版本匹配**：板子烧录的 SDK 镜像里 Python 版本是多少，就下对应 cp 版本的 whl。RV1126 SDK 常见内置 Python 3.8。
+
+### 2.2 安装（板子上执行）
 
 ```bash
-# 获取 rknn_toolkit_lite wheel（SDK 的 external/rknn-toolkit/rknn-toolkit-lite/packages/ 下，
-# 或瑞芯微官方 GitHub releases 下载对应 Python 版本）
-pip3 install rknn_toolkit_lite-1.7.5-cp36-cp36m-linux_armv7l.whl
+# 拷贝 whl 到板子后
+pip3 install rknn-toolkit-lite-1.7.x-cp38-cp38-linux_armv7l.whl
 
 # 验证
 python3 -c "from rknnlite.api import RKNNLite; print('RKNNLite OK')"
 ```
 
-> ⚠️ 注意 wheel 的平台标签是 `linux_armv7l`（32 位 ARM），不要拿 x86_64 的包装到板子上。
-
-### 2.2 环境确认
-
-`rknn-toolkit-lite` 底层调 `librknnmrt.so`，所以板子上该库必须可用（上一节已拷到 `/usr/lib/`）：
+如果板子没有 pip3，先装：
 
 ```bash
-python3 -c "from rknnlite.api import RKNNLite; import ctypes; ctypes.cdll.LoadLibrary('librknnmrt.so'); print('librknnmrt 可加载')"
+# 一些 SDK 镜像不带 pip
+sudo apt update && sudo apt install -y python3-pip
 ```
 
-## 3. 第一个 lite 推理程序
+> 如果 whl 安装报 `is not a supported wheel on this platform`，检查两件事：① 文件名里的 `cp38` 是否匹配板子 Python 版本；② 是否 `armv7l`（RV1126 是 32 位，别下成 aarch64）。
 
-创建 `lite_classify.py`：
+## 3. 完整代码：板端 Python 图像分类
+
+创建 `classify_lite.py`：
 
 ```python
-# lite_classify.py —— 板端 Python 分类推理
+# classify_lite.py —— 板端 Python 推理（RKNNLite）
+import sys
 import numpy as np
-from PIL import Image
 from rknnlite.api import RKNNLite
 
-# 1. 创建 RKNNLite 对象
-rknn_lite = RKNNLite()
+def load_labels(path):
+    """读取 ImageNet 标签文件，一行一个类别名"""
+    with open(path, "r") as f:
+        return [line.strip() for line in f.readlines()]
 
-# 2. 加载模型（PC 转换好的 .rknn）
-ret = rknn_lite.load_rknn('mobilenetv2_int8.rknn')
-if ret != 0:
-    print('load_rknn 失败'); exit(ret)
+def main(model_path, image_path, label_path):
+    # 1. 创建并加载模型
+    rknn = RKNNLite()
+    ret = rknn.load_rknn(model_path)          # 对应 C 的 rknn_init
+    if ret != 0:
+        print("load_rknn 失败:", ret)
+        exit(-1)
+    print("[1/3] load_rknn OK")
 
-# 3. 初始化运行时（真实 NPU）
-ret = rknn_lite.init_runtime()
-if ret != 0:
-    print('init_runtime 失败'); exit(ret)
+    # 2. 初始化运行时（对应 C 的 rknn_init 后半段 + query）
+    ret = rknn.init_runtime()
+    if ret != 0:
+        print("init_runtime 失败:", ret)
+        exit(-1)
+    print("[2/3] init_runtime OK")
 
-# 4. 读图 + 预处理（只需 resize 到模型输入尺寸，保持 0~255）
-img = Image.open('test.jpg').convert('RGB').resize((224, 224))
-img = np.array(img).astype(np.uint8)   # 注意：UINT8，不是 float32！
+    # 3. 读图 + 预处理 + 推理（对应 C 的 inputs_set + run + outputs_get）
+    import cv2
+    img = cv2.imread(image_path)              # BGR 顺序，cv2 默认
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (224, 224))
+    img = np.expand_dims(img, 0).astype(np.uint8)
 
-# 5. 推理
-outputs = rknn_lite.inference(inputs=[img])
-scores = outputs[0].flatten()
+    outputs = rknn.inference(inputs=[img])    # 返回 list[ndarray]
+    print("[3/3] inference OK")
 
-# 6. 打印 top5
-top5 = np.argsort(scores)[::-1][:5]
-for i, idx in enumerate(top5):
-    print(f'Top{i+1}: class {idx}, score {scores[idx]:.4f}')
+    # 4. 后处理：softmax + topk
+    scores = outputs[0][0]                    # (1000,)
+    exp_scores = np.exp(scores - np.max(scores))
+    probs = exp_scores / np.sum(exp_scores)
+    top5 = np.argsort(probs)[::-1][:5]
 
-rknn_lite.release()
+    labels = load_labels(label_path)
+    for i, idx in enumerate(top5):
+        print(f"Top{i+1}: {labels[idx]} ({probs[idx]:.4f})")
+
+    rknn.release()                            # 对应 C 的 rknn_release
+
+if __name__ == "__main__":
+    main(sys.argv[1], sys.argv[2], sys.argv[3])
 ```
 
 运行：
 
 ```bash
-python3 lite_classify.py
+python3 classify_lite.py mobilenetv2_int8.rknn test.jpg labels.txt
 ```
 
-**结果应与 C 版本一致**（同一个模型、同一个 NPU）：
+**预期输出**：
 
 ```text
-Top1: class 281, score 0.9021
-Top2: class 282, score 0.0411
+[1/3] load_rknn OK
+[2/3] init_runtime OK
+[3/3] inference OK
+Top1: tiger cat (0.9021)
+Top2: tabby cat (0.0712)
 ...
 ```
 
-## 4. 与 C 版本的关键差异
+## 4. RKNNLite 三方法与 C 五步 API 的对应
 
-### 4.1 输入数据类型
+| RKNNLite（Python） | C 五步 API | 说明 |
+|:---|:---|:---|
+| `load_rknn(path)` | `rknn_init` | 加载 .rknn 文件 |
+| `init_runtime()` | `rknn_init` + `rknn_query` | 初始化 NPU 运行时，绑定 core |
+| `inference(inputs)` | `inputs_set` + `run` + `outputs_get` | 喂数据、推理、取结果一步到位 |
+| `release()` | `rknn_release` | 释放资源 |
 
-**lite 的输入是 `np.uint8`（0~255），不是 float32**——和 C 版 `RKNN_TENSOR_UINT8` 对应。如果你按 PC 模拟器习惯传 float32，会报错或结果错乱。
+**`inference` 帮你做的事**（C 版要自己写）：
 
-### 4.2 归一化同样由库完成
+1. 根据模型输入 shape 自动做尺寸/类型检查；
+2. 自动把 `np.ndarray` 拷给 NPU；
+3. 执行推理；
+4. 自动做反量化，返回 float32 的 numpy 数组。
 
-和 C 版一样，`mean/std` 在转换时已编译进模型，lite 推理时自动应用。**代码里不要手动归一化**。
+所以在 Python 里你不需要关心 `pass_through`、`want_float`、`fmt`——默认行为对原型开发最友好。
 
-### 4.3 init_runtime 参数
+```mermaid
+flowchart TD
+    subgraph C["C 五步 API"]
+        A1["rknn_init"] --> B1["rknn_query"]
+        B1 --> C1["rknn_inputs_set"]
+        C1 --> D1["rknn_run"]
+        D1 --> E1["rknn_outputs_get"]
+        E1 --> F1["rknn_outputs_release / rknn_release"]
+    end
+    subgraph PY["Python 三步"]
+        A2["load_rknn"] --> B2["init_runtime"]
+        B2 --> C2["inference"]
+        C2 --> D2["release"]
+    end
+    PY -.->|"封装"| C
 
-`init_runtime()` 可带 `core_mask` 参数（如 `RKNNLite.NPU_CORE_AUTO` / `NPU_CORE_0`），用于多核 NPU 平台（RK3566/RK3588）指定核。RV1126 是单核 NPU，通常不传即可。
-
-### 4.4 性能
-
-Python 版本比 C 版本**每次调用多一层解释器开销**（约几毫秒级），对原型验证无所谓，量产建议用 C。但 Python 的开发迭代速度是 C 的很多倍——**先用 lite 验证模型效果，再移植成 C**，是推荐工作流。
-
-## 5. 实战：批量验证多个模型
-
-lite 最实用的场景：快速对比不同模型的精度/速度。比如验证量化前后的差异：
-
-```python
-# compare_lite.py —— 板端快速对比浮点版 vs INT8 版
-from rknnlite.api import RKNNLite
-import numpy as np
-from PIL import Image
-
-def test_model(path, img):
-    rknn = RKNNLite()
-    rknn.load_rknn(path)
-    rknn.init_runtime()
-    out = rknn.inference(inputs=[img])[0]
-    rknn.release()
-    return int(np.argmax(out))
-
-img = np.array(Image.open('test.jpg').convert('RGB').resize((224, 224))).astype(np.uint8)
-print('浮点版预测类别:', test_model('mobilenetv2.rknn', img))
-print('INT8版预测类别:', test_model('mobilenetv2_int8.rknn', img))
+    style C fill:#e0f2fe
+    style PY fill:#d1fae5
 ```
 
-同一个脚本换模型文件即可，不需要重编译——这就是 lite 的价值。
+## 5. Python 版 vs C 版：怎么选
+
+| 维度 | Python（RKNNLite） | C（rknn_api） |
+|:---|:---|:---|
+| 开发速度 | 极快，改代码即跑 | 慢，编译部署一轮 |
+| 单帧推理耗时 | 接近 C（推理本身在 C 层） | 最快 |
+| 帧率上限 | 受 Python 解释器/拷贝开销拖累 | 高，适合多线程流水线 |
+| 依赖 | Python3 + numpy + opencv | 无 |
+| 适用场景 | 原型验证、算法调试、离线跑批 | 量产、嵌入式产品、视频管线 |
+
+**关键认知**：`inference` 里 NPU 执行本身和 C 一样快，Python 的额外开销主要在**数据拷贝、numpy 包装、解释器调度**。对"单张图分类"这种低频任务，Python 完全够用；对"摄像头 30fps 实时检测"，Python 版通常扛不住，要回到 C + 多线程流水线（后面专题讲）。
+
+**开发策略建议**：
+
+```mermaid
+flowchart LR
+    A["新模型/新算法"] --> B["PC 端 rknn-toolkit 模拟验证"]
+    B --> C["板端 Python 快速验证效果"]
+    C -->|"效果 OK，需要实时性"| D["C 版重写 + 流水线优化"]
+    C -->|"只是离线跑批/分析"| E["Python 版直接交付"]
+
+    style C fill:#fef3c7
+    style D fill:#d1fae5
+```
 
 ## 6. 常见问题
 
 | 现象 | 原因 | 处理 |
 |:---|:---|:---|
-| `ImportError: No module named rknnlite` | lite 没装或装错平台 | 确认 wheel 是 armv7l 版本 |
-| `init_runtime` 失败 | librknnmrt.so 缺失 / 驱动问题 | 按上节确认 /dev/rknpu |
-| 输入 float32 报错 | lite 期望 uint8 | `astype(np.uint8)` |
-| 结果与 PC 模拟不一致 | 预处理路径不同 | 确认 PC 模拟也用 0~255 + 同配置 |
-| 运行慢 | Python 解释器开销 | 量产换 C 版 |
+| `ModuleNotFoundError: rknnlite` | whl 没装对 | 确认装了 lite（不是 toolkit），且版本匹配 |
+| wheel 平台不匹配 | 下了 aarch64 版 | RV1126 用 armv7l |
+| `load_rknn` 失败 | 模型是 Toolkit2 转的 | 用 1.x 工具链重转 |
+| `init_runtime` 报找不到设备 | 驱动未加载 | `ls /dev/rknpu`，确认内核配置 |
+| 推理结果全错 | cv2 默认 BGR 而模型要 RGB | `cv2.cvtColor` 转 RGB（或训练时就用 BGR） |
+| 速度比 C 慢很多 | Python 拷贝/解释开销 | 评估是否该转 C 版；或减少输入预处理在 Python 里做 |
 
 ## 7. 练习与里程碑
 
 ### 练习
 
-1. **跑通 lite**：在板子上跑通 `lite_classify.py`，与 C 版结果对比；
-2. **批量验证**：用第 5 节脚本对比浮点/INT8 在 10 张图上的类别一致性；
-3. **换模型**：把 PC 上转换好的另一个模型（如 ResNet）拷到板子，改一行路径跑通；
-4. **计时对比**：用 `time.perf_counter()` 测量 lite 的 inference 耗时，与 C 版 rknn_run 对比，量化 Python 开销。
+1. **跑通分类**：板子上跑通 `classify_lite.py`，输出 top5 与 C 版对比，确认一致；
+2. **批量测试**：写循环对 50 张图批量推理，统计平均耗时和 top1 准确率（注意每次调用 `inference` 的开销）；
+3. **帧率测试**：循环推理 100 次测总耗时，算平均 FPS，记录 Python 版的实际吞吐上限；
+4. **对比实验**：同一模型分别用 C 版和 Python 版跑 100 次，对比平均耗时差距，验证"推理本身一样快、开销在拷贝"的结论。
 
 ### 里程碑自检
 
-- [ ] 分清 rknn-toolkit（PC 转换）与 rknn-toolkit-lite（板端推理）
-- [ ] 能在板子上安装 lite 并 import 成功
-- [ ] 能用 RKNNLite 三行核心 API 完成推理
-- [ ] 知道 lite 输入是 uint8 0~255，归一化由库完成
-- [ ] 能快速对比多个模型的推理结果
+- [ ] 能说出 toolkit / toolkit-lite / librknnmrt 三者的关系
+- [ ] 能独立完成板端 Python 环境安装
+- [ ] 能用 RKNNLite 三方法跑通分类
+- [ ] 知道 Python 版和 C 版各自的适用场景
+- [ ] 能解释"Python 慢在哪、NPU 快在哪"
 
 ## 8. 小结
 
-- **lite = 板端推理专用**：`RKNNLite` 类，只推理不转换，基于 librknnmrt；
-- **三行核心**：`load_rknn → init_runtime → inference`；
-- **输入纪律**：`np.uint8` 0~255，归一化自动；
-- **工作流**：PC 转换 → 板端 lite 快速验证 → 量产移植 C。
+- **rknn-toolkit-lite** 是板端 Python 推理库，底层封装 `librknnmrt.so`，用 `RKNNLite` 类三方法搞定：`load_rknn → init_runtime → inference`；
+- **版本**：一代平台（RV1126）用 1.7.x，armv7l + Python3.8，别和 Toolkit2 混用；
+- **定位**：Python 版适合原型验证、算法调试、离线跑批；实时摄像头流水线要回 C 版；
+- **数据格式**：cv2 默认 BGR，模型要 RGB 时记得 `cvtColor`。
 
-到这里，板端推理的两种姿势（C 和 Python）你都掌握了，能跑**分类**了。但真实产品里更常见的是**目标检测**——不只是"这是什么"，而是"东西在哪"。下一节用 YOLO 补齐检测能力：模型转换 + 板端解码 + NMS 后处理，输出检测框。
+分类模型只能回答"这是什么"。实际产品里更常用的是**检测模型**——框出目标在哪。下一程我们进入 YOLO：从 ONNX 转换到板端后处理，把"会分类"升级成"会定位"。
 
-> 🏷️ 标签：#RKNN #rknn-toolkit-lite #板端Python #RKNNLite #原型验证
+> 🏷️ 标签：#RKNN #RKNNLite #板端Python #原型开发 #推理

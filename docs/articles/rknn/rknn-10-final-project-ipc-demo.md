@@ -1,250 +1,304 @@
 ---
-title: "综合项目：人形检测 + 周界报警 IPC Demo（系列收官）"
-description: "系列：RKNN 端侧部署实战：基于 RV1126 的模型转换与部署"
+title: "RKNN 端侧部署实战 · 第10期：综合项目：人形检测周界报警系统"
+description: "整合摄像头、NPU、人形检测、规则区域和报警输出，完成一个端侧 IPC 周界报警 Demo。"
 pubDate: "2026-08-09"
 series: "rknn"
 order: 10
-tags: ["RKNN", "RKNN 端侧 AI 部署"]
+tags: ["RKNN", "IPC", "人形检测", "周界报警"]
 draft: false
 ---
+
 > 系列：RKNN 端侧部署实战：基于 RV1126 的模型转换与部署
-> 前置：已完成全链路 demo + 基础性能调优
-> 配套硬件：RV1126 开发板 + 摄像头
+> 前置：摄像头链路跑通 + 性能调优完成
+> 目标：把前九期能力组装成一个可交付的完整产品原型
 
-## 0. 本节目标
+## 0. 本期目标
 
-这是系列的收官篇。把前面所有能力——模型转换、量化、板端推理、目标检测、摄像头链路、性能调优——收拢成一个**完整的、可演示的、能写进简历的项目**：
+前九期我们分别打通了：环境与转换（01~04）、板端推理（05~06）、YOLO 检测（07）、摄像头链路（08）、性能调优（09）。
 
-> **基于 RV1126 的人形检测周界报警 IPC Demo**
+本期把这些能力组装成一个**完整产品原型**：人形检测周界报警系统。它具备真实 IPC（网络摄像头）的核心功能：
 
-本节完成四件事：
+1. **采集**：IMX415 实时画面；
+2. **检测**：NPU 运行 YOLOv5s 人形检测；
+3. **告警**：检测到人形后触发报警（GPIO 蜂鸣器 + 截图保存 + 时间戳日志）；
+4. **传输**：RTSP 推流预览 + HTTP 告警上报。
 
-1. **需求定义**：明确做什么、验收标准是什么；
-2. **系统设计**：模块划分、线程模型、报警逻辑；
-3. **工程落地**：代码结构、部署文档、性能报告；
-4. **作品集化**：怎么把这个项目讲给面试官/读者听。
+做完这个项目，你就拥有一个能写进简历的完整嵌入式 AI 案例。
 
-## 1. 需求定义
+## 1. 需求拆解
 
-### 1.1 一句话需求
+先想清楚"要做什么"，再写代码。画一张系统框图：
 
-> 在 RV1126 开发板上接入摄像头，实时检测画面中的人形目标；当检测到人进入设定区域（周界）时，触发报警（GPIO 灯 + 日志/网络通知），并在显示画面上框出目标。
+```mermaid
+flowchart LR
+    subgraph BOARD["RV1126 开发板"]
+        A["IMX415<br/>摄像头"] --> B["RKMedia<br/>VI → VPSS"]
+        B --> C["NPU 推理<br/>YOLOv5s 人形检测"]
+        B --> E["VENC 硬编码<br/>H.264"]
+        C --> D{"检测到<br/>人形？"}
+        D -->|"是"| F["告警模块<br/>GPIO 蜂鸣器 + 截图"]
+        D -->|"否"| G["继续监控"]
+        E --> H["RTSP 推流<br/>局域网预览"]
+        F --> I["HTTP 上报<br/>告警消息"]
+    end
+    H --> J["PC 播放器<br/>VLC"]
+    I --> K["PC 接收端<br/>记录告警"]
 
-### 1.2 验收标准（可量化）
+    style C fill:#fef3c7
+    style F fill:#fee2e2
+    style H fill:#d1fae5
+```
 
-| 验收项 | 标准 |
-|:---|:---|
-| 检测功能 | 能稳定检测画面中的人（距离 1~5 米） |
-| 周界报警 | 人进入设定区域 200ms 内触发报警 |
-| 帧率 | ≥ 20 FPS（640×640 输入） |
-| 稳定性 | 连续运行 1 小时无内存增长、无崩溃 |
-| 可演示 | 显示器/RTSP 实时看到检测框 + 报警状态 |
+**模块划分**：
 
-### 1.3 技术选型
-
-| 项 | 选择 | 理由 |
+| 模块 | 技术点 | 对应前文 |
 |:---|:---|:---|
-| 模型 | YOLOv5s 或 YOLOv5n INT8 | 已跑通、精度/速度均衡 |
-| 输入 | 640×640 或 416×416 | 按实测帧率取舍 |
-| 取流 | RKMedia VI→VPSS | 硬件加速缩放 |
-| 推理 | C 五步 API | 量产形态 |
-| 后处理 | C 实现解码 + NMS | 性能关键路径 |
-| 显示 | VO 直出（调试）→ RTSP（产品） | 先本地后网络 |
-| 报警 | GPIO 拉高 + 日志 + 可选网络上报 | 简单可演示 |
+| 采集 | RKMedia VI→VPSS 640×640 | 第8期 |
+| 推理 | rknn 五步 API + YOLOv5 后处理 | 第5/7期 |
+| 编码推流 | RKMedia VENC + RTSP 服务 | 第8期框架 |
+| 告警 | GPIO + 截图 + 日志 | 本期 |
+| 主控 | 多线程流水线 + 状态机 | 第9期 |
 
-## 2. 系统设计
+## 2. 工程目录结构
 
-### 2.1 模块划分
+一个可维护的项目要有清晰结构，而不是一个 main.c 到底：
 
 ```text
-project/
-├── main.c              # 主程序：初始化 + 线程调度
-├── media.c / media.h   # RKMedia：VI/VPSS/VO 通路管理
-├── detector.c/.h       # NPU 推理封装（init/run/release）
-├── postprocess.c/.h    # YOLO 解码 + NMS（C 实现）
-├── alarm.c/.h          # 周界判定 + GPIO 报警
-├── queue.c/.h          # 有界环形队列（线程间传递帧）
-├── config.h            # 参数配置（阈值/分辨率/区域）
-└── Makefile
+perimeter-alarm/
+├── CMakeLists.txt              # 工程构建
+├── src/
+│   ├── main.c                  # 主控状态机 + 线程创建
+│   ├── camera.c/.h             # RKMedia 采集封装（VI/VPSS）
+│   ├── rknn_det.c/.h           # NPU 推理 + YOLO 后处理封装
+│   ├── alarm.c/.h              # GPIO 蜂鸣器 + 告警逻辑
+│   ├── rtsp_server.c/.h        # VENC 编码 + RTSP 推流
+│   └── utils.c/.h              # 日志、时间戳、截图
+├── model/
+│   └── yolov5s_person.rknn     # 模型（可只检 person 一类）
+└── scripts/
+    └── flash_and_run.sh        # 编译部署脚本
 ```
 
-### 2.2 线程模型（沿用上节流水线）
+## 3. 核心代码实现
 
-```text
-线程A 取流 ──队列1──▶ 线程B 推理 ──队列2──▶ 线程C 后处理+报警+显示
-   VI取帧             NPU执行              decode/nms → 周界判定
-                                             → GPIO报警 → VO显示
-```
+### 3.1 主控状态机
 
-### 2.3 周界判定逻辑（简单有效版）
-
-**定义 1（周界）**：画面中预先划定的报警区域（矩形）。
+报警系统不是一直"检测→报警"，而要有状态管理，避免同一目标反复触发告警：
 
 ```c
-// alarm.c —— 周界判定
-// 检测框中心 (cx, cy) 落在报警区域 (zone_x1, zone_y1, zone_x2, zone_y2) 内 → 报警
-int in_zone(float cx, float cy) {
-    return cx >= zone_x1 && cx <= zone_x2 &&
-           cy >= zone_y1 && cy <= zone_y2;
-}
+typedef enum {
+    ST_IDLE,      // 空闲监控
+    ST_CONFIRM,   // 检测到人形，进入确认期（连续 N 帧确认）
+    ST_ALARM,     // 确认触发，拉响警报
+    ST_COOLDOWN   // 冷却期，避免重复报警
+} AlarmState;
 
-// 报警：持续 N 帧命中才触发（防抖，避免单帧误报）
-static int hit_count = 0;
-if (in_zone(cx, cy)) {
-    if (++hit_count >= HIT_THRESHOLD) {   // 如 3 帧
-        alarm_on();                        // GPIO 拉高 + 打印日志
+static AlarmState state = ST_IDLE;
+static int confirm_count = 0;
+static int cooldown_frames = 0;
+
+void alarm_update(int person_detected) {
+    switch (state) {
+    case ST_IDLE:
+        if (person_detected) {
+            confirm_count = 1;
+            state = ST_CONFIRM;
+        }
+        break;
+    case ST_CONFIRM:
+        if (person_detected) {
+            if (++confirm_count >= CONFIRM_THRESHOLD) {  // 连续 5 帧确认
+                trigger_alarm();                          // 拉响蜂鸣器 + 截图 + 上报
+                state = ST_ALARM;
+            }
+        } else {
+            state = ST_IDLE;                              // 中途消失，取消确认
+        }
+        break;
+    case ST_ALARM:
+        if (!person_detected || ++alarm_frames >= MAX_ALARM_FRAMES) {
+            stop_alarm();
+            cooldown_frames = COOLDOWN_FRAMES;            // 冷却 300 帧 ≈ 10 秒
+            state = ST_COOLDOWN;
+        }
+        break;
+    case ST_COOLDOWN:
+        if (--cooldown_frames <= 0)
+            state = ST_IDLE;
+        break;
     }
-} else {
-    hit_count = 0;
 }
 ```
 
-**防抖设计**（嵌入式类比）：就像按键消抖——单帧检测到的"人"可能是误检，连续几帧都命中才算真报警。`HIT_THRESHOLD` 是灵敏度参数。
+**为什么需要确认期**：单帧误检（光线变化、动物、树叶晃动）很常见。连续 5 帧都检测到才告警，大幅降低误报率。**这是真实产品的必备设计**。
 
-### 2.4 GPIO 报警
-
-RV1126 SDK 用 sysfs 或 gpiod 控制 GPIO：
+### 3.2 告警动作：蜂鸣器 + 截图 + 日志
 
 ```c
-// GPIO 拉高（sysfs 示例，具体引脚按板卡原理图）
-int alarm_on(void) {
-    int fd = open("/sys/class/gpio/gpioN/value", O_WRONLY);
-    write(fd, "1", 1);   // 拉高，点亮报警 LED
-    close(fd);
+void trigger_alarm(void) {
+    // 1. GPIO 拉高，蜂鸣器响
+    gpio_set_value(ALARM_GPIO, 1);
+
+    // 2. 保存当前帧截图（复用 VPSS 通道的 JPEG 或原始 YUV）
+    save_snapshot("/data/alarm/%ld.jpg", time(NULL));
+
+    // 3. 写告警日志（时间 + 目标框坐标 + 置信度）
+    log_alarm(time(NULL), boxes, n);
+
+    // 4. HTTP 上报到服务端（可选，见 4.2）
+    http_post_alarm("http://192.168.1.100:8080/alarm", payload);
+}
+
+void stop_alarm(void) {
+    gpio_set_value(ALARM_GPIO, 0);
+}
+```
+
+GPIO 操作在 RV1126 上可以通过 sysfs 或 libgpiod：
+
+```c
+// libgpiod 方式
+#include <gpiod.h>
+
+struct gpiod_line *line = gpiod_line_get(
+    gpiod_chip_open("/dev/gpiochip0"), ALARM_GPIO_OFFSET);
+gpiod_line_request_output(line, "alarm", 0);
+gpiod_line_set_value(line, 1);   // 响
+gpiod_line_set_value(line, 0);   // 停
+```
+
+### 3.3 RTSP 推流
+
+预览功能让系统"可见"。RV1126 的 VENC 硬编码 H.264，配合 SDK 自带的 RTSP 库（或移植 live555）即可：
+
+```c
+// 流程示意：VPSS 另一通道 → VENC → RTSP
+VPSS_CHN_ATTR_S vpss_chn2 = { .u32Width = 1280, .u32Height = 720, ... };
+RK_MPI_VPSS_SetChnAttr(VPSS_GRP, 1, &vpss_chn2);
+RK_MPI_VPSS_EnableChn(VPSS_GRP, 1);
+
+// VENC 编码
+VENC_CHN_ATTR_S venc_attr = { .enType = RK_VIDEO_ID_AVC,   // H.264
+                              .u32Width = 1280, .u32Height = 720, ... };
+RK_MPI_VENC_CreateChn(0, &venc_attr);
+RK_MPI_SYS_Bind(&vpss_chn1, &venc_chn);   // VPSS chn1 → VENC
+
+// 编码后码流送给 RTSP 库发送（SDK 示例 rtsp_demo）
+```
+
+PC 端用 VLC 打开 `rtsp://板子IP:554/live` 即可看到实时画面。
+
+## 4. 让项目更完整
+
+### 4.1 告警去重与联动
+
+真实系统里，告警不应该只是"响一下"：
+
+- **去重**：同一目标在视野内持续存在，只告警一次（冷却期解决）；
+- **截图留存**：保存触发时刻的图片，便于事后查看；
+- **联动**：可扩展继电器控制灯光/门禁、推送到手机。
+
+### 4.2 HTTP 告警上报
+
+板端作为 HTTP 客户端，把告警信息 POST 到服务端：
+
+```c
+// 简易 HTTP POST（示意，用 libcurl 更健壮）
+int http_post_alarm(const char *url, const char *json) {
+    // 组装 HTTP 请求
+    char req[512];
+    snprintf(req, sizeof(req),
+        "POST %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n\r\n%s",
+        url, HOST, strlen(json), json);
+
+    // TCP 连接 + send + recv
+    // ...（网络编程基础，不再展开）
     return 0;
 }
 ```
 
-## 3. 工程落地
+服务端收到后可以发短信、推微信、弹窗——这就是完整的"报警闭环"。
 
-### 3.1 关键流程（main.c 骨架）
+## 5. 部署与验证
 
-```c
-// main.c —— 综合项目主流程
-int main(void) {
-    // 1. 解析配置（config.h：模型路径、阈值、区域、分辨率）
-    // 2. 初始化媒体通路（media_init: VI→VPSS→VO）
-    // 3. 初始化 NPU（detector_init: rknn_init + query）
-    // 4. 初始化报警（alarm_init: GPIO）
-    // 5. 启动三线程：
-    //    pthread_create(&t_capture,  ...);  // 取流线程
-    //    pthread_create(&t_infer,    ...);  // 推理线程
-    //    pthread_create(&t_display,  ...);  // 后处理+报警+显示线程
-    // 6. 主线程：处理退出信号，等待线程结束
-    // 7. 清理：detector_release / media_deinit
-}
+### 5.1 构建部署
+
+```bash
+# 交叉编译（使用 SDK 工具链 + RKMedia/RKNN 库）
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=../toolchains/aarch64-rockchip-linux-gnu.cmake
+cmake --build build -j4
+
+# 拷贝到板子
+scp build/perimeter_alarm root@板子IP:/userdata/
+scp model/yolov5s_person.rknn root@板子IP:/userdata/
+
+# 板端运行
+ssh root@板子IP "/userdata/perimeter_alarm"
 ```
 
-### 3.2 部署文档（README 要点）
-
-```markdown
-# 人形检测周界报警 IPC Demo（RV1126）
-
-## 硬件
-- RV1126 开发板 + MIPI 摄像头 + 报警 LED（GPIO 引脚 xxx）
-
-## 软件
-- SDK 版本：RV1126 Linux SDK（Buildroot）
-- 工具链版本：rknn-toolkit 1.7.x（PC）/ rknn-toolkit-lite 1.7.x（板端）
-
-## 构建
-- PC 端：转换模型（convert.sh，含量化校准）
-- 板端：make && ./ipc_demo yolov5s_int8.rknn
-
-## 配置（config.h）
-- 输入分辨率 / 置信度阈值 / NMS 阈值 / 报警区域坐标
-
-## 性能（640×640, YOLOv5s INT8）
-- 帧率：xx FPS（实测）
-- NPU 推理耗时：xx ms（实测）
-- CPU 占用：xx%（实测）
-- 内存：平稳 xx MB
-
-## 验证
-- 正常：画面实时显示检测框，人进入区域 LED 点亮
-- 稳定性：连续运行 1 小时内存无增长
-```
-
-**部署文档是作品的"说明书"**：README 里最重要的部分是**实测性能数据**——面试官/读者一看数据就知道你真正跑过，而不是纸上谈兵。
-
-### 3.3 性能报告（示例格式，数字需实测填写）
+### 5.2 验证清单
 
 ```text
-测试环境：RV1126, 640×640 输入, YOLOv5s INT8
-──────────────────────────────────────────
-指标          数值（示例）      说明
-──────────────────────────────────────────
-NPU 推理      18 ms/帧          rknn_run 计时
-端到端延迟     35 ms            取帧→结果显示
-帧率          22 FPS           三线程流水线
-CPU 占用      60%              四核总占用
-内存          平稳 ~120 MB      1 小时运行
-──────────────────────────────────────────
+□ 启动后 VLC 能看到实时画面（RTSP 通）
+□ 人走进画面 5 帧内蜂鸣器响（检测+确认通）
+□ 离开后蜂鸣器停，冷却期后恢复监控（状态机通）
+□ /data/alarm/ 下有告警截图（截图通）
+□ 服务端收到告警 HTTP 请求（上报通）
+□ 连续运行 24 小时不崩、内存不涨（稳定性通）
 ```
 
-## 4. 作品集化：怎么讲这个项目
+## 6. 简历作品集包装
 
-### 4.1 电梯陈述（30 秒版）
+做完项目，把它写进简历。用**项目公式**：背景 → 方案 → 技术亮点 → 量化结果。
 
-> "我做了一个基于 RV1126 的实时人形检测 IPC demo：用 RKNN 工具链把 YOLOv5 量化成 INT8 模型部署到 NPU，用 RKMedia 打通摄像头全链路，三线程流水线把帧率做到 22fps，并实现了周界报警逻辑。"
+```text
+项目：基于 RKNN 的人形检测周界报警系统（RV1126 + IMX415）
 
-### 4.2 面试官会追问的点（提前准备好）
+背景：面向工厂周界安防场景，需在低成本边缘设备上实现实时人形检测告警。
+方案：RKMedia 采集摄像头视频流，VPSS 硬件缩放至 640×640，
+      RKNN NPU 运行 YOLOv5s 人形检测模型，VENC 硬编码 + RTSP 推流预览，
+      多线程流水线 + 状态机管理告警（确认期/冷却期降误报）。
 
-| 追问 | 你的答案要点 |
-|:---|:---|
-| 为什么用 INT8 量化？ | NPU 算力是 INT8 标定，体积 1/4，精度掉 0~2% |
-| 量化精度掉了怎么办？ | 校准集覆盖场景、kl_divergence、accuracy_analysis 定位 |
-| 为什么选 YOLOv5？ | 生态成熟、有官方 RKNN 转换示例、检测效果好 |
-| 帧率瓶颈在哪？ | 先测量：NPU 推理 vs 取流 vs 后处理，各自耗时 |
-| 线程间怎么同步？ | 有界环形队列 + 互斥锁/信号量，丢旧帧策略 |
-| 报警误报怎么处理？ | 连续 N 帧命中防抖 + 置信度阈值调节 |
-| 内存怎么保证不泄漏？ | 每帧 Release、队列有界、长时间压力测试 |
+技术亮点：
+- 全硬件管线：VPSS 缩放 + RGA 格式转换 + NPU 推理 + VENC 编码，CPU 占用 < 30%；
+- 三线程流水线（采集/推理/后处理）+ 绑核优化，实测 640 输入 ~18 FPS；
+- 连续 N 帧确认 + 冷却期状态机，误报率显著下降；
+- 告警联动：GPIO 蜂鸣器 + 截图留存 + HTTP 上报闭环。
 
-### 4.3 加分项（时间允许再加）
+量化结果：端到端延迟 < 200ms，24 小时稳定运行，误报率 < 5%（测试集）。
+```
 
-- **RTSP 推流**：让手机/电脑远程看实时检测画面；
-- **报警截图/录像**：报警时保存 JPEG 或短视频（用 VPU 编码器）；
-- **Web 配置界面**：网页调阈值、划区域（boa/lighttpd + CGI）；
-- **多模型切换**：人形 + 人脸双模型（NPU 串行或分时）。
+> 数字以你的实测为准，**不要编造**。简历写"做过什么 + 怎么做的 + 效果数据"，比罗列技术名词有力得多。
 
-## 5. 项目检查清单（发布前逐项确认）
-
-- [ ] 模型：INT8 量化，精度验证（对比测试集）
-- [ ] 链路：VI→VPSS→NPU→后处理→VO 全通
-- [ ] 报警：GPIO 点亮，防抖生效，区域可配
-- [ ] 性能：FPS/延迟/CPU/内存有实测数据
-- [ ] 稳定：1 小时压力测试无崩溃无泄漏
-- [ ] 文档：README 完整（构建/配置/性能/验证）
-- [ ] 演示：一段 30 秒演示视频（加分）
-
-## 6. 练习与里程碑
+## 7. 练习与里程碑
 
 ### 练习
 
-1. **搭建项目**：按模块划分搭出工程骨架，先跑通"无报警版"（只有检测+显示）；
-2. **加周界**：实现区域判定 + 防抖 + GPIO 报警，验证触发与恢复；
-3. **写 README**：补全构建/配置/性能数据，跑 1 小时压力测试填入真实数据；
-4. **录演示**：录一段 30 秒演示视频：人走入区域 → LED 报警 → 人离开 → 报警恢复；
-5. **拓展一项**：从 4.3 加分项中选一个实现（推荐 RTSP 推流）。
+1. **跑通最小闭环**：只做检测 + 打印结果，确认状态机逻辑正确；
+2. **加告警**：接入 GPIO 蜂鸣器，人走进/离开验证状态切换；
+3. **加预览**：接入 RTSP 推流，VLC 实时查看画面；
+4. **加截图**：告警时保存 JPEG，验证文件可打开；
+5. **稳定性测试**：跑 24 小时，观察内存曲线（`cat /proc/meminfo` / `top`）；
+6. **文档**：写一份 README（硬件接线、编译步骤、使用说明）。
 
 ### 里程碑自检
 
-- [ ] 项目达到验收标准（检测/报警/帧率/稳定/可演示）
-- [ ] 有完整 README 和实测性能数据
-- [ ] 能 30 秒讲清项目（电梯陈述）
-- [ ] 能回答面试官 7 个追问
-- [ ] 有演示视频或截图
+- [ ] 系统框图能画出来
+- [ ] 状态机（IDLE/CONFIRM/ALARM/COOLDOWN）能讲清为什么这样设计
+- [ ] 四个功能模块（采集/检测/告警/推流）都跑通
+- [ ] 简历项目描述能写出来（背景/方案/亮点/数据）
+- [ ] 知道自己项目里每个数字是怎么测出来的
 
-## 7. 小结：这一路走完，你获得了什么
+## 8. 小结
 
-回顾整个系列，你的能力发生了三级跳：
+- **综合项目 = 前九期的组装**：采集链路 + NPU 推理 + 性能调优 + 工程封装；
+- **真实产品设计**：确认期降误报、冷却期去重、截图留存、告警上报闭环；
+- **可交付标准**：不只是"能跑"，而是稳定、可部署、有文档、有数据；
+- **简历价值**：一个完整的嵌入式 AI 案例，胜过十个零散 demo。
 
-**第一级：模型进得来**——从 ONNX/TFLite 到 `.rknn`，转换参数、算子约束、报错排查全掌握；
-**第二级：模型跑得动**——INT8 量化把模型压进 NPU，C/Python 两种推理方式，YOLO 检测 + 后处理；
-**第三级：产品做得成**——摄像头全链路、多线程流水线、性能调优、综合项目交付。
+十期走完，从"下载模型、PC 转换"到"板端实时检测告警"，你已经掌握了 RKNN 端侧部署的完整链路。工具会迭代（一代工具链已老旧，后续平台多用 RKNN-Toolkit2），但**"硬件感知 + 全链路思维 + 工程化习惯"这些核心能力不会过时**。继续，下一站可以是更复杂的模型、更大的平台、或者把检测能力接到你的音视频管线里。
 
-这三件事合起来，就是一个完整的**边缘 AI 部署工程师**的核心能力闭环：**模型转换 → 量化压缩 → 板端部署 → 系统集成 → 性能优化 → 项目交付**。
-
-RV1126 只是起点——这套方法论（工具链选择、量化校准、推理 API、流水线架构、调优流程）可以直接迁移到 RK3568/RK3588 等更强大的平台：换工具链版本、换 API 前缀，思维模型完全复用。你已经不是"只会写单片机的工程师"了——你现在是**能独立把 AI 模型送上嵌入式设备的工程师**。
-
-> 🏷️ 标签：#RKNN #综合项目 #IPC #人形检测 #周界报警 #作品集
+> 🏷️ 标签：#RKNN #综合项目 #人形检测 #周界报警 #RTSP #作品集

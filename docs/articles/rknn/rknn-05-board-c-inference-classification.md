@@ -1,17 +1,18 @@
 ---
-title: "板端 C 推理第一课：rknn_api 五步流程跑通图像分类"
-description: "系列：RKNN 端侧部署实战：基于 RV1126 的模型转换与部署"
+title: "RKNN 端侧部署实战 · 第5期：板端 C 推理：rknn_api 五步流程跑通图像分类"
+description: "在 RV1126 板端使用 C API 跑通 RKNN 图像分类推理，掌握 init、query、inputs、run、outputs 五步流程。"
 pubDate: "2026-08-09"
 series: "rknn"
 order: 5
-tags: ["RKNN", "RKNN 端侧 AI 部署"]
+tags: ["RKNN", "C API", "板端推理", "图像分类"]
 draft: false
 ---
+
 > 系列：RKNN 端侧部署实战：基于 RV1126 的模型转换与部署
 > 前置：已完成 INT8 量化模型（mobilenetv2_int8.rknn）
 > 配套硬件：RV1126 开发板（本文起需要板子）；交叉编译主机：x86_64 Ubuntu
 
-## 0. 本节目标
+## 0. 本期目标
 
 模型在 PC 上模拟通过，现在搬到真实硬件。RV1126 的板端 C 推理就是经典的**五步 API**：
 
@@ -20,7 +21,7 @@ rknn_init → rknn_query → rknn_inputs_set → rknn_run → rknn_outputs_get
 （初始化）   （查输入输出） （喂数据）        （执行）     （取结果）
 ```
 
-本节完成三件事：
+本期完成三件事：
 
 1. **搭起板端运行环境**：拷贝模型、链接 `librknnmrt.so`、交叉编译；
 2. **写一个完整的图像分类 C 程序**：五步 API 全流程 + 输入预处理；
@@ -57,6 +58,8 @@ sudo apt install -y gcc-arm-linux-gnueabihf
 # 验证
 arm-linux-gnueabihf-gcc --version
 ```
+
+**工具链选择是第一个大坑**：如果你用 aarch64 工具链编译，程序在板子上直接 `Exec format error`。RV1126（Cortex-A7）是 32 位核，和 RK3568/RK3588（Cortex-A53/A72，64 位）完全不同——这也是"一代平台"和"二代平台"在工程习惯上的一个分水岭。
 
 ## 2. 完整 C 程序：五步推理图像分类
 
@@ -229,12 +232,28 @@ done.
 
 **在转换时通过 config 写进了模型**（你在 PC 端配的 `mean_values/std_values`），运行时库自动应用。所以板端 C 代码**不需要手动归一化**——这是 RKNN 设计的一大便利。反过来，如果你在板端代码里又手动做了一次归一化（除以 255 再乘 128），结果必错。
 
+```mermaid
+flowchart LR
+    subgraph PC["PC 端转换期"]
+        M["config(mean_values, std_values)"] --> B["写入 .rknn 模型"]
+    end
+    subgraph BOARD["板端推理期"]
+        I["rknn_inputs_set<br/>喂原始 0~255 UINT8"] --> R["库自动做归一化<br/>（mean/std 已内嵌）"]
+        R --> N["NPU 执行 INT8 推理"]
+    end
+    B --> BOARD
+
+    style PC fill:#e0f2fe
+    style BOARD fill:#d1fae5
+    style N fill:#fef3c7
+```
+
 ### 4.2 pass_through 参数
 
 - `pass_through = 0`：库做 mean/std 归一化和数据布局转换（默认，推荐）；
 - `pass_through = 1`：原始数据直通 NPU，不做任何预处理（此时你必须自己完成全部预处理，通常配合零拷贝使用）。
 
-新手一律用 `pass_through = 0`。
+新手一律用 `pass_through = 0`。**等你能解释"零拷贝为什么需要自己预处理"时，再碰 pass_through=1。**
 
 ### 4.3 输入输出格式与内存
 
@@ -242,7 +261,9 @@ done.
 |:---|:---|
 | 输入 fmt | `RKNN_TENSOR_NHWC` 或 `NCHW`，以模型实际布局为准（TFLite/ONNX 常见 NHWC） |
 | 输出 want_float | `1` = 拿浮点结果（库反量化，方便调试）；`0` = 拿 INT8 原始结果（省一次转换，性能好） |
-| 内存 | 基本模式是库内部分配；追求极致性能可用 `rknn_create_mem/rknn_set_io_mem` 零拷贝（一代平台支持情况查官方文档，标注待核实） |
+| 内存 | 基本模式是库内部分配；追求极致性能可用 `rknn_create_mem/rknn_set_io_mem` 零拷贝（一代平台支持情况查官方文档） |
+
+**want_float 的工程取舍**：调试阶段用 `want_float=1`，每个输出值都是可读的浮点，topk 直接比较。量产阶段如果后处理也写成了 INT8 定点版（像 YOLO 的 sigmoid/exp 定点化），就可以 `want_float=0` 省掉一次全张量反量化——在 1000 类输出上这是几毫秒的差距。
 
 ### 4.4 性能观察
 
@@ -261,11 +282,22 @@ printf("rknn_run 耗时: %.2f ms\n", ms);
 
 MobileNetV2 INT8 在 RV1126 上单帧推理通常在 **10~30 ms** 量级（具体与模型、量化、NPU 频率有关，以实测为准）。**注意这只是 NPU 推理时间，不含取图/预处理/后处理**——全链路延迟后面专门有一篇讲。
 
+```mermaid
+flowchart TD
+    T["取图/解码<br/>0~15 ms（CPU）"] --> P["缩放/转格式<br/>0~5 ms（CPU/RGA）"]
+    P --> N["NPU 推理 rknn_run<br/>10~30 ms（NPU）"]
+    N --> POST["后处理<br/>0~3 ms（CPU）"]
+
+    style N fill:#fef3c7
+    style POST fill:#d1fae5
+```
+
 ## 5. 常见问题
 
 | 现象 | 原因 | 处理 |
 |:---|:---|:---|
 | `rknn_init` 返回 -1/-2 | 库缺失 / 驱动未加载 / 模型是 Toolkit2 转的 | 确认 librknnmrt.so 在 LD_LIBRARY_PATH；`ls /dev/rknpu`；重转一代模型 |
+| `Exec format error` | 用错工具链（aarch64 编了 32 位板子） | 确认用 arm-linux-gnueabihf |
 | `rknn_inputs_set` 返回非 0 | 输入尺寸或类型不匹配 | 用 query 打出的 dims 核对；确认 fmt/type |
 | 结果全错 | 输入布局/通道顺序问题 | 核对 NHWC/NCHW、RGB/BGR、是否重复归一化 |
 | 编译找不到 rknn_api.h | 头文件路径不对 | `-I` 指向 include 目录 |

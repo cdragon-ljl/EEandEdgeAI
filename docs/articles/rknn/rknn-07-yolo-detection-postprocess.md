@@ -1,280 +1,398 @@
 ---
-title: "目标检测实战：YOLO 转换 + 板端后处理（解码 + NMS）"
-description: "系列：RKNN 端侧部署实战：基于 RV1126 的模型转换与部署"
+title: "RKNN 端侧部署实战 · 第7期：YOLO 检测：从 ONNX 转换到板端后处理"
+description: "完成 YOLO 模型的 RKNN 转换、板端推理和检测框解码、阈值过滤、NMS 后处理。"
 pubDate: "2026-08-09"
 series: "rknn"
 order: 7
-tags: ["RKNN", "RKNN 端侧 AI 部署"]
+tags: ["RKNN", "YOLO", "目标检测", "NMS"]
 draft: false
 ---
+
 > 系列：RKNN 端侧部署实战：基于 RV1126 的模型转换与部署
-> 前置：已完成分类模型的板端推理（C/Python 均可）
-> 配套硬件：RV1126 开发板（本节的转换可在 PC，板端验证需要板子）
+> 前置：已会 PC 端模型转换（rknn-toolkit 1.x）与板端 C 推理（五步 API）
+> 模型：YOLOv5s（一代平台兼容性最好的检测模型之一）
 
-## 0. 本节目标
+## 0. 本期目标
 
-分类解决"是什么"，检测解决"**在哪** + 是什么"。IPC 场景（人形检测、周界报警、客流统计）的核心就是目标检测。
+分类模型输出一个 1000 维向量，取最大值就是类别。**检测模型**输出的是"目标在哪里 + 是什么"：一组候选框（中心点、宽高）加类别概率。
 
-本节用 YOLOv5s 走完整检测链路：
+本期完成三件事：
 
-1. **模型转换**：YOLOv5 ONNX → INT8 .rknn（检测模型转换的注意点）；
-2. **看懂输出**：YOLO 输出的 85 维向量是什么、三个尺度怎么回事；
-3. **后处理**：解码（把网格坐标还原成图像坐标）+ 置信度过滤 + **NMS**（去重选框），输出检测框。
+1. 导出检测模型：把 PyTorch 的 YOLOv5s 转成 ONNX，再转成一代平台 .rknn；
+2. 看懂输出：理解 YOLO 三个尺度头的输出张量结构；
+3. 板端后处理：解码 → 置信度过滤 → NMS，用 C 实现完整检测链路。
 
-## 1. YOLO 检测原理速览（嵌入式直觉）
+## 1. YOLO 输出长什么样
 
-### 1.1 检测 = 分类 + 定位
+以 YOLOv5s 为例（输入 640×640，COCO 80 类）。网络有**三个检测头**，分别负责大/中/小目标：
 
-**定义 1（目标检测, Object Detection）**：在一张图中找出所有目标，输出每个目标的**类别 + 边界框（x, y, w, h）**。
+| 输出头 | 特征图尺寸 | 感受野/负责目标 |
+|:---|:---|:---|
+| 大目标头 | 20×20 | 大目标（每格感受野大） |
+| 中目标头 | 40×40 | 中目标 |
+| 小目标头 | 80×80 | 小目标（每格感受野小） |
 
-嵌入式类比：分类像"看门人认人"（这人是谁），检测像"保安扫全场"（哪里有几个人、分别在哪个位置）。YOLO 的做法是把图像切成网格，**每个网格预测中心落在自己格子里的目标**。
-
-### 1.2 网格 + 锚框
-
-【图1：YOLO 网格与锚框】
+每个头的每个格子输出 `5 + 80 = 85` 个数：
 
 ```text
-图像被分成 S×S 网格（如 80×80）
-┌──┬──┬──┬──┐
-│  │  │  │  │  每个格子预测：
-├──┼──┼──┼──┤    · 目标中心是否在本格（置信度）
-│  │■ │  │  │    · 相对本格坐标 (x, y)
-├──┼──┼──┼──┤    · 宽高 (w, h)（相对锚框缩放）
-│  │  │  │  │    · 各类别概率
-└──┴──┴──┴──┘
-每个格子还有 K 个"预设形状"（锚框），预测的是对锚框的缩放
+[x, y, w, h, obj_conf, cls0, cls1, ..., cls79]
 ```
 
-> 图1 生图 prompt：网格示意图，白色背景。一张 4×4 网格，其中一个格子用红色高亮（目标中心），标注"目标中心在本格"；每个格子内画 3 个不同长宽比的虚线矩形（锚框：竖长条、横长条、方形）；右侧注释：每个格子预测 置信度 + 坐标(x,y) + 宽高(w,h) + 类别概率。扁平插画风，比例 16:9，中文标注。
+其中 `x, y` 是中心点相对格子的偏移，`w, h` 是宽高相对先验框的缩放，`obj_conf` 是"这里有目标"的置信度，后面 80 个是各类别分数。
 
-**锚框（anchor）** 是预先定义的一组"典型目标形状"（比如人的框偏竖长、车的框偏扁平）。模型不直接预测绝对宽高，而是预测**相对锚框的缩放量**——这让模型更容易学（不用从零学"像素"这种绝对量）。
+```mermaid
+flowchart LR
+    subgraph INPUT["输入 640×640×3"]
+    end
+    subgraph BACKBONE["Backbone<br/>CSPDarknet"]
+        B1["80×80 特征"] --> H1["小目标头<br/>80×80×85"]
+        B2["40×40 特征"] --> H2["中目标头<br/>40×40×85"]
+        B3["20×20 特征"] --> H3["大目标头<br/>20×20×85"]
+    end
+    INPUT --> BACKBONE
 
-### 1.3 为什么有三个尺度
+    style BACKBONE fill:#e0f2fe
+    style H1 fill:#fef3c7
+    style H2 fill:#fef3c7
+    style H3 fill:#fef3c7
+```
 
-目标大小差异很大：远处的行人只有几十像素，近处的车占满半屏。YOLO 用**三个尺度的特征图**分别检测大小目标：
+**三个头的输出会被拼接**成一个大张量：`(1, 25200, 85)`，其中：
 
-| 特征图 | 网格数 | 步长 stride | 负责的目标 |
-|:---|:---|:---|:---|
-| 小尺度层 | 80×80 | 8 | 小目标 |
-| 中尺度层 | 40×40 | 16 | 中目标 |
-| 大尺度层 | 20×20 | 32 | 大目标 |
+```text
+25200 = 80×80 + 40×40 + 20×20
+```
 
-## 2. 模型转换
+所以在板端，你拿到的就是 `[1, 25200, 85]` 的数组，后处理要做的：
 
-### 2.1 获取 YOLOv5s ONNX
+```text
+1. 对每个候选：sigmoid 得到有效概率
+2. 解码坐标：从网格偏移还原成像素坐标
+3. 过滤：obj_conf × max(cls) > 阈值才保留
+4. NMS：同类别高置信度框抑制重叠框
+```
 
-YOLOv5 官方仓库（`https://github.com/ultralytics/yolov5`）可导出 ONNX；也可以直接用瑞芯微官方示例中的 yolov5s onnx（`rknn-toolkit/examples/onnx/yolov5/` 下有转换脚本和说明，社区也有大量现成文件）。导出时注意：**固定输入尺寸 640×640**（动态尺寸转换麻烦且一代支持有限）。
+## 2. 模型导出与转换
 
-### 2.2 转换脚本
+### 2.1 导出 ONNX（PC 端，PyTorch 环境）
 
-与分类模型几乎相同，只多了**校准集用检测场景图片**（人、车等）：
+```bash
+git clone https://github.com/ultralytics/yolov5
+cd yolov5
+pip install -r requirements.txt
+```
+
+导出（yolov5s.pt → yolov5s.onnx）：
+
+```bash
+python export.py --weights yolov5s.pt --img 640 --batch 1 \
+    --include onnx --opset 11
+```
+
+**opset 注意**：一代工具链对 opset 版本兼容有限，**opset 11 最稳**。opset 13+ 可能引入不支持的算子导致转换失败或推理错误。
+
+### 2.2 ONNX → RKNN（PC 端）
+
+转换脚本（一代工具链 rknn-toolkit 1.x）：
 
 ```python
-# convert_yolov5.py —— YOLOv5s → INT8 RKNN
+# convert_yolov5.py
 from rknn.api import RKNN
 
-rknn = RKNN(verbose=True)
+rknn = RKNN()
 
+# 1. 配置：注意 mean/std 是 RGB 顺序（YOLOv5 训练用 RGB）
 rknn.config(
-    mean_values=[[0, 0, 0]],              # YOLOv5 训练预处理：除以 255（0~1）
-    std_values=[[255, 255, 255]],         # 即 x/255，不是 127.5 那套
-    target_platform='rv1126',
-    quantized_dtype='asymmetric_quantized-8',
-    quantized_algorithm='kl_divergence')
+    mean_values=[[0, 0, 0]],       # YOLOv5 归一化在模型内部，这里不再减
+    std_values=[[255, 255, 255]],  # 只做 /255
+    target_platform="rv1126",
+    reorder_channel="0 1 2",       # RGB，与训练一致
+)
 
-rknn.load_onnx(model='yolov5s.onnx')
+# 2. 加载 ONNX
+ret = rknn.load_onnx(model="yolov5s.onnx")
+assert ret == 0, "load_onnx 失败: %d" % ret
 
-# 检测模型校准集：放 100~300 张人/车/常见目标图片
-ret = rknn.build(do_quantization=True, dataset='dataset_det.txt')
-if ret != 0:
-    print('build 失败'); exit(ret)
+# 3. 构建
+ret = rknn.build(do_quantization=True, dataset="./dataset.txt")
+assert ret == 0, "build 失败: %d" % ret
 
-rknn.export_rknn('yolov5s_int8.rknn')
-print('✅ YOLOv5s 量化转换完成')
-rknn.release()
+# 4. 导出
+ret = rknn.export_rknn("yolov5s_int8.rknn")
+assert ret == 0, "export 失败: %d" % ret
+print("转换完成")
 ```
 
-**⚠️ 检测模型的 mean/std 和分类不同**：YOLOv5 官方预处理是像素除以 255（归一化到 0~1），所以 `mean_values=[[0,0,0]]`、`std_values=[[255,255,255]]`。**照抄分类模型的 127.5 那套会出问题**——再次验证那条铁律：预处理必须匹配模型训练时的设定。
+`dataset.txt` 是量化校准图片列表（每行一个图片路径，20~100 张代表真实场景的图即可）。
 
-## 3. 看懂 YOLO 输出
+> ⚠️ **不导出 NMS**：YOLOv5 的 ONNX 导出默认带一个 NMS 分支（`--include onnx` 不带 `nms` 参数时一般不带，但**确认输出节点只有 3 个检测头或 1 个拼接张量**）。RKNN 一代平台不支持在 NPU 里跑 NMS，**NMS 必须在 CPU 后处理里自己写**。转换后用 Netron 打开 onnx 检查输出节点数量。
 
-转换后的模型推理输出 shape 为 `[1, 25200, 85]`：
-
-```text
-25200 = (80×80 + 40×40 + 20×20) × 3 锚框 = 8400 × 3
-85    = 5 + 80 = [cx, cy, w, h, obj_conf] + 80 个类别得分 (COCO)
-```
-
-【图2：输出向量结构】
-
-```text
-[1, 25200, 85]
- │
- ├── 前 8400 行：80×80 小尺度层（stride=8）的预测
- ├── 中 8400 行：40×40 中尺度层（stride=16）
- └── 后 8400 行：20×20 大尺度层（stride=32）
-
-每行 85 个值：
-┌────┬────┬────┬────┬────────┬───────────────┐
-│ cx │ cy │ w  │ h  │ obj_conf│ 80 类得分      │
-└────┴────┴────┴────┴────────┴───────────────┘
- 格子内  格子内  相对  相对   该格有目标的   每个类别的
- 中心x  中心y  锚框  锚框   概率          概率
-```
-
-> 图2 生图 prompt：数据布局图，白色背景。上方一个长条矩形标注 "[1, 25200, 85]"，用三种颜色分段标注：蓝（80×80 层）、绿（40×40 层）、橙（20×20 层）；下方展开一行 85 维向量，前 5 格高亮标注 cx/cy/w/h/obj_conf，后 80 格灰色标注"80 类得分"。扁平插画风，比例 16:9，中文标注。
-
-## 4. 后处理：解码 + 置信度过滤 + NMS
-
-### 4.1 为什么要后处理
-
-NPU 输出的是"网格空间"的原始预测，要变成图像上的像素坐标框，需要：
-
-1. **解码**：网格坐标 × stride + 锚框 → 像素坐标；
-2. **过滤**：置信度（目标概率 × 类别概率）低于阈值的丢掉；
-3. **NMS**：同一目标会有多个框重叠，保留最好的，抑制重复的。
-
-**定义 2（NMS, Non-Maximum Suppression，非极大值抑制）**：在多个重叠的候选框中，保留置信度最高的，删除与它 IoU 超过阈值的其他框。
-
-嵌入式类比：NMS 就像**多路信号去重**——多个传感器同时报警同一事件时，只保留最强信号的那一路，避免重复上报。IoU（交并比）就是两个框的重叠程度：重叠越多，越可能是同一个目标。
-
-### 4.2 Python 后处理完整代码
-
-板端用 lite 推理 + Python 后处理（验证阶段足够用；量产再移植 C）：
+### 2.3 转换后先 PC 模拟验证
 
 ```python
-# detect.py —— YOLOv5 板端检测（lite + 后处理）
-import numpy as np
-from PIL import Image, ImageDraw
-from rknnlite.api import RKNNLite
-
-# ---- 常量 ----
-CLASSES = ('person', 'bicycle', 'car', ...)   # COCO 80 类，完整列表见附录/官方
-ANCHORS = {
-    8:  [[10,13], [16,30], [33,23]],    # 80×80 层锚框
-    16: [[30,61], [62,45], [59,119]],   # 40×40 层锚框
-    32: [[116,90], [156,198], [373,326]],  # 20×20 层锚框
-}
-CONF_THRES = 0.25
-IOU_THRES = 0.45
-IMG_SIZE = 640
-
-def sigmoid(x):
-    return 1.0 / (1.0 + np.exp(-x))
-
-def decode(pred, stride, anchors):
-    """把一个尺度的输出解码成框（xyxy 像素坐标）+ 得分"""
-    # pred: [1, 3, H, W, 85] → [H*W*3, 85]
-    pred = pred.reshape(3, -1, 85)
-    boxes, scores = [], []
-    for ai, (aw, ah) in enumerate(anchors):
-        p = pred[ai]                      # [H*W, 85]
-        h, w = p.shape[0] ** 0.5, p.shape[0] ** 0.5  # 简化示意，见下方说明
-        # 实际按网格坐标解码（完整代码见官方示例）：
-        # cx = (sigmoid(p[:,0]) + grid_x) * stride
-        # cy = (sigmoid(p[:,1]) + grid_y) * stride
-        # bw = exp(p[:,2]) * aw ; bh = exp(p[:,3]) * ah
-        # 此处为流程示意，省略网格索引计算
-        obj = sigmoid(p[:, 4])
-        cls = sigmoid(p[:, 5:]).max(axis=1)
-        conf = obj * cls
-        mask = conf > CONF_THRES
-        # ... 拼接有效框到 boxes / scores ...
-    return boxes, scores
-
-def nms(boxes, scores, iou_thres=IOU_THRES):
-    """NMS：按得分排序，逐个保留，抑制 IoU 过高的框"""
-    order = np.argsort(scores)[::-1]
-    keep = []
-    while order.size > 0:
-        i = order[0]
-        keep.append(i)
-        if order.size == 1:
-            break
-        ious = compute_iou(boxes[i], boxes[order[1:]])
-        order = order[1:][ious <= iou_thres]
-    return keep
-
-def compute_iou(box, boxes):
-    """计算一个框与一组框的 IoU（交并比）"""
-    x1 = np.maximum(box[0], boxes[:, 0])
-    y1 = np.maximum(box[1], boxes[:, 1])
-    x2 = np.minimum(box[2], boxes[:, 2])
-    y2 = np.minimum(box[3], boxes[:, 3])
-    inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
-    area_box = (box[2] - box[0]) * (box[3] - box[1])
-    area_boxes = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-    union = area_box + area_boxes - inter
-    return inter / union
-
-# ---- 主流程 ----
-rknn = RKNNLite()
-rknn.load_rknn('yolov5s_int8.rknn')
-rknn.init_runtime()
-
-img = Image.open('test_det.jpg').convert('RGB')
-img_resized = img.resize((IMG_SIZE, IMG_SIZE))
-input_data = np.array(img_resized).astype(np.uint8)
-
-outputs = rknn.inference(inputs=[input_data])   # 3 个输出（3 个尺度）
-boxes_all, scores_all = [], []
-for out, stride, anchors in zip(outputs, (8, 16, 32),
-                                (ANCHORS[8], ANCHORS[16], ANCHORS[32])):
-    boxes, scores = decode(out, stride, anchors)
-    boxes_all += boxes
-    scores_all += scores
-
-boxes_all = np.array(boxes_all)
-scores_all = np.array(scores_all)
-keep = nms(boxes_all, scores_all)
-
-# 画框
-draw = ImageDraw.Draw(img)
-for idx in keep:
-    x1, y1, x2, y2 = boxes_all[idx] * (img.width / IMG_SIZE)   # 缩放回原图
-    draw.rectangle([x1, y1, x2, y2], outline='red', width=3)
-img.save('result.jpg')
-print(f'检测到 {len(keep)} 个目标, 结果保存 result.jpg')
-
-rknn.release()
+# 模拟推理，确认转换正确再上板
+rknn.init_runtime()   # 默认 PC 模拟（需要 x86 的 rknn-toolkit）
+img = cv2.imread("bus.jpg")   # YOLOv5 官方测试图
+img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+img = cv2.resize(img, (640, 640))
+img = np.expand_dims(img, 0).astype(np.uint8)
+outputs = rknn.inference(inputs=[img])
+print("输出 shape:", [o.shape for o in outputs])
+# 预期: [(1, 25200, 85)] 或 [(1,25200,85)] 单输出
 ```
 
-> ⚠️ 上面的 `decode` 是**流程示意**：完整实现需要按网格坐标（grid_x/grid_y）逐点解码，代码较长。瑞芯微官方示例 `rknn-toolkit/examples/onnx/yolov5/` 提供完整可运行的 Python 后处理（`yolov5_postprocess.py`），**建议直接参考官方实现**，核心逻辑与上面一致：sigmoid → 网格解码 → 置信度过滤 → NMS。
+## 3. 板端后处理：完整 C 实现
 
-## 5. 常见问题
+### 3.1 数据结构
+
+```c
+#define MAX_BOXES 1000
+
+typedef struct {
+    float x1, y1, x2, y2;   // 像素坐标（左上/右下）
+    float score;            // 最终得分
+    int class_id;           // 类别
+} Box;
+
+// 按得分降序排序（qsort 用）
+int cmp_box(const void *a, const void *b) {
+    Box *ba = (Box *)a, *bb = (Box *)b;
+    return (bb->score > ba->score) ? 1 : -1;
+}
+```
+
+### 3.2 解码 + 置信度过滤
+
+YOLOv5 的坐标解码公式（`x,y` 是中心点相对网格的偏移，`w,h` 是先验框的缩放）：
+
+```c
+// 输入: output 为 (25200, 85) 的 float 数组（板端拿到的拼接张量）
+// stride[3] = {8, 16, 32} 对应 80/40/20 网格
+// anchors 为每个尺度的 3 组先验框（YOLOv5s 默认锚）
+static int decode_yolov5(const float *output, int grid0, int grid1,
+                         float stride, const float *anchors,
+                         float conf_thresh, Box *boxes, int max_boxes) {
+    int count = 0;
+    int h = grid1, w = grid0;          // 该尺度网格
+    for (int gy = 0; gy < h; gy++) {
+        for (int gx = 0; gx < w; gx++) {
+            for (int a = 0; a < 3; a++) {           // 3 个锚
+                const float *p = output + (gy * w + gx) * 3 * 85 + a * 85;
+                float obj = sigmoid(p[4]);           // 目标置信度
+                // 找 80 个类别中最高分
+                int cls_id = 0; float max_cls = 0;
+                for (int c = 0; c < 80; c++) {
+                    float s = sigmoid(p[5 + c]);
+                    if (s > max_cls) { max_cls = s; cls_id = c; }
+                }
+                float score = obj * max_cls;         // 最终得分
+                if (score < conf_thresh) continue;
+
+                // 解码（YOLOv5 公式）
+                float cx = (gx + sigmoid(p[0])) * stride;
+                float cy = (gy + sigmoid(p[1])) * stride;
+                float bw = anchors[a * 2]     * expf(p[2]);
+                float bh = anchors[a * 2 + 1] * expf(p[3]);
+
+                boxes[count].x1 = cx - bw / 2;
+                boxes[count].y1 = cy - bh / 2;
+                boxes[count].x2 = cx + bw / 2;
+                boxes[count].y2 = cy + bh / 2;
+                boxes[count].score = score;
+                boxes[count].class_id = cls_id;
+                count++;
+                if (count >= max_boxes) return count;
+            }
+        }
+    }
+    return count;
+}
+```
+
+> 说明：`sigmoid` 和 `expf` 是标准数学函数；`(1, 25200, 85)` 的输出在内存里正好按"80×80 头在前、40×40 中间、20×20 在后"的顺序排布，循环时用不同 `stride` 分别遍历三段即可（代码里以单个尺度为例，三个尺度调用三次）。
+
+### 3.3 NMS
+
+```c
+// 简单 NMS：按得分从高到低，抑制与已选框 IoU 超过阈值的框
+static int nms(Box *boxes, int count, float iou_thresh, Box *result) {
+    qsort(boxes, count, sizeof(Box), cmp_box);
+    int keep = 0;
+    char removed[MAX_BOXES] = {0};
+    for (int i = 0; i < count; i++) {
+        if (removed[i]) continue;
+        result[keep++] = boxes[i];
+        for (int j = i + 1; j < count; j++) {
+            if (removed[j]) continue;
+            if (boxes[j].class_id != boxes[i].class_id) continue; // 仅同类抑制
+            float iou = calc_iou(&boxes[i], &boxes[j]);
+            if (iou > iou_thresh) removed[j] = 1;
+        }
+    }
+    return keep;
+}
+
+// IoU：交集面积 / 并集面积
+float calc_iou(const Box *a, const Box *b) {
+    float ix1 = fmaxf(a->x1, b->x1);
+    float iy1 = fmaxf(a->y1, b->y1);
+    float ix2 = fminf(a->x2, b->x2);
+    float iy2 = fminf(a->y2, b->y2);
+    float iw = fmaxf(0, ix2 - ix1);
+    float ih = fmaxf(0, iy2 - iy1);
+    float inter = iw * ih;
+    float area_a = (a->x2 - a->x1) * (a->y2 - a->y1);
+    float area_b = (b->x2 - b->x1) * (b->y2 - b->y1);
+    return inter / (area_a + area_b - inter);
+}
+```
+
+### 3.4 主流程（板端五步 API + 后处理）
+
+```c
+// 伪代码：完整检测流程
+rknn_init(&ctx, "yolov5s_int8.rknn", 0, 0, NULL);
+rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
+
+// 取一帧（摄像头/图片），缩放到 640×640，RGB
+unsigned char *frame = get_frame();          // 见摄像头专题
+unsigned char *resized = malloc(640*640*3);
+resize_bilinear(frame, w, h, resized, 640, 640, 3);
+
+// 喂数据
+rknn_input inputs[1] = {0};
+inputs[0].index = 0;
+inputs[0].type = RKNN_TENSOR_UINT8;
+inputs[0].fmt = RKNN_TENSOR_NHWC;
+inputs[0].size = 640*640*3;
+inputs[0].buf = resized;
+inputs[0].pass_through = 0;
+rknn_inputs_set(ctx, 1, inputs);
+
+// 推理
+rknn_run(ctx, NULL);
+
+// 取输出（want_float=1 拿 float）
+rknn_output outputs[1] = {0};
+outputs[0].want_float = 1;
+rknn_outputs_get(ctx, 1, outputs, NULL);
+float *pred = (float *)outputs[0].buf;      // (25200, 85)
+
+// 后处理
+Box boxes[MAX_BOXES];
+int n = 0;
+n += decode_yolov5(pred, 80, 80, 8,  anchors0, 0.25, boxes+n, MAX_BOXES-n);
+n += decode_yolov5(pred + 80*80*3*85, 40, 40, 16, anchors1, 0.25, boxes+n, MAX_BOXES-n);
+n += decode_yolov5(pred + (80*80+40*40)*3*85, 20, 20, 32, anchors2, 0.25, boxes+n, MAX_BOXES-n);
+
+Box result[100];
+int keep = nms(boxes, n, 0.45, result);
+
+// 画框/上报
+for (int i = 0; i < keep; i++) {
+    printf("class=%d score=%.3f box=(%.0f,%.0f,%.0f,%.0f)\n",
+           result[i].class_id, result[i].score,
+           result[i].x1, result[i].y1, result[i].x2, result[i].y2);
+}
+
+rknn_outputs_release(ctx, 1, outputs);
+rknn_release(ctx);
+```
+
+## 4. 后处理全流程
+
+```mermaid
+flowchart TD
+    A["NPU 输出<br/>25200×85 float"] --> B["三尺度遍历<br/>80×80 / 40×40 / 20×20"]
+    B --> C["sigmoid + 类别取最大"]
+    C --> D["得分 = obj × max_cls"]
+    D -->|"score < 0.25 丢弃"| E["过滤"]
+    D -->|"score ≥ 0.25"| F["坐标解码<br/>网格 → 像素"]
+    F --> G["NMS<br/>同类 IoU > 0.45 抑制"]
+    G --> H["最终目标框列表"]
+
+    style A fill:#fef3c7
+    style F fill:#e0f2fe
+    style G fill:#d1fae5
+    style H fill:#d1fae5
+```
+
+### 4.1 为什么 obj × max(cls) 而不是直接用 obj
+
+`obj_conf` 表示"这里有目标"，`max(cls)` 表示"最可能是哪类"。两者相乘是**联合概率**：既要有目标、又要类别置信度高。只用 `obj_conf` 过滤会把"低置信度但恰好有个类别分数"的误检放进来。**这是检测后处理最容易忽略的细节**。
+
+### 4.2 阈值怎么选
+
+| 阈值 | 作用 | 建议值 | 调高/调低影响 |
+|:---|:---|:---|:---|
+| conf_thresh | 候选框过滤 | 0.25 | 调高少框快但漏检；调低多框慢但误检多 |
+| iou_thresh | NMS 抑制 | 0.45 | 调高保留重叠框；调低抑制更狠（适合密集目标） |
+
+**实践**：先固定 iou=0.45，用 conf 调召回；再用 iou 调精度。看你的应用是"宁缺毋滥"（报警类）还是"宁可多报"（辅助标注类）。
+
+## 5. 性能观察
+
+| 环节 | 量级（YOLOv5s INT8 @640） | 说明 |
+|:---|:---|:---|
+| NPU 推理 | 50~150 ms | 一代平台跑 640 输入偏重，可用 416 输入降一半以上 |
+| 解码+过滤 | 2~10 ms | 纯 CPU，25200 候选是主要开销 |
+| NMS | 1~5 ms | 候选少则快 |
+
+**优化提示**：YOLOv5s 在 RV1126 上 640 输入比较吃力。两个常用招：
+
+1. **换小输入**：`--img 416` 重训练/重导出，帧率翻倍，精度略降；
+2. **换小模型**：YOLOv5n / YOLOv5s 的剪枝版。
+
+```mermaid
+flowchart LR
+    A["YOLOv5s 640<br/>50~150ms"] -->|"方案1: 输入改 416"| B["YOLOv5s 416<br/>25~70ms"]
+    A -->|"方案2: 换 YOLOv5n"| C["YOLOv5n 640<br/>20~50ms"]
+    B --> D["实测为准"]
+    C --> D
+
+    style A fill:#fee2e2
+    style B fill:#d1fae5
+    style C fill:#d1fae5
+```
+
+## 6. 常见问题
 
 | 现象 | 原因 | 处理 |
 |:---|:---|:---|
-| 检测框全在图像边缘/中心 | 解码公式错误（grid 索引没加） | 对照官方示例逐行核对解码 |
-| 同一目标多个重叠框 | NMS 阈值太松 / 没跑 NMS | 确认 NMS；IOU_THRES 调低（0.4~0.5） |
-| 什么都检不到 | CONF_THRES 太高 / 量化掉精度 | 降到 0.15 试试；检查校准集 |
-| 小目标漏检 | 量化对检测模型更敏感 | kl_divergence；校准集覆盖小目标场景 |
-| 框位置偏 | 原图缩放比例没还原 | 框坐标要 ×(原图宽/输入宽) |
+| 转换报不支持算子 | ONNX opset 太高 / 模型带了 NMS | 用 opset 11；导出时去掉 NMS 分支 |
+| 板端输出 shape 不对 | 转换时输出节点没确认 | Netron 检查 ONNX，确认 3 头或 1 个拼接张量 |
+| 检测框全偏 | mean/std 或通道顺序错 | YOLOv5 用 RGB + mean 0 + std 255 |
+| 框在但类别错 | 类别顺序与 COCO 标签不一致 | 核对 labels.txt 与训练时类别顺序 |
+| 大量重复框 | NMS 没做 / iou 阈值太高 | 检查后处理是否调用了 NMS |
+| 小目标全漏 | 输入太小 / conf 阈值太高 | 提高输入分辨率；降低 conf_thresh |
+| 帧率太低 | 640 输入太重 | 改 416 输入或换小模型 |
 
-## 6. 练习与里程碑
+## 7. 练习与里程碑
 
 ### 练习
 
-1. **跑通检测**：用官方示例的完整后处理代码，在板子上跑通人/车检测，保存标注图；
-2. **调阈值**：分别用 CONF_THRES=0.1 / 0.25 / 0.5 跑同一张图，观察漏检与误检的权衡；
-3. **量化对比**：对比浮点 YOLO 与 INT8 YOLO 在同一张图上的检测结果，观察量化对检测精度的影响；
-4. **读官方代码**：读懂官方 `yolov5_postprocess.py` 的网格解码部分，画一张解码数据流图。
+1. **转换**：完成 YOLOv5s → ONNX(opset11) → .rknn 全流程，Netron 确认输出节点；
+2. **PC 模拟**：用 bus.jpg 模拟推理，检查输出 shape 是 (1,25200,85)；
+3. **板端跑通**：把解码 + 过滤 + NMS 移植到板子，对 bus.jpg 输出检测框坐标，与 PC 端模拟结果对比（坐标应一致）；
+4. **调参实验**：改变 conf_thresh（0.1/0.25/0.5）和 iou_thresh（0.3/0.45/0.6），观察检测结果和耗时变化，记录成表；
+5. **画框**：用 OpenCV 在图上画出检测框并保存，肉眼验证检测正确性。
 
 ### 里程碑自检
 
-- [ ] 能解释 25200 和 85 的来历
-- [ ] 知道检测模型的 mean/std 与分类模型不同（YOLOv5 用 0/255）
-- [ ] 能跑通 YOLO 检测并输出正确检测框
-- [ ] 能说清 NMS 的原理和 IoU 的作用
-- [ ] 能量化对比浮点/INT8 检测效果
+- [ ] 能解释 YOLOv5 三尺度输出结构和 25200 的来历
+- [ ] 能独立完成检测模型的 ONNX→RKNN 转换
+- [ ] 能写出解码 + 过滤 + NMS 的 C 实现
+- [ ] 知道 obj × max(cls) 的含义和必要性
+- [ ] 能说出两个提升帧率的思路
 
-## 7. 小结
+## 8. 小结
 
-- **检测 = 分类 + 定位**：YOLO 把图切网格、用锚框预测目标框，三个尺度覆盖大小目标；
-- **输出结构**：`[1, 25200, 85]`（8400 网格 × 3 锚框，85 = 5 框参数 + 80 类）；
-- **转换注意**：YOLOv5 预处理是 0~255 那套（mean=0, std=255），别照抄分类；
-- **后处理三件套**：解码（网格 → 像素）→ 置信度过滤 → NMS 去重，官方示例代码可参考。
+- **YOLOv5 输出**：三尺度头拼接成 (1, 25200, 85)，85 = 5 + 80（坐标 + 目标置信度 + 类别）；
+- **转换要点**：opset 11、不导出 NMS、RGB + mean 0 / std 255；
+- **后处理三步**：sigmoid 解码 → obj×max(cls) 过滤 → 同类 NMS；
+- **性能**：一代平台 640 输入偏重，416 输入或 YOLOv5n 是实战常用折中；
+- **阈值**：conf 调召回，iou 调精度，按应用场景取舍。
 
-检测跑通后，你的板子已经能"看懂"画面里有什么、在哪。但目前的输入还是**静态图片**——真实产品是**摄像头实时视频**。下一阶段把摄像头接进来：RV1126 的 ISP/RKMedia 取流 → 推理 → 结果显示，组成一条完整的实时链路。
+检测链路在单帧上跑通了，但"检测一张图"和"实时检测摄像头视频流"是两回事。下一程把摄像头接进来：RKMedia 的 VI→VPSS→NPU 数据流，让 YOLO 真正"看起来"。
 
-> 🏷️ 标签：#RKNN #YOLO #目标检测 #NMS #后处理 #RV1126
+> 🏷️ 标签：#RKNN #YOLOv5 #目标检测 #NMS #后处理 #模型转换
