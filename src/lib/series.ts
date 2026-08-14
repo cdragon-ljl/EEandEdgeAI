@@ -1,11 +1,11 @@
-export type SeriesId = 'cuda' | 'ee-system' | 'rknn' | 'zephyr' | 'bsp';
+export type SeriesId = 'cuda' | 'ee-system' | 'rknn' | 'zephyr' | 'bsp' | 'video-audio';
 
 export interface SeriesMeta {
   id: SeriesId;
   title: string;
   shortTitle: string;
   description: string;
-  accent: 'blue' | 'emerald' | 'violet' | 'amber' | 'cyan';
+  accent: 'blue' | 'emerald' | 'violet' | 'amber' | 'cyan' | 'rose';
   href: string;
   label: string;
 }
@@ -56,6 +56,15 @@ export const SERIES: Record<SeriesId, SeriesMeta> = {
     href: '/bsp/',
     label: '板级开发',
   },
+  'video-audio': {
+    id: 'video-audio',
+    title: '音视频开发实战',
+    shortTitle: 'Video & Audio',
+    description: '从图像与音频基础、摄像头与 ISP，到编码、推流、FFmpeg 和 GStreamer，系统构建端侧音视频能力。',
+    accent: 'rose',
+    href: '/video-audio/',
+    label: '多媒体系统',
+  },
 };
 
-export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'rknn', 'zephyr', 'bsp'];
+export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'rknn', 'zephyr', 'bsp', 'video-audio'];

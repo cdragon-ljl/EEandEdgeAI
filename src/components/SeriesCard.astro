@@ -14,6 +14,7 @@ const gradientMap = {
   violet: { from: '#8B5CF6', to: '#EC4899', glow: 'rgba(139,92,246,0.15)' },
   amber: { from: '#F59E0B', to: '#EF4444', glow: 'rgba(245,158,11,0.15)' },
   cyan: { from: '#06B6D4', to: '#14B8A6', glow: 'rgba(6,182,212,0.15)' },
+  rose: { from: '#F43F5E', to: '#FB7185', glow: 'rgba(244,63,94,0.15)' },
 };
 const gradient = gradientMap[series.accent];
 const iconPath = {
@@ -22,6 +23,7 @@ const iconPath = {
   rknn: 'M3.75 13.5 14.25 2.25 12 10.5h8.25L9.75 21.75 12 13.5H3.75Z',
   zephyr: 'M12 2.25 4.5 20.25h6l-1.5-6h6l-1.5 6h6L12 2.25Zm0 4.8 2.1 5.7H9.9L12 7.05Z',
   bsp: 'M3.75 19.5V4.5h16.5v15H3.75Zm3-12v9h10.5v-9H6.75Zm2.25 2.25h6v4.5H9v-4.5Z',
+  'video-audio': 'M15.75 10.5V6.75A2.25 2.25 0 0 0 13.5 4.5h-9A2.25 2.25 0 0 0 2.25 6.75v10.5A2.25 2.25 0 0 0 4.5 19.5h9a2.25 2.25 0 0 0 2.25-2.25V13.5L21 16.5v-9l-5.25 3Z',
 }[series.id];
 ---
 
