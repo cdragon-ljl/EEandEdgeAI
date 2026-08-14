@@ -3,6 +3,7 @@ import Header from '../components/Header.astro';
 import Search from '../components/Search.astro';
 import CopyButton from '../components/CopyButton.astro';
 import MermaidRenderer from '../components/MermaidRenderer.astro';
+import { withBase } from '../lib/paths';
 import '../styles/global.css';
 
 interface Props {
@@ -22,6 +23,8 @@ const canonicalURL = new URL(Astro.url.pathname, Astro.site);
     <meta charset="UTF-8" />
     <meta name="description" content={description} />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" sizes="256x256" href={withBase('/favicon.png')} />
+    <link rel="apple-touch-icon" href={withBase('/favicon.png')} />
     <link rel="canonical" href={canonicalURL} />
     <meta name="generator" content={Astro.generator} />
     <meta name="theme-color" content="#007aff" />
