@@ -1,11 +1,11 @@
-export type SeriesId = 'cuda' | 'ee-system' | 'rknn' | 'zephyr';
+export type SeriesId = 'cuda' | 'ee-system' | 'rknn' | 'zephyr' | 'bsp';
 
 export interface SeriesMeta {
   id: SeriesId;
   title: string;
   shortTitle: string;
   description: string;
-  accent: 'blue' | 'emerald' | 'violet' | 'amber';
+  accent: 'blue' | 'emerald' | 'violet' | 'amber' | 'cyan';
   href: string;
   label: string;
 }
@@ -47,6 +47,15 @@ export const SERIES: Record<SeriesId, SeriesMeta> = {
     href: '/zephyr/',
     label: 'RTOS 生态',
   },
+  bsp: {
+    id: 'bsp',
+    title: 'Linux BSP 开发实战',
+    shortTitle: 'Linux BSP',
+    description: '围绕启动链路、SDK 构建、U-Boot、设备树与板级调试，建立嵌入式 Linux BSP 开发的完整工程视角。',
+    accent: 'cyan',
+    href: '/bsp/',
+    label: '板级开发',
+  },
 };
 
-export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'rknn', 'zephyr'];
+export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'rknn', 'zephyr', 'bsp'];
