@@ -1,0 +1,52 @@
+---
+---
+
+<script>
+  const renderMermaidDiagrams = async () => {
+    const blocks = Array.from(
+      document.querySelectorAll('pre > code.language-mermaid, pre[data-language="mermaid"] > code'),
+    );
+    if (blocks.length === 0) return;
+
+    const mermaid = (await import('mermaid')).default;
+    const isDark = document.documentElement.classList.contains('dark');
+
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: 'strict',
+      theme: isDark ? 'dark' : 'default',
+    });
+
+    await Promise.all(
+      blocks.map(async (code, index) => {
+        const pre = code.parentElement;
+        if (!pre || pre.dataset.mermaidRendered === 'true') return;
+
+        const lineNodes = Array.from(code.querySelectorAll('.line'));
+        const source =
+          lineNodes.length > 0
+            ? lineNodes.map((line) => line.textContent ?? '').join('\n').trim()
+            : (code.textContent?.trim() ?? '');
+        if (!source) return;
+
+        const wrapper = document.createElement('div');
+        wrapper.className = 'mermaid-diagram';
+        wrapper.setAttribute('data-mermaid-source', source);
+
+        try {
+          const { svg } = await mermaid.render(`mermaid-${Date.now()}-${index}`, source);
+          wrapper.innerHTML = svg;
+          pre.replaceWith(wrapper);
+        } catch (error) {
+          pre.dataset.mermaidRendered = 'failed';
+          pre.classList.add('mermaid-error');
+          console.error('Failed to render Mermaid diagram', error);
+        }
+      }),
+    );
+  };
+
+  document.addEventListener('DOMContentLoaded', () => {
+    renderMermaidDiagrams();
+  });
+</script>

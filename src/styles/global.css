@@ -261,6 +261,36 @@
   color: #3fb950;
 }
 
+.prose .mermaid-diagram {
+  margin: 1.75em 0;
+  overflow-x: auto;
+  border: 1px solid #e0e0e8;
+  border-left: 3px solid #007aff;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 1.25rem;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.08);
+}
+
+.dark .prose .mermaid-diagram {
+  border-color: #2a2a3e;
+  border-left-color: #0a84ff;
+  background: #111827;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2), 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+
+.prose .mermaid-diagram svg {
+  display: block;
+  height: auto;
+  max-width: none;
+  min-width: 640px;
+  margin: 0 auto;
+}
+
+.prose pre.astro-code.mermaid-error {
+  border-left-color: #ef4444;
+}
+
 :root {
   --pagefind-ui-scale: 0.9;
   --pagefind-ui-primary: #007aff;

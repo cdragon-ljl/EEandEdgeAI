@@ -2,6 +2,7 @@
 import Header from '../components/Header.astro';
 import Search from '../components/Search.astro';
 import CopyButton from '../components/CopyButton.astro';
+import MermaidRenderer from '../components/MermaidRenderer.astro';
 import '../styles/global.css';
 
 interface Props {
@@ -72,6 +73,7 @@ const canonicalURL = new URL(Astro.url.pathname, Astro.site);
 
     <Search />
     <CopyButton />
+    <MermaidRenderer />
 
     <script>
       const progressBar = document.getElementById('reading-progress');
