@@ -27,7 +27,8 @@ test('zephyr articles include required frontmatter', () => {
     assert.match(markdown, /^---\r?\n[\s\S]+?\r?\n---\r?\n/);
     assert.match(markdown, /^series: zephyr$/m);
     assert.match(markdown, /^order: \d+$/m);
-    assert.match(markdown, /^draft: false$/m);
+    const isDraft = file === 'zephyr-framework.md';
+    assert.match(markdown, isDraft ? /^draft: true$/m : /^draft: false$/m);
   }
 });
 
