@@ -50,22 +50,22 @@ test('bsp articles include required frontmatter', () => {
   const bspDir = 'docs/articles/bsp';
   const files = readdirSync(bspDir).filter((file) => file.endsWith('.md'));
 
-  assert.equal(files.length, 28);
+  assert.equal(files.length, 49);
 
   for (const file of files) {
     const markdown = readFileSync(join(bspDir, file), 'utf8');
     assert.match(markdown, /^---\r?\n[\s\S]+?\r?\n---\r?\n/);
     assert.match(markdown, /^series: bsp$/m);
     assert.match(markdown, /^order: \d+$/m);
-    const isDraft = file === 'linux-bsp-framework.md' || /^bsp-(24|25|26|27)-/.test(file);
+    const isDraft = file === 'linux-bsp-framework.md';
     assert.match(markdown, isDraft ? /^draft: true$/m : /^draft: false$/m);
   }
 });
 
-test('published BSP articles 10 through 23 meet the long-form publication standard', () => {
+test('published BSP articles 10 through 48 meet the long-form publication standard', () => {
   const bspDir = 'docs/articles/bsp';
 
-  for (let order = 10; order <= 23; order += 1) {
+  for (let order = 10; order <= 48; order += 1) {
     const prefix = `bsp-${String(order).padStart(2, '0')}-`;
     const file = readdirSync(bspDir).find((candidate) => candidate.startsWith(prefix));
     assert.ok(file, `missing article for BSP-${String(order).padStart(2, '0')}`);
