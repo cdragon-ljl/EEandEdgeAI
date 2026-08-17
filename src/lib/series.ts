@@ -1,11 +1,11 @@
-export type SeriesId = 'cuda' | 'ee-system' | 'rknn' | 'zephyr' | 'bsp' | 'video-audio';
+export type SeriesId = 'cuda' | 'ee-system' | 'rknn' | 'riscv' | 'zephyr' | 'bsp' | 'video-audio';
 
 export interface SeriesMeta {
   id: SeriesId;
   title: string;
   shortTitle: string;
   description: string;
-  accent: 'blue' | 'emerald' | 'violet' | 'amber' | 'cyan' | 'rose';
+  accent: 'blue' | 'emerald' | 'violet' | 'indigo' | 'amber' | 'cyan' | 'rose';
   href: string;
   label: string;
 }
@@ -38,6 +38,15 @@ export const SERIES: Record<SeriesId, SeriesMeta> = {
     href: '/rknn/',
     label: '端侧部署',
   },
+  riscv: {
+    id: 'riscv',
+    title: 'RISC-V 架构精讲',
+    shortTitle: 'RISC-V',
+    description: '从 QEMU 裸机实验、架构原理到 FPGA 软核，建立可动手验证的 RISC-V 系统能力。',
+    accent: 'indigo',
+    href: '/riscv/',
+    label: '架构与软核',
+  },
   zephyr: {
     id: 'zephyr',
     title: 'Zephyr RTOS 实战',
@@ -67,4 +76,4 @@ export const SERIES: Record<SeriesId, SeriesMeta> = {
   },
 };
 
-export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'rknn', 'zephyr', 'bsp', 'video-audio'];
+export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'video-audio'];

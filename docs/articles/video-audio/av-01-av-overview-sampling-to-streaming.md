@@ -53,11 +53,6 @@ pwd
 /home/你的用户名/av-lab
 ```
 
-**不对怎么办**：
-
-- `mkdir: cannot create directory '~/av-lab'`：说明家目录不可写（罕见）。先 `cd ~` 确认家目录存在，再 `mkdir av-lab`
-- 显示的不是 `/home/xxx/av-lab`：确认你当前用户的家目录路径，后续命令都从 `cd ~/av-lab` 开始
-
 再确认系统是什么、有没有基础工具：
 
 ```bash
@@ -77,7 +72,6 @@ which apt
 /usr/bin/apt
 ```
 
-**不对怎么办**：没有 `apt` 说明不是 Debian/Ubuntu 系。本系列的安装命令以 Debian/Ubuntu 为准；如果你用的是 Fedora/Arch，把 `apt` 换成对应包管理器（`dnf`/`pacman`），包名基本一致。
 
 ## 一、数字化的三步：采样、量化、编码
 
@@ -106,33 +100,33 @@ which apt
 | 位深 | 每样本的量化位数 | 16bit、24bit |
 | 声道 | 同时采集的通道数 | 单声道、双声道（立体声）、多声道 |
 
-## 二、先把带宽账算清楚：一帧 1080p30 有多大
+## 二、带宽：一帧 1080p30 有多大
 
-做音视频，第一项基本功是**会算数据量**。不把账算清，后面的编码选型、缓冲设计、网络规划都无从谈起。**别跳过去，下面每一步都跟着算**，工具链装好后用真实文件验证。
+做音视频，第一项基本功是**会算数据量**。不把账算清，后面的编码选型、缓冲设计、网络规划都无从谈起。
 
-**第一步：1080p 一帧有多少个像素。**
+**一：1080p 一帧有多少个像素。**
 
 ```text
 1920 × 1080 = 2,073,600 个像素
 ```
 
-**第二步：最常见的 YUV420（NV12）格式下，每个像素平均占多少字节。**
+**二：最常见的 YUV420（NV12）格式下，每个像素平均占多少字节。**
 
 YUV420 里，亮度 Y 每个像素都有（1 字节），色度 U/V 每 2×2 个像素才各有一个（共 0.5 字节），所以平均每个像素占 1 + 0.5 = **1.5 字节**。（为什么要牺牲色度？人眼对亮度敏感、对色度不敏感，这是"视觉冗余"的典型应用，第三节会展开。）
 
-**第三步：一帧多少字节。**
+**三：一帧多少字节。**
 
 ```text
 2,073,600 × 1.5 ≈ 3.11 MB
 ```
 
-**第四步：30fps 一秒多少。**
+**四：30fps 一秒多少。**
 
 ```text
 3.11 MB × 30 ≈ 93.3 MB/s ≈ 746 Mbps
 ```
 
-**第五步：对照音频账（CD 质量）。**
+**五：对照音频账（CD 质量）。**
 
 ```text
 44,100 次采样 × 2 字节 × 2 声道 ≈ 172 KB/s ≈ 1.4 Mbps
@@ -208,9 +202,9 @@ flowchart LR
 4. **流媒体传输**——RTP/RTSP、推流实战、GStreamer 管线
 5. **系统与工程化**——音视频同步、多线程零拷贝管线、综合项目
 
-每一篇都坚持**双轨可复现**：板端用 RKMedia C 接口跑真实硬件，PC 端用 FFmpeg / GStreamer 跑同样的概念。没有板子也能先跟上大部分内容，有板子则全程验证。
+板端用 RKMedia C 接口跑真实硬件，PC 端用 FFmpeg / GStreamer 跑同样的概念。
 
-## 七、实操一：装好 PC 工具链
+## 七、装好 PC 工具链
 
 先把 PC 端的两把"瑞士军刀"装好。**目标是装完能确认版本号**——版本号是本系列的"环境坐标"，写作、排障、查资料都要用到。
 
@@ -228,12 +222,6 @@ Hit:1 http://archive.ubuntu.com/ubuntu noble InRelease
 Reading package lists... Done
 Building dependency tree... Done
 ```
-
-**不对怎么办**：
-
-- `sudo: command not found`：你当前就是 root，直接去掉 `sudo`
-- `Failed to fetch ... Connection failed`：网络不通或软件源不可达。先 `ping archive.ubuntu.com` 看网络，再检查 `/etc/apt/sources.list` 里源地址（国内网络可换成清华/阿里镜像源，网上搜"Ubuntu 换源"有标准步骤）
-- `Unable to locate package` 在下一步出现：先执行本步 `apt update` 刷新索引，再重试
 
 ```bash
 sudo apt install -y ffmpeg
@@ -259,10 +247,7 @@ built with gcc 13.2.0 (Ubuntu 13.2.0-23ubuntu2)
 configuration: --enable-gpl ...
 ```
 
-**不对怎么办**：
-
-- `ffmpeg: command not found`：安装没成功。重新执行 `sudo apt install -y ffmpeg`，看末尾有没有报错（依赖冲突/磁盘满）
-- 版本不是 6.x 而是 7.x：正常，不同系统版本自带版本不同，**记下你自己的版本号**即可，本系列命令不依赖特定小版本
+版本不是 6.x 而是 7.x：正常，不同系统版本自带版本不同，**记下你自己的版本号**即可，本系列命令不依赖特定小版本
 
 ### 7.2 安装 GStreamer
 
@@ -288,11 +273,6 @@ gst-launch-1.0 version 1.24.2
 GStreamer 1.24.2
 ```
 
-**不对怎么办**：
-
-- 某个 `gstreamer1.0-plugins-ugly` 报 `Unable to locate package`：个别镜像源可能不含 ugly 包，先跳过它（`-ugly` 本系列用到时再说），其余装上即可
-- `gst-launch-1.0: command not found`：重装 `gstreamer1.0-tools`，注意包名是 `gstreamer1.0-tools` 不是 `gstreamer-tools`
-
 ### 7.3 确认四把工具齐了
 
 ```bash
@@ -302,9 +282,7 @@ ffplay -version | head -1
 gst-launch-1.0 --version
 ```
 
-**预期结果**：四条都有输出。**工具链 OK，进实操二。**
-
-## 八、实操二：建立测试资产 test.mp4
+## 八、工具测试
 
 生成一段 5 秒的测试音视频（彩条 + 1kHz 正弦波），存为 `~/av-lab/test.mp4`。**这个文件是后面所有实验的"标准素材"**。
 
@@ -355,7 +333,7 @@ frame=  150 fps= 40 q=-1.0 Lsize=     250kB time=00:00:05.00 bitrate= 406.9kbits
 ls -l ~/av-lab/test.mp4
 ```
 
-**不对怎么办**：
+**错误分析**：
 
 - `Unknown encoder 'libx264'`：FFmpeg 编译时没带 x264。换软编 `-c:v mpeg4` 临时替代，或安装 `sudo apt install -y libx264-dev` 后重装 ffmpeg（一般 apt 的 ffmpeg 都带 x264）
 - `Option not found` / 参数写错：检查拼写，`testsrc=size=1920x1080:rate=30` 的冒号别写成中文冒号
@@ -412,7 +390,7 @@ bit_rate=129186
 - `Invalid data found when processing input`：test.mp4 损坏或不完整，回到 8.1 重新生成
 - 显示 `bit_rate=N/A`：容器里没写码率字段（正常现象），用 `-show_entries stream=duration` 看时长确认文件完好
 
-## 九、实操三：播放验证 + 认识你的板子
+## 九、播放验证 + 认识你的板子
 
 ### 9.1 PC 端播放验证
 
@@ -430,8 +408,6 @@ ffplay test.mp4
 - 没装图形界面的服务器（无显示器）：跳过 ffplay，用 `ffmpeg -i test.mp4 -f null -` 验证解码不报错（预期输出结尾 `frame= 150` 即 OK）
 
 ### 9.2 认识你的板子（RV1126 初识）
-
-板子先不深入操作（后面专门的采集篇章会手把手做），现在只做一件事：**登录并确认多媒体硬件存在**，把"概念里的 RV1126"和"你手里的板子"对上号。
 
 按正点原子资料《开发板使用手册》连接电源、调试串口，上电后在 PC 串口终端登录：
 
