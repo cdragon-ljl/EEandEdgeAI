@@ -30,5 +30,5 @@ export function seriesMeta(series: SeriesId) {
 }
 
 export function isSeriesId(value: string): value is SeriesId {
-  return value === 'cuda' || value === 'ee-system' || value === 'rknn' || value === 'riscv' || value === 'zephyr' || value === 'bsp' || value === 'video-audio';
+  return value === 'cuda' || value === 'ee-system' || value === 'rknn' || value === 'riscv' || value === 'zephyr' || value === 'bsp' || value === 'usb-pcie' || value === 'video-audio';
 }

@@ -1,11 +1,11 @@
-export type SeriesId = 'cuda' | 'ee-system' | 'rknn' | 'riscv' | 'zephyr' | 'bsp' | 'video-audio';
+export type SeriesId = 'cuda' | 'ee-system' | 'rknn' | 'riscv' | 'zephyr' | 'bsp' | 'usb-pcie' | 'video-audio';
 
 export interface SeriesMeta {
   id: SeriesId;
   title: string;
   shortTitle: string;
   description: string;
-  accent: 'blue' | 'emerald' | 'violet' | 'indigo' | 'amber' | 'cyan' | 'rose';
+  accent: 'blue' | 'emerald' | 'violet' | 'indigo' | 'amber' | 'cyan' | 'orange' | 'rose';
   href: string;
   label: string;
 }
@@ -65,6 +65,15 @@ export const SERIES: Record<SeriesId, SeriesMeta> = {
     href: '/bsp/',
     label: '板级开发',
   },
+  'usb-pcie': {
+    id: 'usb-pcie',
+    title: 'USB 与 PCIe 驱动开发',
+    shortTitle: 'USB / PCIe',
+    description: '从总线枚举、驱动框架和数据传输，到 DMA、中断与板级调试，建立高速外设驱动开发能力。',
+    accent: 'orange',
+    href: '/usb-pcie/',
+    label: '高速外设',
+  },
   'video-audio': {
     id: 'video-audio',
     title: '音视频开发实战',
@@ -76,4 +85,4 @@ export const SERIES: Record<SeriesId, SeriesMeta> = {
   },
 };
 
-export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'video-audio'];
+export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb-pcie', 'video-audio'];
