@@ -1,0 +1,40 @@
+---
+import { withBase } from '../../lib/paths';
+
+const target = withBase('/usb/');
+const canonicalURL = new URL(target, Astro.site);
+---
+
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="refresh" content={`0;url=${target}`} />
+    <link rel="canonical" href={canonicalURL} />
+    <title>USB 驱动开发实战</title>
+    <script is:inline define:vars={{ target }}>
+      window.location.replace(target);
+    </script>
+  </head>
+  <body>
+    <main>
+      <h1>USB 与 PCIe 已拆分为独立系列</h1>
+      <p>正在前往 USB 驱动开发实战。</p>
+      <a href={target}>立即进入 USB 系列</a>
+    </main>
+  </body>
+</html>
+
+<style>
+  :global(body) {
+    margin: 0;
+    background: #fafafa;
+    color: #111827;
+    font-family: Inter, "Microsoft YaHei", sans-serif;
+  }
+  main { margin: 18vh auto 0; max-width: 38rem; padding: 0 1.5rem; text-align: center; }
+  h1 { font-size: 1.75rem; }
+  p { color: #6b7280; line-height: 1.7; }
+  a { color: #007aff; font-weight: 600; }
+</style>

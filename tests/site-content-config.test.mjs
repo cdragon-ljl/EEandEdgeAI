@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 
@@ -8,11 +8,11 @@ test('zephyr is registered as a first-class article series', () => {
   const seriesConfig = readFileSync('src/lib/series.ts', 'utf8');
   const articlesLib = readFileSync('src/lib/articles.ts', 'utf8');
 
-  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,rknn,riscv,zephyr,bsp,usb-pcie,video-audio\}\/\*\*\/!\(riscv-architecture-framework\)\.md'/);
-  assert.match(contentConfig, /z\.enum\(\['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb-pcie', 'video-audio'\]\)/);
-  assert.match(seriesConfig, /export type SeriesId = 'cuda' \| 'ee-system' \| 'rknn' \| 'riscv' \| 'zephyr' \| 'bsp' \| 'usb-pcie' \| 'video-audio';/);
+  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,rknn,riscv,zephyr,bsp,usb,pcie,video-audio\}\/\*\*\/!\(riscv-architecture-framework\)\.md'/);
+  assert.match(contentConfig, /z\.enum\(\['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio'\]\)/);
+  assert.match(seriesConfig, /export type SeriesId = 'cuda' \| 'ee-system' \| 'rknn' \| 'riscv' \| 'zephyr' \| 'bsp' \| 'usb' \| 'pcie' \| 'video-audio';/);
   assert.match(seriesConfig, /zephyr:\s*\{/);
-  assert.match(seriesConfig, /SERIES_ORDER: SeriesId\[\] = \['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb-pcie', 'video-audio'\]/);
+  assert.match(seriesConfig, /SERIES_ORDER: SeriesId\[\] = \['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio'\]/);
   assert.match(articlesLib, /value === 'zephyr'/);
 });
 
@@ -20,15 +20,13 @@ test('riscv is registered as a first-class article series', () => {
   const contentConfig = readFileSync('src/content/config.ts', 'utf8');
   const seriesConfig = readFileSync('src/lib/series.ts', 'utf8');
   const articlesLib = readFileSync('src/lib/articles.ts', 'utf8');
-  const seriesCard = readFileSync('src/components/SeriesCard.astro', 'utf8');
 
-  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,rknn,riscv,zephyr,bsp,usb-pcie,video-audio\}\/\*\*\/!\(riscv-architecture-framework\)\.md'/);
-  assert.match(contentConfig, /z\.enum\(\['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb-pcie', 'video-audio'\]\)/);
-  assert.match(seriesConfig, /export type SeriesId = 'cuda' \| 'ee-system' \| 'rknn' \| 'riscv' \| 'zephyr' \| 'bsp' \| 'usb-pcie' \| 'video-audio';/);
+  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,rknn,riscv,zephyr,bsp,usb,pcie,video-audio\}\/\*\*\/!\(riscv-architecture-framework\)\.md'/);
+  assert.match(contentConfig, /z\.enum\(\['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio'\]\)/);
+  assert.match(seriesConfig, /export type SeriesId = 'cuda' \| 'ee-system' \| 'rknn' \| 'riscv' \| 'zephyr' \| 'bsp' \| 'usb' \| 'pcie' \| 'video-audio';/);
   assert.match(seriesConfig, /riscv:\s*\{/);
-  assert.match(seriesConfig, /SERIES_ORDER: SeriesId\[\] = \['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb-pcie', 'video-audio'\]/);
+  assert.match(seriesConfig, /SERIES_ORDER: SeriesId\[\] = \['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio'\]/);
   assert.match(articlesLib, /value === 'riscv'/);
-  assert.match(seriesCard, /riscv:/);
 });
 
 test('the first RISC-V article includes required published frontmatter', () => {
@@ -136,15 +134,13 @@ test('bsp is registered as a first-class article series', () => {
   const contentConfig = readFileSync('src/content/config.ts', 'utf8');
   const seriesConfig = readFileSync('src/lib/series.ts', 'utf8');
   const articlesLib = readFileSync('src/lib/articles.ts', 'utf8');
-  const seriesCard = readFileSync('src/components/SeriesCard.astro', 'utf8');
 
-  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,rknn,riscv,zephyr,bsp,usb-pcie,video-audio\}\/\*\*\/!\(riscv-architecture-framework\)\.md'/);
-  assert.match(contentConfig, /z\.enum\(\['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb-pcie', 'video-audio'\]\)/);
-  assert.match(seriesConfig, /export type SeriesId = 'cuda' \| 'ee-system' \| 'rknn' \| 'riscv' \| 'zephyr' \| 'bsp' \| 'usb-pcie' \| 'video-audio';/);
+  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,rknn,riscv,zephyr,bsp,usb,pcie,video-audio\}\/\*\*\/!\(riscv-architecture-framework\)\.md'/);
+  assert.match(contentConfig, /z\.enum\(\['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio'\]\)/);
+  assert.match(seriesConfig, /export type SeriesId = 'cuda' \| 'ee-system' \| 'rknn' \| 'riscv' \| 'zephyr' \| 'bsp' \| 'usb' \| 'pcie' \| 'video-audio';/);
   assert.match(seriesConfig, /bsp:\s*\{/);
-  assert.match(seriesConfig, /SERIES_ORDER: SeriesId\[\] = \['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb-pcie', 'video-audio'\]/);
+  assert.match(seriesConfig, /SERIES_ORDER: SeriesId\[\] = \['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio'\]/);
   assert.match(articlesLib, /value === 'bsp'/);
-  assert.match(seriesCard, /bsp:/);
 });
 
 test('bsp articles include required frontmatter', () => {
@@ -181,15 +177,13 @@ test('video-audio is registered as a first-class article series', () => {
   const contentConfig = readFileSync('src/content/config.ts', 'utf8');
   const seriesConfig = readFileSync('src/lib/series.ts', 'utf8');
   const articlesLib = readFileSync('src/lib/articles.ts', 'utf8');
-  const seriesCard = readFileSync('src/components/SeriesCard.astro', 'utf8');
 
-  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,rknn,riscv,zephyr,bsp,usb-pcie,video-audio\}\/\*\*\/!\(riscv-architecture-framework\)\.md'/);
-  assert.match(contentConfig, /z\.enum\(\['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb-pcie', 'video-audio'\]\)/);
-  assert.match(seriesConfig, /export type SeriesId = 'cuda' \| 'ee-system' \| 'rknn' \| 'riscv' \| 'zephyr' \| 'bsp' \| 'usb-pcie' \| 'video-audio';/);
+  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,rknn,riscv,zephyr,bsp,usb,pcie,video-audio\}\/\*\*\/!\(riscv-architecture-framework\)\.md'/);
+  assert.match(contentConfig, /z\.enum\(\['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio'\]\)/);
+  assert.match(seriesConfig, /export type SeriesId = 'cuda' \| 'ee-system' \| 'rknn' \| 'riscv' \| 'zephyr' \| 'bsp' \| 'usb' \| 'pcie' \| 'video-audio';/);
   assert.match(seriesConfig, /'video-audio':\s*\{/);
-  assert.match(seriesConfig, /SERIES_ORDER: SeriesId\[\] = \['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb-pcie', 'video-audio'\]/);
+  assert.match(seriesConfig, /SERIES_ORDER: SeriesId\[\] = \['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio'\]/);
   assert.match(articlesLib, /value === 'video-audio'/);
-  assert.match(seriesCard, /'video-audio':/);
 });
 
 test('video-audio articles include required frontmatter', () => {
@@ -207,29 +201,51 @@ test('video-audio articles include required frontmatter', () => {
   }
 });
 
-test('usb-pcie is registered as a first-class article series', () => {
+test('usb and pcie are registered as independent first-class article series', () => {
   const contentConfig = readFileSync('src/content/config.ts', 'utf8');
   const seriesConfig = readFileSync('src/lib/series.ts', 'utf8');
   const articlesLib = readFileSync('src/lib/articles.ts', 'utf8');
-  const seriesCard = readFileSync('src/components/SeriesCard.astro', 'utf8');
 
-  assert.match(contentConfig, /usb-pcie/);
-  assert.match(seriesConfig, /'usb-pcie':\s*\{/);
-  assert.match(articlesLib, /value === 'usb-pcie'/);
-  assert.match(seriesCard, /'usb-pcie':/);
+  assert.match(contentConfig, /usb/);
+  assert.match(contentConfig, /pcie/);
+  assert.doesNotMatch(contentConfig, /usb-pcie/);
+  assert.match(seriesConfig, /usb:\s*\{/);
+  assert.match(seriesConfig, /pcie:\s*\{/);
+  assert.doesNotMatch(seriesConfig, /'usb-pcie':\s*\{/);
+  assert.match(articlesLib, /value === 'usb'/);
+  assert.match(articlesLib, /value === 'pcie'/);
 });
 
-test('usb-pcie articles include required frontmatter', () => {
-  const usbPcieDir = 'docs/articles/usb-pcie';
-  const files = readdirSync(usbPcieDir).filter((file) => file.endsWith('.md'));
+test('usb articles include contiguous published frontmatter', () => {
+  const usbDir = 'docs/articles/usb';
+  assert.ok(existsSync(usbDir), 'USB article directory must exist');
+  const files = readdirSync(usbDir).filter((file) => file.endsWith('.md'));
 
-  assert.equal(files.length, 25);
+  assert.equal(files.length, 9);
 
-  for (const file of files) {
-    const markdown = readFileSync(join(usbPcieDir, file), 'utf8');
+  for (const [index, file] of files.sort().entries()) {
+    const markdown = readFileSync(join(usbDir, file), 'utf8');
     assert.match(markdown, /^---\r?\n[\s\S]+?\r?\n---\r?\n/);
-    assert.match(markdown, /^series: usb-pcie$/m);
-    assert.match(markdown, /^order: \d+$/m);
+    assert.match(markdown, /^series: usb$/m);
+    assert.match(markdown, new RegExp(`^order: ${index + 1}$`, 'm'));
     assert.match(markdown, /^draft: false$/m);
   }
+});
+
+test('pcie articles include contiguous published frontmatter', () => {
+  const pcieDir = 'docs/articles/pcie';
+  assert.ok(existsSync(pcieDir), 'PCIe article directory must exist');
+  const files = readdirSync(pcieDir).filter((file) => file.endsWith('.md'));
+
+  assert.equal(files.length, 16);
+
+  const orders = files.map((file) => {
+    const markdown = readFileSync(join(pcieDir, file), 'utf8');
+    assert.match(markdown, /^---\r?\n[\s\S]+?\r?\n---\r?\n/);
+    assert.match(markdown, /^series: pcie$/m);
+    assert.match(markdown, /^draft: false$/m);
+    return Number(markdown.match(/^order: (\d+)$/m)?.[1]);
+  });
+
+  assert.deepEqual(orders.sort((a, b) => a - b), Array.from({ length: 16 }, (_, index) => index + 1));
 });
