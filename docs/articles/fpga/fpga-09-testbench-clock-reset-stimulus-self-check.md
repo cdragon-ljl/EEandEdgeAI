@@ -238,7 +238,7 @@ flowchart LR
     CHECK --> OUTPUT["可交付结果"]
 ```
 
-```systemverilog
+```verilog
 module counter_tb;
     localparam WIDTH = 4;
     logic clk = 0;

@@ -255,7 +255,7 @@ flowchart LR
     CHECK --> OUTPUT["可交付结果"]
 ```
 
-```systemverilog
+```verilog
 always_ff @(posedge aclk) begin
     if (!aresetn || task_start) begin
         cycle_count <= '0;

@@ -238,7 +238,7 @@ flowchart LR
     CHECK --> OUTPUT["可交付结果"]
 ```
 
-```systemverilog
+```verilog
 wire push = s_valid && s_ready;
 wire pop  = m_valid && m_ready;
 

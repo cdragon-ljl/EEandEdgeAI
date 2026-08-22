@@ -238,7 +238,7 @@ flowchart LR
     CHECK --> OUTPUT["可交付结果"]
 ```
 
-```systemverilog
+```verilog
 localparam CTRL    = 5'h00;
 localparam STATUS  = 5'h04;
 localparam INPUT   = 5'h08;

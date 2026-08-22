@@ -255,7 +255,7 @@ flowchart LR
     CHECK --> OUTPUT["可交付结果"]
 ```
 
-```systemverilog
+```verilog
 property p_output_stable_while_stalled;
     @(posedge aclk) disable iff (!aresetn)
         m_axis_tvalid && !m_axis_tready

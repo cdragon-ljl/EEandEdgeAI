@@ -86,7 +86,7 @@ test('FPGA-05 includes a self-checking portable Verilog lab', () => {
   assert.match(markdown, /gtkwave/);
 });
 test('board-facing Vivado articles remain board-neutral', () => {
-  for (const [file, order] of articles.filter(([, order]) => order >= 11 && order <= 15)) {
+  for (const [file] of articles.filter(([, order]) => order >= 11 && order <= 15)) {
     const path = join(fpgaDir, file);
     assert.ok(existsSync(path), `${file} must exist`);
     const body = readFileSync(path, 'utf8').replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
@@ -116,7 +116,7 @@ test('each remaining batch covers its engineering contract', () => {
 });
 
 test('accelerator articles do not claim fabricated benchmark speedups', () => {
-  for (const [file, order] of articles.filter(([, order]) => order >= 27 && order <= 35)) {
+  for (const [file] of articles.filter(([, order]) => order >= 27 && order <= 35)) {
     const path = join(fpgaDir, file);
     assert.ok(existsSync(path), `${file} must exist`);
     assert.doesNotMatch(readFileSync(path, 'utf8'), /提升\s*\d+(?:\.\d+)?\s*倍/);

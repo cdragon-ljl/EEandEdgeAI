@@ -255,7 +255,7 @@ flowchart LR
     CHECK --> OUTPUT["可交付结果"]
 ```
 
-```dts
+```text
 reserved-memory {
     #address-cells = <2>;
     #size-cells = <2>;

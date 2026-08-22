@@ -238,7 +238,7 @@ flowchart LR
     CHECK --> OUTPUT["可交付结果"]
 ```
 
-```systemverilog
+```verilog
 typedef struct packed {
     logic [7:0]  opcode;
     logic [15:0] length;

@@ -255,7 +255,7 @@ flowchart LR
     CHECK --> OUTPUT["可交付结果"]
 ```
 
-```systemverilog
+```verilog
 wire take_in  = s_axis_tvalid && s_axis_tready;
 wire take_out = m_axis_tvalid && m_axis_tready;
 

@@ -238,7 +238,7 @@ flowchart LR
     CHECK --> OUTPUT["可交付结果"]
 ```
 
-```systemverilog
+```verilog
 property p_hold_during_backpressure;
     @(posedge clk) disable iff (rst)
     out_valid && !out_ready |=> out_valid && $stable(out_data);

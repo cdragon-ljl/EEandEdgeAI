@@ -238,7 +238,7 @@ flowchart LR
     CHECK --> OUTPUT["可交付结果"]
 ```
 
-```systemverilog
+```verilog
 wire transfer = tvalid && tready;
 
 property p_payload_stable_when_stalled;
