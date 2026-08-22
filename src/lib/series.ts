@@ -1,4 +1,4 @@
-export type SeriesId = 'cuda' | 'ee-system' | 'rknn' | 'riscv' | 'zephyr' | 'bsp' | 'usb' | 'pcie' | 'video-audio';
+export type SeriesId = 'cuda' | 'ee-system' | 'rknn' | 'riscv' | 'fpga' | 'zephyr' | 'bsp' | 'usb' | 'pcie' | 'video-audio';
 
 export interface SeriesMeta {
   id: SeriesId;
@@ -57,6 +57,16 @@ export const SERIES: Record<SeriesId, SeriesMeta> = {
     label: '架构与软核',
     cover: { src: '/covers/riscv.webp', width: 1919, height: 820, alt: 'RISC-V 架构精讲系列封面' },
   },
+  fpga: {
+    id: 'fpga',
+    title: 'FPGA 与芯片原型验证实战',
+    shortTitle: 'FPGA / Zynq',
+    description: '从数字逻辑、RTL 与 Zynq PS/PL，到 AXI、Linux 驱动访问 PL 和硬件加速器原型。',
+    accent: 'cyan',
+    href: '/fpga/',
+    label: '硬件原型',
+    cover: { src: '/covers/fpga.webp', width: 1921, height: 819, alt: 'FPGA 与芯片原型验证实战系列封面' },
+  },
   zephyr: {
     id: 'zephyr',
     title: 'Zephyr RTOS 实战',
@@ -109,4 +119,4 @@ export const SERIES: Record<SeriesId, SeriesMeta> = {
   },
 };
 
-export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'rknn', 'riscv', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio'];
+export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'rknn', 'riscv', 'fpga', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio'];
