@@ -1,655 +1,469 @@
 ---
 title: "嵌入式知识体系 · 音视频开发实战 #05 · 点亮摄像头：sensor 驱动与设备树适配"
-description: "前面几篇把平台和格式讲清楚了，现在做整条视频管线里最\"硬核\"的一步：**把摄像头点亮**。点亮 = 电源、时钟、复位都正确 → CPU 能通过 I2C 读写 sensor → sensor 开始按 MIPI CSI-2 输出图像 → SoC 的控制器把数据收进内存。"
+description: "以正点原子 RV1126 SDK 的设备树与 Rockchip IMX415 驱动为依据，讲清上电识别、媒体链路、模式配置和逐层调试。"
 pubDate: "2026-08-13"
 series: video-audio
 order: 5
 tags: ["Video & Audio", "Embedded Multimedia"]
 draft: false
 ---
-前面几篇把平台和格式讲清楚了，现在做整条视频管线里最"硬核"的一步：**把摄像头点亮**。点亮 = 电源、时钟、复位都正确 → CPU 能通过 I2C 读写 sensor → sensor 开始按 MIPI CSI-2 输出图像 → SoC 的控制器把数据收进内存。
 
-这一篇是**实操手册**，不是泛泛讲原理。前提是你手上有一块正点原子 RV1126 开发板 + IMX415 模组，SDK 在 PC 上（`~/RV1126/atk-rv1126-sdk`）。整篇按"照着做"组织：
+这一篇只讨论一个目标：让正点原子 RV1126 开发板上的 IMX415 从“设备树中有一个节点”，走到“驱动识别、媒体链路建立并能稳定出帧”。
 
-- 第一步：**先确认原厂固件已经点亮**（大概率你的板子出厂就能出图，先看到真实输出）
-- 第二步：**定位并读懂原厂配置**（用 find/grep 找到 SDK 里真实的设备树和驱动）
-- 第三步：**改一处配置、编译、烧录、验证**（把"看懂"变成"改懂"）
+本文的具体结论来自两份配套源码：
 
-每步都有命令、预期输出、输出不对时的排查方向。凡是不同批次固件/资料可能不同的东西（文件名、总线号、波特率），一律教你怎么**动态定位**，不写死。
+- `src/rv1126-alientek-800p.dts`
+- `src/imx415.c`
 
-## 一、点亮全路径：从寄存器到内存
+当前源码里的关键事实是：IMX415 可挂在 `i2c1` 或 `i2c5`，I2C 地址均为 `0x1a`，使用 4 条 MIPI data lane，驱动把 `xvclk` 设置为 **37.125 MHz**，并从寄存器 `0x311A` 读取 1 字节芯片 ID `0xE0`。
 
-一颗摄像头模组，本质是"一个图像传感器 + 一块小 PCB"。要让它在 Linux 里出图，必须依次打通五关：
+> 源码是软件侧事实，原理图和传感器规格书是硬件侧事实。真正改板级配置时，三者必须一致；本文不会从所给文件中推断电源电压或其他未出现的硬件参数。
 
-```mermaid
-flowchart LR
-    A["① 供电/时钟/复位<br>AVDD/DOVDD/DVDD + MCLK + RESET"] --> B["② I2C 可访问<br>CPU 能读 sensor 寄存器"]
-    B --> C["③ 初始化寄存器<br>写模式/曝光/增益/HDR"]
-    C --> D["④ MIPI CSI-2 输出<br>sensor 按 lane 发数据"]
-    D --> E["⑤ 控制器接收出帧<br>rkcif → ISP → 内存"]
-```
+## 一、先看清实际链路
 
-- **① 供电/时钟/复位**：sensor 有多个电源轨（模拟 AVDD、数字 DVDD、IO DOVDD），一颗主时钟 MCLK（常见 24MHz）驱动内部时序，一根复位脚控制启动。三者顺序错了，后面全免谈。
-- **② I2C 可访问**：CPU 通过 I2C 总线读写 sensor 内部寄存器。I2C 有应答 = sensor 活着。
-- **③ 初始化寄存器**：按数据手册的初始化表写入，配置输出模式（分辨率/帧率/数据格式）、曝光与增益范围、HDR 开关等。
-- **④ MIPI CSI-2 输出**：sensor 把像素数据按 CSI-2 协议打包，通过 data lane（数据通道）串行发出。
-- **⑤ 控制器接收出帧**：SoC 的 MIPI CSI 接收控制器（RV1126 上是 rkcif）解包，交给 ISP 处理，最终落到内存——应用就能拿到一帧图了。
-
-类比：sensor 是一台"自带胶卷的相机"，I2C 是它的遥控器，MIPI 是传照片的数据线，rkcif 是接收照片的前台，ISP 是冲印房。点亮摄像头 = 电源插好、遥控器能按、相机开始连拍、前台把照片收进仓库。
-
-【图1：点亮五关与对应排查点】
-
-```mermaid
-flowchart TD
-    P1[供电/时钟/复位] -->|示波器/万用表| C1[电压轨 1.8V/2.8V/1.2V<br>MCLK 24MHz 有波形<br>RESET 拉高]
-    P2[I2C 可访问] -->|i2cdetect| C2[总线上能看到 0x1a<br>读写寄存器有应答]
-    P3[初始化寄存器] -->|对照数据手册| C3[模式表写对<br>曝光/增益范围正确]
-    P4[MIPI 输出] -->|逻辑分析仪/media-ctl| C4[lane 数/极性/频率匹配<br>data-lanes 与硬件一致]
-    P5[控制器出帧] -->|v4l2-ctl 抓帧| C5[帧大小正确<br>画面不黑不花]
-```
-
-## 二、Linux 摄像头驱动框架：V4L2 / subdev / media-controller / async
-
-Linux 里摄像头不是"一个大驱动"，而是**一组协同工作的驱动**，它们通过一套标准框架对接：
-
-- **V4L2（Video4Linux2）**：用户空间看到的 API。采集设备是 `/dev/video*`，每个视频节点对应一个"能出图/进图"的通道；子设备是 `/dev/v4l-subdev*`，对应 sensor 等硬件单元。应用用 `open/ioctl/mmap` 就能抓帧。
-- **v4l2-subdev**：把 sensor、MIPI 控制器、ISP 等硬件单元抽象成"子设备"。每个 subdev 有输入输出 **pad**（端点）、可查询/设置的 **format**（分辨率、像素格式）、可操作的 **control**（曝光、增益）。sensor 驱动本质上是一个 `v4l2_subdev` 的实例。
-- **media-controller**：把各个子设备按"实体—pad—link"连成拓扑图，描述数据从 sensor 流到 ISP 的路径。用户空间用 `media-ctl` 查看/修改这张图。
-- **v4l2-async**：解决"探测顺序不确定"的问题。sensor 驱动和 CSI/ISP 驱动是独立模块，谁先加载不一定；双方都用异步通知注册自己，等"我的数据源/我的接收者"都就绪后，框架自动完成绑定。
+IMX415 有两类连接：I2C、时钟、电源和复位负责“控制与上电”，MIPI CSI-2 data lane 负责连续发送像素。
 
 ```mermaid
 flowchart LR
-    subgraph 硬件[硬件]
-        SEN[IMX415 sensor]
-        CSI[MIPI CSI 接收 rkcif]
-        ISP[ISP rkisp]
-    end
-    subgraph 内核[内核驱动]
-        SENSOR_DRV[imx415.c<br>v4l2-subdev]
-        CSI_DRV[rkcif<br>v4l2-subdev + video]
-        ISP_DRV[rkisp<br>v4l2-subdev + video]
-    end
-    subgraph 用户空间[应用]
-        APP[应用]
-        MCTL[media-ctl / v4l2-ctl]
-    end
-    SEN --- SENSOR_DRV
-    CSI --- CSI_DRV
-    ISP --- ISP_DRV
-    SENSOR_DRV -- "async 绑定" --> CSI_DRV
-    CSI_DRV -- "async 绑定" --> ISP_DRV
-    CSI_DRV -->|"/dev/video*"| APP
-    ISP_DRV -->|"/dev/video*"| APP
-    APP -. ioctl .-> MCTL
+    P[regulator / reset / xvclk] --> I[I2C probe<br>读取 0x311A]
+    I --> S[写 global 与 mode 寄存器表]
+    S --> D[IMX415 4-lane MIPI CSI-2]
+    D --> R[D-PHY / CSI receiver]
+    R --> C[RKCIF 或 ISP]
+    C --> V["/dev/videoX"]
 ```
 
-图里的每一条连线都对应设备树里的一个 endpoint 链接。**把设备树、驱动、用户空间三者的名字对上，是排障的第一步**。这一篇后面每一步实操，你都会看到这三层名字在真实系统里出现。
+这份板级设备树给了两条不同的摄像头路径：
 
-## 三、设备树适配：让内核认识摄像头
+| 接口 | Sensor | 数据链路 |
+|:---|:---|:---|
+| CSI0 | `imx415@1a` under `i2c1` | `ucam_out0 → mipi_in_ucam0 → csidphy0_out → mipi_csi2_input → mipi_csi2_output → cif_mipi_in → cif_sditf → isp_virt1_in` |
+| CSI1 | `imx415@1a` under `i2c5` | `ucam_out2 → csi_dphy1_input → csi_dphy1_output → isp_in` |
 
-设备树（Device Tree）是 Linux 的"硬件描述文件"，告诉内核：这个 sensor 挂在哪条 I2C 上、用什么时钟、哪根 GPIO 是复位、数据走几根 lane。
+CSI0 经过 `mipi_csi2`、`rkcif_mipi_lvds` 和 `rkcif_mipi_lvds_sditf` 进入 `rkisp_vir0`；CSI1 则由 `csi_dphy1` 直接连接 `rkisp_vir1`。所以不能把两路都简化成同一条 `sensor → csi2 → rkcif → rkisp`。
 
-### 3.0 实操先导：在你的 SDK 里定位真实文件
+## 二、Linux 里的对象如何对应
 
-**先别急着抄下面的 dts 代码**——下面代码是"参考结构"，是为了让你读得懂；你要改的是你自己 SDK 里**真实存在**的那份。怎么找到它？三条命令，在你的 SDK 根目录执行：
+摄像头不是一个独立的 `/dev/video0` 驱动，而是一组协同对象：
+
+- `imx415.c` 把 sensor 注册为 `v4l2_subdev`；
+- D-PHY、CSI、RKCIF 和 ISP 驱动也注册自己的 media entity；
+- Device Tree 的 `endpoint` 与 `remote-endpoint` 描述实体之间的连接；
+- Media Controller 根据这些端点建立 graph；
+- 最终由 RKCIF 或 ISP 暴露可采集的 `/dev/video*` 节点。
+
+驱动用 `m%02d_%s_%s %s` 生成 sensor subdev 名称。两路 `camera-module-index` 分别为 `0`、`1`，`camera-module-facing` 都是 `front`，因此实体名通常包含 `m00_f_imx415` 或 `m01_f_imx415`，后面再跟 `1-001a` 或 `5-001a`。实际名称以 `media-ctl -p` 输出为准。
+
+## 三、按源码读设备树
+
+### 3.1 先定位真实文件
+
+在 SDK 根目录执行：
 
 ```bash
 cd ~/RV1126/atk-rv1126-sdk
 
-# ① 找板级 dts：所有 rv1126 相关的 dts/dtsi 文件
-find kernel/arch/arm/boot/dts -iname "*rv1126*" -name "*.dts*" | sort
+find kernel/arch/arm/boot/dts -name 'rv1126-alientek-800p.dts'
+grep -n 'imx415@1a' kernel/arch/arm/boot/dts/rv1126-alientek-800p.dts
+grep -n 'IMX415_XVCLK\|IMX415_REG_CHIP_ID\|imx415_probe' \
+    kernel/drivers/media/i2c/imx415.c
 ```
 
-预期输出（示例，不同 SDK 版本文件名可能不同，但结构一致）：
+与本文配套的文件名就是 `rv1126-alientek-800p.dts`，不是假设存在的 `*-cam.dtsi`。如果 SDK 中的路径不同，先用 `find kernel -iname '*imx415*'` 定位，再以实际被构建的 DTS 为准。
+
+还要确认运行中的板子确实加载了这份 DTB。只改对源码但烧入了旧 `boot.img`，板端现象不会改变。
+
+### 3.2 CSI0：`i2c1` 上的 IMX415
+
+源码中的第一路节点是：
 
 ```text
-kernel/arch/arm/boot/dts/rv1126-atk-rv1126.dts        ← 板级 dts，最顶层
-kernel/arch/arm/boot/dts/rv1126-atk-rv1126-cam.dtsi   ← 摄像头 dtsi（重点）
-kernel/arch/arm/boot/dts/rv1126-evb.dtsi
-kernel/arch/arm/boot/dts/rv1126-cam.dtsi
-kernel/arch/arm/boot/dts/rv1126-cam-av4l2.dtsi
-```
-
-```bash
-# ② 在 dts 目录里搜 imx415，找出哪些文件配置了它
-grep -rn "imx415" kernel/arch/arm/boot/dts/ | grep -v "imx415.c"
-```
-
-预期输出（示例）：
-
-```text
-kernel/arch/arm/boot/dts/rv1126-atk-rv1126-cam.dtsi:42: imx415: imx415@1a {
-kernel/arch/arm/boot/dts/rv1126-atk-rv1126-cam.dtsi:80:  remote-endpoint = <&mipi_csi2_in>;
-```
-
-```bash
-# ③ 确认驱动源码存在，并看 SDK 里驱动版本
-ls -l kernel/drivers/media/i2c/imx415.c
-grep -n "SONY_IMX415\|imx415" kernel/drivers/media/i2c/imx415.c | head -5
-```
-
-**这一节做完，你手上应该有**：一份真实的板级 dts 路径、一份包含 imx415 节点的 dtsi 路径、一份驱动源码路径。**把它们抄在笔记本上**，后面的操作都围绕这三个文件。如果某条命令没找到任何结果，先别继续——去 `find kernel/ -name "*imx415*"` 全内核搜，确认你的 SDK 里驱动是否被裁剪掉了。
-
-### 3.1 sensor 节点：挂在 I2C 总线上
-
-sensor 用 I2C 控制，所以它的节点是某条 I2C 控制器的子节点。参考结构（对照你刚找到的真实节点看）：
-
-```dts
-&i2c3 {
+&i2c1 {
     status = "okay";
-    clock-frequency = <100000>;          // I2C 速率
+    clock-frequency = <400000>;
 
-    imx415: imx415@1a {                   // reg = I2C 7bit 地址 0x1a
-        compatible = "sony,imx415";       // 与驱动 match 表对应
+    imx415: imx415@1a {
+        compatible = "sony,imx415";
         reg = <0x1a>;
-
-        clocks = <&cru CLK_MIPICSI_OUT>;  // MCLK 时钟源
+        clocks = <&cru CLK_MIPICSI_OUT>;
         clock-names = "xvclk";
-
-        pinctrl-names = "default";        // 引脚复用
-        pinctrl-0 = <&mipicsi_out_pins>;
-
-        power-domains = <&power RV1126_PD_VI>;  // 视频输入电源域
-
-        reset-gpios = <&gpio2 RK_PB6 GPIO_ACTIVE_LOW>;  // 复位脚
-
+        power-domains = <&power RV1126_PD_VI>;
+        pinctrl-names = "rockchip,camera_default";
+        pinctrl-0 = <&mipicsi_clk0>;
+        avdd-supply = <&vcc_avdd>;
+        dovdd-supply = <&vcc_dovdd>;
+        dvdd-supply = <&vcc_dvdd>;
+        pwdn-gpios = <&gpio1 RK_PD4 GPIO_ACTIVE_HIGH>;
+        reset-gpios = <&gpio4 RK_PA0 GPIO_ACTIVE_LOW>;
         rockchip,camera-module-index = <0>;
-        rockchip,camera-module-facing = "back";
-        rockchip,camera-module-name = "default";
-        rockchip,camera-module-lens-name = "default";
+        rockchip,camera-module-facing = "front";
+        rockchip,camera-module-name = "YT10092";
+        rockchip,camera-module-lens-name =
+            "IR0147-60IRC-8M-F20-hdr3";
 
         port {
-            imx415_out: endpoint {
-                remote-endpoint = <&mipi_csi2_in>;  // 指向 CSI 接收端
-                data-lanes = <1 2 3 4>;             // 用了 4 根 lane
-                link-frequencies = /bits/ 64
-                    <891000000>;                    // MIPI 链路时钟
+            ucam_out0: endpoint {
+                remote-endpoint = <&mipi_in_ucam0>;
+                data-lanes = <1 2 3 4>;
             };
         };
     };
 };
 ```
 
-**怎么验证"我 SDK 里的节点长这样"**：打开你刚定位到的 `*-cam.dtsi`，找到 `imx415:` 节点，逐字段对比。**你 SDK 里真实的节点才是标准答案**，上面这份是帮助你理解每一行的"注释版"。
+关键字段与驱动的对应关系如下：
 
-各字段含义（**设备树字段 = 驱动代码里能查到的硬件事实**）：
-
-| 字段 | 含义 | 排障对应 |
+| DTS 字段 | 驱动中的消费者 | 当前值 |
 |:---|:---|:---|
-| `compatible` | 驱动匹配的字符串 | 驱动没 probe 先查它是否匹配 |
-| `reg` | I2C 从机地址 | i2cdetect 应看到同一地址 |
-| `clocks/clock-names` | MCLK 时钟源 | 示波器量 MCLK 引脚是否有波形 |
-| `pinctrl-0` | 引脚复用配置 | MCLK 复用错了就没有时钟输出 |
-| `power-domains` | 电源域 | 漏配可能导致上电时序错乱 |
-| `reset-gpios` | 复位 GPIO | 电平极性反了 sensor 一直复位 |
-| `data-lanes` | 使用几根数据 lane | 与硬件接线、sensor 输出必须一致 |
-| `link-frequencies` | MIPI 链路时钟 | 与 sensor 输出模式、控制器配置要匹配 |
+| `compatible` | `imx415_of_match[]` | `sony,imx415` |
+| `reg` | I2C core | `0x1a` |
+| `clock-names` | `devm_clk_get(dev, "xvclk")` | `xvclk` |
+| 三路 `*-supply` | `devm_regulator_bulk_get()` | `dvdd`、`dovdd`、`avdd` |
+| `reset-gpios` | `devm_gpiod_get(dev, "reset", ...)` | GPIO4_A0，低有效 |
+| 四个 module 字段 | `of_property_read_*()` | probe 的必需属性 |
+| `data-lanes` | CSI endpoint | `<1 2 3 4>` |
 
-**实战核对（手把手）**：读到你 SDK 里的真实 imx415 节点后，把 `reg`、`clocks`、`reset-gpios`、`data-lanes`、`remote-endpoint` 五个值抄下来，然后去原理图（正点原子资料里《RV1126 原理图.pdf》或摄像头模组接口部分）找到 IMX415 模组的 I2C 引脚、MCLK 引脚、复位引脚，确认设备树写的引脚号和原理图一致。**这一步能拦住 50% 的"点亮失败"**——很多问题不是驱动错，是 dts 引脚的 GPIO 号与原理图对不上。
+四个 `rockchip,camera-module-*` 属性不是装饰。驱动把它们一起读取，只要缺一个就打印 `could not get module information!` 并返回 `-EINVAL`。
 
-### 3.2 接收侧：csi2 与 rkcif 节点
+### 3.3 CSI1：`i2c5` 上的第二路 IMX415
 
-sensor 的 endpoint 要指向接收端。RV1126 上接收链路是 `csi2（MIPI D-PHY 控制器）→ rkcif_mipi_lvds（接收器）→ rkisp（ISP）`，设备树里对应节点都要使能并连上（参考结构，同样对照你 SDK 真实节点）：
+第二路使用相同的电源与时钟资源，但 pinctrl、GPIO 和 endpoint 不同：
 
-```dts
-&csi2 {
-    status = "okay";
+```text
+imx415_csi1: imx415@1a {
+    compatible = "sony,imx415";
+    reg = <0x1a>;
+    clocks = <&cru CLK_MIPICSI_OUT>;
+    clock-names = "xvclk";
+    pinctrl-names = "rockchip,camera_default";
+    pinctrl-0 = <&mipicsi_clk1>;
+    pwdn-gpios = <&gpio2 RK_PA7 GPIO_ACTIVE_HIGH>;
+    reset-gpios = <&gpio4 RK_PA1 GPIO_ACTIVE_LOW>;
+    rockchip,camera-module-index = <1>;
+    rockchip,camera-module-facing = "front";
+    rockchip,camera-module-name = "YT10092";
+    rockchip,camera-module-lens-name =
+        "IR0147-60IRC-8M-F20-hdr3";
+
     port {
-        mipi_csi2_in: endpoint {
-            remote-endpoint = <&imx415_out>;   // 与 sensor 端互指
+        ucam_out2: endpoint {
+            remote-endpoint = <&csi_dphy1_input>;
             data-lanes = <1 2 3 4>;
         };
     };
 };
-
-&rkcif_mipi_lvds {
-    status = "okay";
-    port {
-        rkcif_mipi_lvds_in: endpoint {
-            remote-endpoint = <&mipi_csi2_out>;  // 与 csi2 输出互指
-            data-lanes = <1 2 3 4>;
-        };
-    };
-};
-
-&rkcif {
-    status = "okay";
-};
-&rkcif_mmu {
-    status = "okay";   // 接收器需要 IOMMU
-};
-&rkisp {
-    status = "okay";
-};
-&rkisp_mmu {
-    status = "okay";
-};
 ```
 
-**两条铁律**：
+两颗 sensor 可以都使用 `0x1a`，因为它们位于不同的 I2C controller 上。排查时必须把“地址”写成“总线号 + 地址”，即 `1-001a` 或 `5-001a`。
 
-1. **`remote-endpoint` 必须成对互指**——sensor 输出指向 csi2 输入，csi2 输出指向 rkcif 输入。少一端，media 拓扑就断链，应用层连不上。
-2. **`data-lanes` 三处一致**——sensor 端、csi2 端、接收端必须都写 `1 2 3 4`（或都写 `1 2`），并且与**板卡实际接线**一致。写成 4 lane 但硬件只接了 2 lane，或反之，都会"无数据"或花屏。
+这份板级文件没有在 `&i2c5` 段内显式写 `status = "okay"`，其最终状态取决于被 include 的 DTSI。使用第二路前应反编译实际 DTB，确认 `i2c5` 的有效 `status`，不能只看这一段源码就认定总线已经启用。
 
-**实战核对**：在 SDK 里执行 `grep -rn "remote-endpoint" kernel/arch/arm/boot/dts/rv1126-atk-rv1126-cam.dtsi`，把成对出现的 `remote-endpoint` 画一条连线，确认 sensor → csi2 → rkcif 三段链路每一段都是"你指向我、我指向你"。
+### 3.4 endpoint 必须按完整路径核对
 
-### 3.3 电源与上电：regulator 与 GPIO 控制
-
-IMX415 通常需要三路电源（模拟 AVDD、数字 DVDD、IO DOVDD），板卡上可能由 PMIC/LDO 输出，也可能由 GPIO 控制的开关供电。SDK 的 sensor 驱动支持两种方式：
-
-- **regulator 方式**：设备树里用 `avdd-supply`、`dovdd-supply`、`dvdd-supply` 指向电源节点，驱动里 `regulator_enable()` 控制；
-- **GPIO 方式**：用 `pwdn-gpios` / `reset-gpios` 控制模组的供电/复位引脚。
-
-具体你的板卡用哪种，**看原理图 + SDK 参考 dts**。点亮前务必确认：三路电压值正确（通常 1.8V/2.8V/1.2V 量级，以 IMX415 规格书为准）、MCLK 有 24MHz 波形、RESET 极性正确且处于释放状态。
-
-**没有示波器怎么办**：先不测波形，用下面的方法间接验证——`i2cdetect` 能看到地址，基本说明电源和时钟是对的（sensor 内部已经跑起来才能响应 I2C）；看不到地址，优先怀疑电源/时钟/复位，再想办法借示波器确认。
-
-## 四、sensor 驱动关键代码路径
-
-设备树只是"描述"，真正干活的是驱动。以 SDK 里的 `imx415.c` 为例（**具体函数名与实现以你的 SDK 版本为准**），点亮相关的代码路径有四段。边读边对照你刚定位的驱动文件。
-
-### 4.1 probe：上电 + 认芯片 + 注册
-
-```c
-// 参考结构，非 SDK 原文
-static int imx415_probe(struct i2c_client *client)
-{
-    // 1. 解析设备树：时钟、复位 GPIO、电源
-    imx415->xvclk = devm_clk_get(dev, "xvclk");
-    imx415->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
-
-    // 2. 上电：开时钟 → 供电 → 释放复位
-    __imx415_power_on(imx415);
-
-    // 3. 通过 I2C 读芯片 ID，确认真的连上了这颗 sensor
-    ret = imx415_check_chip_id(imx415);
-    if (ret) return -ENODEV;   // 读不到 ID = I2C/电源/时序有问题
-
-    // 4. 注册为 v4l2 subdev，并注册异步通知
-    v4l2_i2c_subdev_init(&imx415->sd, client, &imx415_subdev_ops);
-    imx415->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
-    ret = v4l2_async_register_subdev(&imx415->sd);
-}
-```
-
-**probe 是排障第一现场**：如果 `dmesg` 里连 probe 都没执行（或 probe 失败），说明 `compatible` 没匹配或 `check_chip_id` 读不到——后者直接指向 I2C/电源/时序问题。
-
-**实战**：打开你的 `imx415.c`，`grep -n "probe\|check_chip_id\|power_on"` 找到这些函数，把行号记下来。后面排障时，`dmesg` 报错就能直接跳到对应行看代码。
-
-### 4.2 power_on：上电时序的代码实现
-
-```c
-// 参考结构
-static void __imx415_power_on(struct imx415 *imx415)
-{
-    // 典型顺序：时钟 → 电源 → 复位释放 → 延时
-    clk_set_rate(imx415->xvclk, 24000000);   // MCLK = 24MHz
-    clk_prepare_enable(imx415->xvclk);
-    usleep_range(1000, 2000);                 // 时钟稳定
-    regulator_enable(imx415->avdd);           // 各电源轨按规格书顺序
-    regulator_enable(imx415->dovdd);
-    regulator_enable(imx415->dvdd);
-    usleep_range(1000, 2000);                 // 电源稳定
-    gpiod_set_value_cansleep(imx415->reset_gpio, 1);  // 释放复位（低有效）
-    usleep_range(10000, 20000);               // 等 sensor 内部初始化
-}
-```
-
-**顺序与延时以 IMX415 规格书的"上电时序"小节为准**：先哪路电源、时钟先还是复位先、释放复位后等多久，不同 sensor 不同。代码里每个 `usleep` 背后都是规格书里的时序参数。
-
-### 4.3 初始化寄存器与 set_fmt：告诉 sensor"怎么输出"
-
-```c
-// 参考结构
-static const struct regval imx415_linear_regs[] = {
-    // 由 IMX415 数据手册 + 厂商参考驱动提供
-    // 0xXXXX, 0xYYYY,   // 输出模式/帧率相关
-    // 0xXXXX, 0xYYYY,   // HDR 开关
-    // ...
-    {0xFFFF, 0xFF},      // 表结束标记
-};
-
-static int imx415_set_fmt(struct v4l2_subdev *sd,
-                          struct v4l2_subdev_state *state,
-                          struct v4l2_subdev_format *fmt)
-{
-    // 根据 fmt->format.width/height 选对应的模式寄存器表
-    // 写入 imx415_linear_regs 或对应分辨率表
-    // 上报 media bus code（如 MEDIA_BUS_FMT_SRGGB10_1X10）
-}
-```
-
-**寄存器表是"厂商资产"**：具体地址与数值来自 IMX415 数据手册与参考驱动，SDK 里以数组形式给出。你不需要背寄存器，但要能看懂表里几类关键项：**模式设置（分辨率/帧率）、曝光、增益、HDR 模式**——这正是后面调画质（AE/AWB）时驱动与 ISP 打交道的接口。
-
-### 4.4 set_ctrl 与 s_stream：曝光/增益与"开始出图"
-
-```c
-// 参考结构
-static int imx415_set_ctrl(struct v4l2_ctrl *ctrl)
-{
-    switch (ctrl->id) {
-    case V4L2_CID_EXPOSURE:        // 曝光时间，单位由 step 决定
-        // 写入曝光寄存器
-        break;
-    case V4L2_CID_ANALOGUE_GAIN:   // 模拟增益
-        // 写入增益寄存器
-        break;
-    }
-}
-
-static int imx415_s_stream(struct v4l2_subdev *sd, int on)
-{
-    if (on) {
-        // 写 streaming 相关寄存器，sensor 开始输出 MIPI 数据
-    } else {
-        // 停止输出
-    }
-}
-```
-
-**`s_stream(1)` 是"点亮"的最后一脚**：前面的初始化只是配置，这一脚让 sensor 真正开始沿 MIPI 发数据。应用侧 `STREAMON` 会触发整条链路（sensor → csi → isp）依次 `s_stream(1)`，任何一环没起来，画面就出不来。
-
-## 五、上电时序：最常见的第一道坎
-
-点亮失败的案例里，很大比例不是代码错，而是**上电时序不对**。sensor 是精密模拟器件，电源、时钟、复位必须按规格书的先后与间隔来：
-
-```mermaid
-sequenceDiagram
-    participant P as 电源轨
-    participant C as MCLK
-    participant R as RESET
-    participant I as I2C 寄存器
-    Note over P: AVDD/DVDD/DOVDD 依次稳定
-    P->>P: t1: 各电源轨上电
-    Note over C: 电源稳定后给时钟
-    C->>C: t2: MCLK 24MHz 输出
-    Note over R: 时钟稳定后释放复位
-    R->>R: t3: RESET 拉高（低有效释放）
-    Note over I: 释放复位后等待内部初始化
-    I->>I: t4: 等待 t_init，之后 I2C 才可安全访问
-```
-
-- **t1~t4 的具体数值**：以 IMX415 规格书为准（通常毫秒级）
-- **典型错误**：先释放复位再给时钟 → sensor 内部状态机跑飞；I2C 在 t4 之前就去读 → 无应答
-- **验证手段**：示波器同时抓 RESET 与 MCLK，对照规格书时序图；或简单地在驱动 power_on 里把延时加大（如各 10ms）排除"延时不够"这类问题
-
-## 六、点亮调试流程：四步定位（实操展开）
-
-点亮不用靠猜，按下面四步走，每步都能定位到具体层面。**每一步我都会给你：命令 → 预期输出 → 输出不对怎么办**。
-
-### 第 0 步：先登录板子
-
-把板子接好电源、调试串口（正点原子资料《开发板使用手册》里有串口连接方法：USB 转串口接调试串口，波特率以资料为准），上电，在 PC 串口终端里回车，确认能进入 Linux shell：
-
-```bash
-# 在板子的串口终端里（不是 PC 上）
-root@rv1126:/#
-```
-
-**预期输出**：出现 `root@rv1126:/#` 提示符。
-**不对怎么办**：上电没打印 → 检查电源/串口线/TTL 电平；有打印但卡住 → 把完整启动 log 拍下来，对照正点原子资料常见问题章节；登不进 root → 查资料里默认账号密码（正点原子一般 root 无密码或 root/root）。
-
-顺便确认板上能联网或能拷贝文件的方式（网口/串口传文件），后面改完配置要用。**最省事的方式**：SDK 编好的镜像直接烧录，或者用 nfs/ssh 把新内核传上去，方式以你资料手册为准。
-
-### 第 1 步：看驱动有没有起来
-
-在板子串口终端执行：
-
-```bash
-dmesg | grep -i imx415        # probe 日志、chip id 读取结果
-```
-
-**预期输出（示例，以你固件为准）**：
+CSI0 的互指关系为：
 
 ```text
-imx415 3-001a: driver version: 0x01
-imx415 3-001a: Detected imx415 sensor
-imx415 3-001a: register imx415 3-001a
+ucam_out0        <-> mipi_in_ucam0
+csidphy0_out     <-> mipi_csi2_input
+mipi_csi2_output <-> cif_mipi_in
+cif_sditf        <-> isp_virt1_in
 ```
 
-再看接收侧和子设备节点：
-
-```bash
-dmesg | grep -iE "rkcif|rkisp|v4l2"
-ls /dev/v4l-subdev* /dev/video* 2>/dev/null
-```
-
-**预期输出（示例）**：
+CSI1 的互指关系为：
 
 ```text
-rkcif: rkcif_plat_probe: ...
-rkisp: ...
-/dev/v4l-subdev0  /dev/video0  /dev/video1  ...
+ucam_out2        <-> csi_dphy1_input
+csi_dphy1_output <-> isp_in
 ```
 
-**不对怎么办**：
+`remote-endpoint` 必须成对。对于声明了 `data-lanes` 的端点，当前文件统一写成 `<1 2 3 4>`。原文所说的“只核对三处 data-lanes”并不适用于这份设备树，因为 CSI0 链上不止三个 endpoint。
 
-- `dmesg` 里**完全搜不到 imx415**：驱动没被编译进内核或 dts 没配。回到 3.0 确认 SDK 里有 `imx415.c`，并检查内核配置 `grep -rn "IMX415" kernel/arch/arm/configs/` 是否打开。
-- 搜到了但提示 **probe failed / chip id mismatch**：说明 I2C 通信有问题，进第 2 步。
-- 只有 imx415 没有 rkcif/rkisp：接收侧 dts 没使能，回到 3.2 核对 `status = "okay"`。
+设备树中还为同一连接器保留了 IMX335、IMX415 等备选 sensor 节点，并使用相同 I2C 地址。最终产品配置必须确认实际焊接的 sensor、启用的驱动和 endpoint 选择一致，不能把备选节点理解成同一接口上可同时工作的设备。
 
-### 第 2 步：I2C 是否通
+### 3.5 DTS 与驱动之间有一处需要特别注意
 
-先**动态确定 sensor 挂在哪条总线**——不猜，看内核已经告诉你的信息：
+DTS 写的是：
+
+```text
+pwdn-gpios = <...>;
+```
+
+但这份 `imx415.c` 获取的可选 GPIO 是：
+
+```c
+imx415->power_gpio = devm_gpiod_get(dev, "power", GPIOD_ASIS);
+```
+
+这个调用查找的是 `power-gpios`，不是 `pwdn-gpios`。所以当前 `pwdn-gpios` 不会被这份驱动作为 `power_gpio` 使用；probe 会打印 `Failed to get power-gpios` 警告，但不会仅因为该 GPIO 缺失而退出。硬件能否继续工作仍取决于模组 PWDN 的实际接法和默认电平，不能仅凭 probe 继续执行就判定这根脚不需要控制。
+
+不要为了消除警告直接把属性改名。先对照原理图确认这根管脚究竟是模组电源使能还是 PWDN，再决定应改 DTS 还是驱动。
+
+## 四、按源码读 IMX415 驱动
+
+### 4.1 probe 的真实顺序
+
+`imx415_probe()` 的核心流程是：
+
+1. 读取四个 module 信息属性和可选的 `rockchip,camera-hdr-mode`；
+2. 根据 HDR mode 从 `supported_modes[]` 选择第一个匹配模式；
+3. 获取 `xvclk`、reset GPIO、可选 power GPIO、pinctrl 和三路 regulator；
+4. 初始化 V4L2 controls 与 subdev；
+5. 调用 `__imx415_power_on()`；
+6. 调用 `imx415_check_sensor_id()`；
+7. 初始化 media pad，并调用 `v4l2_async_register_subdev_sensor_common()`；
+8. 启用 runtime PM。
+
+函数名是 `imx415_check_sensor_id()`，不是 `imx415_check_chip_id()`。识别逻辑也不是泛化的“两字节 ID”：
+
+```c
+#define CHIP_ID            0xE0
+#define IMX415_REG_CHIP_ID 0x311A
+
+ret = imx415_read_reg(client, IMX415_REG_CHIP_ID,
+                      IMX415_REG_VALUE_08BIT, &id);
+if (id != CHIP_ID)
+    return -ENODEV;
+```
+
+驱动开启 Thunder Boot 时会跳过 sensor ID 检查；看到 `Enable thunderboot mode, skip sensor id check`，不能再把“probe 成功”当成芯片 ID 已被实际读取的证据。
+
+### 4.2 上电时序与 MCLK
+
+这份驱动的实际 `__imx415_power_on()` 顺序是：
+
+```text
+选择 camera_default pinctrl
+  -> regulator_bulk_enable(dvdd, dovdd, avdd)
+  -> 可选 power GPIO 置有效
+  -> 延时 10~20 ms
+  -> reset GPIO 置逻辑 0
+  -> 延时 10~20 ms
+  -> xvclk 设置为 37.125 MHz 并使能
+  -> 延时 20~30 ms
+  -> 允许 I2C 访问
+```
+
+`reset-gpios` 在 DTS 中是 `GPIO_ACTIVE_LOW`。gpiod API 使用的是逻辑值，因此驱动写逻辑 0 表示“复位无效”，对应物理引脚拉高；关电时写逻辑 1，才是物理低电平复位。
+
+驱动常量是：
+
+```c
+#define IMX415_XVCLK_FREQ_37M 37125000
+```
+
+所以这块板上应测到约 **37.125 MHz**，不是 24 MHz。代码注释给出的芯片最小间隔是 ns/us 量级，但实现为了模块加载场景留了更保守的 10~30 ms 延时。调试时应先验证这份实现，而不是套用另一版驱动的时序图。
+
+### 4.3 支持模式与 link frequency
+
+`supported_modes[]` 一共有 9 项：
+
+| 输出尺寸 | RAW | HDR | 最大帧率 | V4L2 link frequency |
+|:---|:---:|:---:|:---:|---:|
+| 3864×2192 | 10 bit | Linear | 30 fps | 446 MHz |
+| 3864×2192 | 10 bit | HDR X2 | 30 fps | 743 MHz |
+| 3864×2192 | 10 bit | HDR X3 | 20 fps | 743 MHz |
+| 3864×2192 | 10 bit | HDR X3 | 20 fps | 891 MHz |
+| 3864×2192 | 12 bit | Linear | 30 fps | 446 MHz |
+| 3864×2192 | 12 bit | HDR X2 | 30 fps | 891 MHz |
+| 3864×2192 | 12 bit | HDR X3 | 20 fps | 891 MHz |
+| 1944×1097 | 12 bit | Linear | 30 fps | 297 MHz |
+| 1944×1097 | 12 bit | HDR X2 | 30 fps | 446 MHz |
+
+驱动上报的 Bayer code 是 `MEDIA_BUS_FMT_SGBRG10_1X10` 或 `MEDIA_BUS_FMT_SGBRG12_1X12`，不是 SRGGB。
+
+`link_freq_items[]` 为 297、446、743、891 MHz。寄存器表名字中的 `594M/891M/1485M/1782M` 表示 DDR lane 数据率，而 V4L2 link frequency 是它的一半。驱动按下面公式计算 pixel rate：
+
+```text
+pixel_rate = link_frequency × 2 × 4 lanes / bits_per_pixel
+```
+
+DTS endpoint 中没有 `link-frequencies` 属性；本驱动从当前 mode 的 `mipi_freq_idx` 建立 `V4L2_CID_LINK_FREQ`。因此不能在文章里凭空给 DTS 加一个固定的 891 MHz 属性。
+
+`imx415_set_fmt()` 只选择最接近的模式并更新 `hblank`、`vblank`、link frequency 和 pixel rate；它不会立刻写完整寄存器表。真正写表发生在开始取流时。
+
+### 4.4 曝光、增益与开始取流
+
+Linear 模式下，曝光控制不是把曝光值直接写进寄存器，而是先计算：
+
+```c
+shr0 = imx415->cur_vts - ctrl->val;
+```
+
+再把 `shr0` 分别写入 `0x3050`、`0x3051`、`0x3052`。模拟增益写入 `0x3090`、`0x3091`。HDR X2/X3 的多帧曝光通过 Rockchip 私有 ioctl 处理。
+
+开始取流时，`__imx415_start_stream()` 依次：
+
+1. 写 `global_reg_list`；
+2. 写当前 mode 的 `reg_list`；
+3. 应用缓存的 V4L2 controls；
+4. HDR 模式下应用初始多曝光参数；
+5. 向 `0x3000` 写 `0x00`，进入 streaming。
+
+停止取流则向 `0x3000` 写 `0x01`，进入 software standby。runtime PM 负责在首个用户开始取流时上电，在最后一个用户停止后释放电源。
+
+## 五、从板端逐层验证
+
+### 第 1 步：确认驱动实际 probe
 
 ```bash
-# 看 imx415 驱动绑定了哪个 i2c 地址（总线号-地址 一目了然）
+dmesg | grep -i imx415
 ls /sys/bus/i2c/drivers/imx415/
 ```
 
-**预期输出（示例）**：
+正常情况下，日志至少应出现类似信息：
 
 ```text
-3-001a
+imx415 1-001a: driver version: 00.01.06
+imx415 1-001a: Detected imx415 id 0000e0
 ```
 
-这个 `3-001a` 的含义：**总线 3、地址 0x1a**。所以你要扫的就是 i2c-3：
+第二路存在时还会看到 `5-001a`。如果 DTS 没有 `rockchip,camera-hdr-mode`，驱动会打印 `Get hdr mode failed! no hdr default`，随后默认选择 `NO_HDR`；这条警告本身不是 probe 失败。
+
+按日志分层判断：
+
+- 完全没有 IMX415 日志：检查正确 DTB 是否生效，以及驱动是否编入内核；
+- `could not get module information!`：检查四个 module 属性；
+- `Failed to get power regulators`：检查三路 supply phandle 与 regulator provider；
+- `Unexpected sensor id`：检查 I2C、37.125 MHz MCLK、电源和 reset；
+- `v4l2 async register subdev failed`：sensor 已识别，问题在 media graph 注册阶段。
+
+### 第 2 步：正确理解 i2cdetect
+
+先看 sysfs 中的绑定结果：
 
 ```bash
-i2cdetect -y 3
+ls -l /sys/bus/i2c/drivers/imx415/
+cat /sys/bus/i2c/devices/1-001a/name 2>/dev/null
+cat /sys/bus/i2c/devices/5-001a/name 2>/dev/null
 ```
 
-**预期输出（示例）**：
+再扫描对应总线：
+
+```bash
+i2cdetect -y 1
+i2cdetect -y 5
+```
+
+如果内核驱动已经占用地址，`i2cdetect` 通常显示 **`UU`**，而不是 `1a`。这表示地址已被内核驱动绑定，是正常现象。只有未绑定时，表格中才可能直接显示 `1a`。
+
+不要在驱动仍绑定且可能取流时用 `i2ctransfer` 抢同一地址。确实需要独占读取芯片 ID 时，先停止所有摄像头应用，再执行：
+
+```bash
+echo 1-001a > /sys/bus/i2c/drivers/imx415/unbind
+i2ctransfer -y 1 w2@0x1a 0x31 0x1a r1
+echo 1-001a > /sys/bus/i2c/drivers/imx415/bind
+```
+
+预期读到 `0xe0`。第二路把 `1-001a` 和 `-y 1` 换成 `5-001a`、`-y 5`。即使中间命令失败，也要重新 bind，避免后续误判为驱动消失。
+
+### 第 3 步：检查每一个 media graph
+
+板上可能有多个 `/dev/media*`，不要默认只有 `/dev/media0`：
+
+```bash
+for dev in /dev/media*; do
+    echo "===== $dev ====="
+    media-ctl -d "$dev" -p
+done
+
+v4l2-ctl --list-devices
+```
+
+检查重点：
+
+- sensor entity 名称包含正确的 `1-001a` 或 `5-001a`；
+- CSI0 能沿 D-PHY、MIPI CSI2、RKCIF、sditf 到达 `rkisp_vir0`；
+- CSI1 能沿 `csi_dphy1` 到达 `rkisp_vir1`；
+- 相邻 entity 的 link 为 `ENABLED`；
+- sensor source format 是 SGBRG10 或 SGBRG12；
+- sensor 原生模式是 3864×2192 或 1944×1097，3840×2160、1920×1080 可以是驱动 selection/ISP 裁剪缩放后的尺寸，不能反推 sensor mode 表也是这个尺寸。
+
+少 sensor entity 时回查 probe；sensor 存在但链路中断时，对照第 3.4 节逐对检查 `remote-endpoint`；链路完整但没有 video node 时，再查 RKCIF、ISP 和对应 MMU/保留内存配置。
+
+### 第 4 步：选择正确 video node 抓帧
+
+先列出节点，不要直接假设 `/dev/video0` 就是 NV12 ISP 输出：
+
+```bash
+v4l2-ctl --list-devices
+v4l2-ctl -d /dev/videoX --list-formats-ext
+```
+
+选中实际 ISP mainpath 或目标采集节点后，再按它列出的格式抓帧。假设该节点确实支持 1920×1080 NV12：
+
+```bash
+VIDEO_NODE=/dev/videoX
+v4l2-ctl -d "$VIDEO_NODE" \
+    --set-fmt-video=width=1920,height=1080,pixelformat=NV12 \
+    --stream-mmap --stream-count=30 --stream-to=frames.nv12
+```
+
+30 帧而不是 1 帧更容易暴露 CSI 错包、掉帧和 buffer 超时。文件大小在无额外 stride 的理想情况下应为：
 
 ```text
-     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
-00:
-10:                         1a
-...
+1920 × 1080 × 1.5 × 30 = 93,312,000 bytes
 ```
 
-**看到 `1a` = sensor 活着**，问题往下游走（进第 3 步）。**看不到 = 电源/时钟/复位/地址问题**，回到第五节，逐项排查：
+实际节点可能带 stride 或输出 RAW，必须以 `--list-formats-ext`、驱动格式和实际文件大小为准。查看 sensor controls 应对 `/dev/v4l-subdevX` 执行 `--list-ctrls`，不要默认曝光控制挂在某个 ISP `/dev/videoX` 上。
 
-- 地址对不对：`cat /sys/bus/i2c/devices/3-001a/name` 能显示说明绑定成功；地址不一定是 0x1a，以你 dts `reg` 为准
-- 总线号对不对：如果你 dts 里 sensor 挂在 `&i2c3` 下，但板子上模组实际接的是另一路 I2C，那 `i2cdetect -y 3` 当然扫不到——`ls /sys/bus/i2c/devices/` 看有哪些总线，分别 `i2cdetect -y N` 试
-- 如果 `i2cdetect -y 3` 报 `Could not open file /dev/i2c-3`：内核没开 i2c-dev 支持或总线没使能，检查 dts 里 i2c3 `status = "okay"`
+## 六、做一次不破坏取流的 DTS 实验
 
-**进阶验证**：`i2ctransfer` 直接读 sensor 的 chip id 寄存器：
+原文通过故意改错 data lane 或 I2C 地址再烧录来观察失败。这种实验会主动破坏摄像头链路，也容易在恢复旧 DTB 时留下新的变量。这里换成源码已经支持、且保持默认行为不变的验证。
 
-```bash
-# 以 IMX415 为例（寄存器地址以你 SDK 驱动 imx415_check_chip_id 为准）
-i2ctransfer -y 3 w2@0x1a 0x00 0x00 r2
+当前 DTS 没有 `rockchip,camera-hdr-mode`。驱动读取失败后默认：
+
+```c
+hdr_mode = NO_HDR;
 ```
 
-读出的值和驱动 `imx415_check_chip_id()` 里比较的常量一致，就完全确认 I2C 层 OK。
-
-### 第 3 步：media 拓扑是否完整
-
-```bash
-media-ctl -p                  # 查看实体/pad/link 拓扑
-v4l2-ctl --list-devices       # 查看视频节点
-```
-
-**预期输出（示例，截取关键部分）**：
+在正在使用的 IMX415 节点中显式加入：
 
 ```text
-- entity 1: imx415 3-001a (1 pad, 1 link)
-    type V4L2 subdev subtype Sensor
-    pad0: Source [fmt:SRGGB10_1X10/3840x2160]  ← 分辨率是 sensor 实际输出
-            -> "m00_b_mipi_csi2":0 [ENABLED]    ← link 状态是 ENABLED
-
-- entity 2: m00_b_mipi_csi2 (2 pads, 2 links)
-    pad0: Sink
-        <- "imx415 3-001a":0 [ENABLED]
-    pad1: Source
-        -> "m00_b_rkcif_mipi_lvds":0 [ENABLED]
+rockchip,camera-hdr-mode = <0>;
 ```
 
-**预期输出要点**：拓扑里 `imx415 → csi2 → rkcif_mipi_lvds` 链路完整，每条 link 后都标 `[ENABLED]`；`v4l2-ctl --list-devices` 能看到 rkcif 的 `/dev/video0` 与 rkisp 的 `/dev/video1`（以 SDK 为准）。
+这仍然选择 Linear/NO_HDR，只会把“隐式默认”变成“显式配置”。完成后：
 
-**不对怎么办**：
+1. 执行 `./build.sh kernel`；
+2. 从构建日志确认生成的是 `rv1126-alientek-800p.dtb`；
+3. 用 `fdtdump` 或 `dtc -I dtb -O dts` 确认产物包含该属性；
+4. 按当前 SDK 的打包和烧录流程更新实际承载 DTB 的镜像；
+5. 重启后确认 `Get hdr mode failed! no hdr default` 消失；
+6. 再抓 30 帧，确认分辨率、格式和稳定性不变。
 
-- 少了 imx415 实体：驱动没 probe 成功，回第 1/2 步
-- 实体在但 link 是 `[DISABLED]`：用 `media-ctl -l` 手动使能试试（例如 `media-ctl -l "'imx415 3-001a':0 -> 'm00_b_mipi_csi2':0[1]"`），能 enable 说明链路描述正确，只是默认没开；enable 不了说明 `remote-endpoint` 没配对，回 3.2 检查
-- 完全没拓扑输出：`media-ctl` 工具没装或 media controller 没使能，`v4l2-ctl --list-devices` 也能看个大概
+这个实验同时验证了源码修改、DTC、镜像打包、烧录、启动加载和驱动解析六个环节，而不会故意制造 lane 错配。
 
-### 第 4 步：抓一帧验证
+## 七、排查清单
 
-```bash
-# 设置格式并抓一帧到文件（先列出这个节点支持的格式，别猜）
-v4l2-ctl --device /dev/video0 --list-formats-ext
-```
+| 现象 | 源码对应 | 优先检查 |
+|:---|:---|:---|
+| 无 IMX415 probe 日志 | `imx415_of_match[]`、DTS 节点 | 当前 DTB、`compatible`、驱动配置 |
+| module information 报错 | probe 中四个 `of_property_read_*` | module index/facing/name/lens-name |
+| regulator 获取失败 | `imx415_configure_regulators()` | `dvdd/dovdd/avdd-supply` 与 provider |
+| power GPIO 警告 | 驱动读取 `power-gpios`，DTS 写 `pwdn-gpios` | 结合原理图决定是否修 DTS/驱动 |
+| sensor ID 为非 `0xE0` | `0x311A` 读 1 字节 | I2C 总线、37.125 MHz MCLK、reset、电源 |
+| `i2cdetect` 显示 `UU` | I2C client 已绑定 | 正常，不要当成地址消失 |
+| media graph 缺 link | DTS endpoint graph | 成对核对全部 `remote-endpoint` |
+| 有 entity 但抓帧超时 | `s_stream()` 与接收链路 | 4 lane、一致的 format、CSI/RKCIF/ISP 日志 |
+| RAW 格式或尺寸与预期不同 | `supported_modes[]` | SGBRG10/12、3864×2192 或 1944×1097 |
+| 全黑但持续有帧 | 曝光/增益与 ISP/3A | sensor subdev controls、IQ 文件、镜头 |
 
-**预期输出（示例）**：
+## 八、动手练习
 
-```text
-ioctl: VIDIOC_ENUM_FMT
-	Type: Video Capture
-	[0]: 'NV12' (Y/CbCr 4:2:0)
-		Size: Discrete 1920x1080
-		Size: Discrete 3840x2160
-```
-
-选一个支持的分辨率抓一帧：
-
-```bash
-v4l2-ctl --device /dev/video0 \
-         --set-fmt-video=width=1920,height=1080,pixelformat=NV12 \
-         --stream-mmap --stream-count=1 --stream-to=frame.nv12
-```
-
-**预期输出（示例）**：
-
-```text
-<<<<<<<<<<<<<<<< 1.0 fps, 3110400 bytes
-```
-
-`3110400 = 1920 × 1080 × 1.5`（NV12 每像素 1.5 字节），**帧大小对 = 数据真的进来了**。
-
-把裸数据拷回 PC 转成能看的图（PC 上装 FFmpeg）：
-
-```bash
-# PC 上执行
-ffmpeg -f rawvideo -pix_fmt nv12 -s 1920x1080 -i frame.nv12 frame.png
-```
-
-**预期输出**：`frame.png` 是一张正常画面（哪怕偏暗/偏亮，但能看到内容）。
-**不对怎么办**：
-
-- 抓帧超时 / `Unable to start streaming`：s_stream 链路某环没起来。看 `dmesg | tail` 有没有 rkcif/rkisp 报错；确认 data-lanes 三处一致、link-frequencies 匹配（第七节排查清单）
-- 抓到帧但**全黑**：曝光/增益为 0、ISP 3A 没工作、镜头盖没摘。`v4l2-ctl --device /dev/video1 --list-ctrls`（rkisp 通道）看曝光/增益值，试着 `v4l2-ctl -d /dev/video1 -c exposure=1000`（值范围以实际为准）
-- 抓到帧但**花屏/斜切**：格式不匹配、stride 用错。确认 pixelformat 与 `--list-formats-ext` 一致；NV12 按 1.5 字节/像素算大小
-
-**这一步通了，摄像头就是"点亮"了**；之后接 ISP、接编码、接 NPU 都是在这帧数据上做文章。
-
-## 七、从改懂到改会：改一处配置并验证
-
-前六节你已经**看懂**了原厂配置。这一节做一次完整的"改 → 编译 → 烧录 → 观察 → 改回"闭环，把知识变成手感。**用故意改错的方式验证你对配置的理解**——这是最快的学习路径。
-
-### 7.1 改什么：把 data-lanes 从 4 改成 2
-
-为什么要拿这个开刀：`data-lanes` 是"三处必须一致"的铁律，改错它的后果（无数据/花屏）在第六节第 3、4 步有明确的观察点，最适合做对照实验。
-
-在 SDK 里打开你定位到的 `*-cam.dtsi`，找到 sensor 节点的 `port/endpoint`，把：
-
-```dts
-data-lanes = <1 2 3 4>;
-```
-
-改成：
-
-```dts
-data-lanes = <1 2>;
-```
-
-保存。**注意只改 sensor 端这一处**，csi2 和 rkcif 端保持 `<1 2 3 4>` 不动——故意制造"三处不一致"。
-
-### 7.2 编译内核
-
-回到 SDK 根目录：
-
-```bash
-cd ~/RV1126/atk-rv1126-sdk
-./build.sh kernel
-```
-
-**预期输出（示例）**：
-
-```text
-...
-  DTC     arch/arm/boot/dts/rv1126-atk-rv1126.dtb
-  Kernel: arch/arm/boot/zImage is ready
-  ...
-  boot.img created
-```
-
-看到 `boot.img created`（或提示 boot 镜像路径）就是成功。产物一般在 `kernel/boot.img`，或执行 `./mkfirmware.sh` 后打包到 `rockdev/` 目录（以你 SDK 脚本输出为准）。
-
-**不对怎么办**：
-
-- dts 语法错误会在 DTC 阶段报 `Error: ... syntax error`，按行号回去改（多半是少分号/少括号）
-- 编译报缺库/缺工具链：确认 SDK 环境初始化脚本执行过（正点原子资料里有 SDK 环境搭建章节，通常需要 `source envsetup.sh` 或安装交叉编译工具链）
-
-### 7.3 烧录 boot 分区并重启
-
-烧录方式以正点原子资料《开发板使用手册》烧录章节为准（常用 RKDevTool 或升级工具），**只需要烧 boot 分区**（因为只改了 dts，dts 编在 boot.img 里），不用重烧整个系统。
-
-烧完重启，重新执行第六节第 4 步的抓帧命令。
-
-**预期观察（这是本实验的核心）**：
-
-- `i2cdetect -y 3` 应该还能看到 `1a`（I2C 层没受影响）
-- `media-ctl -p` 里 imx415 实体的分辨率/格式可能还能显示（链路还能建立）
-- **抓帧大概率失败或只有极少数帧**——因为 sensor 实际还在按 4 lane 输出，接收端按 2 lane 收，链路数据对不上
-
-**结论**：你亲手验证了"data-lanes 三处不一致"的真实后果。现在把 `<1 2>` 改回 `<1 2 3 4>`，重复 7.2 + 7.3，确认恢复出图。
-
-### 7.4 第二轮实验（可选）：改 i2c 地址故意失配
-
-同样的套路：把 dts 里 `reg = <0x1a>` 改成 `reg = <0x1b>`，重新编译烧录。预期：`dmesg` 报 chip id 读取失败、`ls /sys/bus/i2c/drivers/imx415/` 为空、`i2cdetect -y 3` 在 0x1a 位置依然能看到（因为硬件没变，地址是硬件决定的）。改回来，恢复。
-
-**做完这两个实验，你对设备树字段的理解就落地了**——知道每个字段改错了会有什么现象，排障时就能反推。
-
-## 八、排查清单（贴墙上）
-
-| 现象 | 定位命令 | 可能原因 | 排查动作 | 对应章节 |
-|:---|:---|:---|:---|:---|
-| dmesg 无 probe / probe 失败 | `dmesg \| grep -i imx415` | compatible 不匹配；chip id 读不到 | 核对 dts `compatible` 与驱动 match 表；查 I2C/电源 | 4.1 / 3.0 |
-| i2cdetect 看不到 sensor | `ls /sys/bus/i2c/drivers/imx415/` + `i2cdetect -y N` | 电源没上、MCLK 无波形、RESET 极性反、地址错、上电时序不对 | 示波器量电压/时钟；核对 reg 地址；对照规格书时序 | 5 / 6.2 |
-| I2C 能看到但读寄存器异常 | `i2ctransfer` | 供电不稳、时钟频率超 spec、I2C 速率过高 | 降 I2C 速率到 100kHz；量电压纹波 | 6.2 |
-| media-ctl 拓扑断链 | `media-ctl -p` | endpoint 没互指、某节点 status 非 okay | 检查所有 `remote-endpoint` 成对；`status = "okay"` | 3.2 / 6.3 |
-| 有节点但抓帧超时 | `dmesg \| tail` + 抓帧 | data-lanes 不一致、link-frequencies 不匹配、s_stream 没触发 | 三处 data-lanes 对比硬件接线；检查链路时钟 | 7 / 6.4 |
-| 抓到帧但全黑 | `v4l2-ctl --list-ctrls` | 曝光/增益为 0、ISP 配置、镜头盖 | 设默认曝光/增益；接 ISP 后检查 3A 是否工作 | 6.4 |
-| 抓到帧但花屏/斜切 | `--list-formats-ext` | 格式不匹配、lane 顺序、stride 用错 | 核对 pixelformat 与输出格式；用正确 stride 取数据 | 6.4 |
-
-这张表比前面的章节更"压缩"，排障时从"现象"列找到自己，按"定位命令"先跑，再按"排查动作"逐条做，最后回到对应章节读细节。
-
-## 九、动手练习
-
-1. **跑通四步调试**：在 RV1126 板卡上依次执行 dmesg、i2cdetect、media-ctl、v4l2-ctl 抓帧，记录每一步的实际输出，与你板卡 SDK 的设备树节点一一对应——把第 6 节的"预期输出（示例）"替换成你自己的真实输出，写一份《我的板子点亮记录》
-2. **读 SDK 驱动**：打开 SDK 里的 `imx415.c`，标出 probe、power_on、set_fmt、set_ctrl、s_stream 五个函数的行号，说出每段在做什么
-3. **对照设备树**：在你的板卡 dts 里找到 sensor 节点，把 `reg`、`clocks`、`reset-gpios`、`data-lanes` 抄出来，并到原理图上找到对应引脚验证
-4. **做完 7.3 的 data-lanes 实验**：亲手制造一次"三处不一致"，观察现象，再改回来，写出你观察到的三个现象
-5. **PC 端对照**：用 USB 摄像头 + `v4l2-ctl --list-devices` / `v4l2-ctl --stream-mmap` 抓帧，体会"应用视角"与板端一致——同一套 V4L2 接口
+1. 在 DTS 中分别画出 CSI0 和 CSI1 的全部 endpoint 对。
+2. 在板端确认 IMX415 实际绑定为 `1-001a`、`5-001a`，还是只有其中一路。
+3. 从 `supported_modes[]` 找出当前 RAW bit depth、HDR mode、fps 和 link frequency。
+4. 完成第六节的显式 NO_HDR 实验，并保留 DTB 反编译片段与 dmesg 前后对比。
+5. 连续抓取 30 帧，记录节点、格式、尺寸、文件大小和内核错误计数。
 
 ## 里程碑
 
-- [ ] 能画出点亮五关（供电/I2C/初始化/MIPI/出帧）并说出每关的排查点
-- [ ] 能在自己的 SDK 里用 find/grep 定位到真实的板级 dts、imx415 节点、驱动源码三个文件
-- [ ] 能在板卡上独立跑完 dmesg → i2cdetect → media-ctl → 抓帧四步，并会把预期输出与真实输出对照
-- [ ] 能解释 v4l2-subdev、media-controller、v4l2-async 各解决什么问题
-- [ ] 能读懂 sensor 设备树节点每个关键字段，并能检查 endpoint 是否成对、data-lanes 是否一致
-- [ ] 能独立完成一次"改 dts → 编译 → 烧录 → 验证 → 改回"的完整闭环
-- [ ] 会使用排查清单：从现象反推原因，用定位命令逐层缩小范围
+- [ ] 能解释为什么本板的 MCLK 是 37.125 MHz，而不是常见的 24 MHz
+- [ ] 能说出芯片 ID 寄存器 `0x311A`、期望值 `0xE0` 和读取长度 1 字节
+- [ ] 能分别画出 CSI0 经 RKCIF、CSI1 直达 ISP 的两条路径
+- [ ] 能解释 `i2cdetect` 中 `UU` 的含义
+- [ ] 能指出 `pwdn-gpios` 与驱动读取 `power-gpios` 的差异
+- [ ] 能区分 sensor 原生 mode、selection crop 与 ISP 输出尺寸
+- [ ] 能完成 DTS 修改、DTB 验证、烧录和 30 帧回归闭环
 
-> 🏷️ 标签：sensor 驱动 · 设备树 · v4l2-subdev · media-controller · v4l2-async · MIPI-CSI · IMX415 · 点亮调试 · 上电时序
+> 标签：sensor 驱动 · 设备树 · V4L2 subdev · Media Controller · MIPI CSI-2 · IMX415 · RV1126 · 上电时序

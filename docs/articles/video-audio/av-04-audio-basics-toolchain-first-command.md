@@ -50,14 +50,7 @@ PCM 有三个决定数据量与音质的参数，也就是"音频三要素"：
 
 例：48kHz / 16bit / 立体声 = 48000 × 2 × 2 = 192000 B/s ≈ 187.5 KB/s ≈ 1.5 Mbps。和视频对比：1080p30 NV12 是 93MB/s，编码后 2~4Mbps——**音频在总码流里占比极小，但它是"最后一公里"的体验担当**：视频卡顿可以忍，声音断断续续或回声刺耳，用户立刻卸载。
 
-【图1：PCM 采样与量化示意】
-
-```mermaid
-flowchart LR
-    A[模拟声波<br>连续曲线] -->|采样率 48kHz<br>每秒取 48000 个点| B[离散样本序列]
-    B -->|位深 16bit<br>每个样本圆整为整数| C[量化后的数字序列]
-    C -->|声道数 2<br>左右交错存放| D[PCM 字节流<br>192KB/s @48k16双声道]
-```
+![av-04-1](./assets/av-04-1.png)
 
 ## 二、音频的"像素格式"：交错、字节序与裸流
 
@@ -100,24 +93,7 @@ I2S 适合接高质量 audio codec（ADC/DAC 芯片），支持 16/24/32bit、�
 
 工程判断：**板载麦克风阵列/语音唤醒常用 PDM（便宜、可多路）**，需要高保真录音/播放用 I2S + codec。RV1126 两者都有，具体哪组引脚可用、怎么配，以板卡原理图与 SDK 设备树为准。
 
-【图2：I2S 与 PDM 两条音频通路】
-
-```mermaid
-flowchart LR
-    subgraph 模拟侧[声音]
-        MIC1[MEMS 麦克风]
-        CODEC[Audio Codec<br>ADC/DAC]
-    end
-    subgraph SoC[RV1126]
-        PDM[PDM 控制器<br>1-bit 流 + 抽取滤波]
-        I2S[I2S 控制器<br>PCM 逐位传输]
-        A3A[音频 3A<br>AEC/ANS/AGC]
-    end
-    MIC1 -->|PDM 1-bit 2.4MHz| PDM
-    CODEC -->|I2S BCLK/LRCK/SD| I2S
-    PDM --> A3A --> APP[应用/编码]
-    I2S --> A3A
-```
+![av-04-2](./assets/av-04-2.png)
 
 > 注：音频 3A（回声消除/降噪/自动增益）是本系列后续的重点内容，这里先记住它的位置——在音频通路进入应用之前。
 
@@ -143,7 +119,7 @@ ffprobe tone_1k.wav
 
 `ffprobe` 输出里的 `Sample rate`、`Channels`、`Sample format` 就是 WAV 头里记录的参数——这就是"音频三要素"落地的样子。
 
-## 五、PC 工具链安装（双轨零成本）
+## 五、PC 工具链安装
 
 本系列约定"PC 先跑通概念，再上板验证"。音频相关的 PC 工具链只需要两个：
 

@@ -261,6 +261,17 @@
   color: #3fb950;
 }
 
+.prose table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.prose :not(pre) > code {
+  overflow-wrap: anywhere;
+}
+
 .prose .mermaid-diagram {
   margin: 1.75em 0;
   overflow-x: auto;
