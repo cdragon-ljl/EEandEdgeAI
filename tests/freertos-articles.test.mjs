@@ -11,6 +11,10 @@ const article2Name = 'freertos-02-tcb-task-create-delete.md';
 const article2Path = join(freertosDir, article2Name);
 const article3Name = 'freertos-03-scheduler-tick-block-unblock.md';
 const article3Path = join(freertosDir, article3Name);
+const article4Name = 'freertos-04-cortex-m4-port-context-switch.md';
+const article4Path = join(freertosDir, article4Name);
+const article5Name = 'freertos-05-riscv-port-trap-context.md';
+const article5Path = join(freertosDir, article5Name);
 const expectedChapters = [
   '源码阅读方法与 List_t/ListItem_t',
   'TCB、任务创建与删除',
@@ -31,7 +35,7 @@ test('freertos directory contains the framework and approved first sample only',
     .filter((file) => file.endsWith('.md'))
     .sort();
 
-  assert.deepEqual(files, [article1Name, article2Name, article3Name, 'freertos-kernel-framework.md']);
+  assert.deepEqual(files, [article1Name, article2Name, article3Name, article4Name, article5Name, 'freertos-kernel-framework.md']);
 });
 
 test('freertos framework defines the approved 12-article sequence', () => {
@@ -143,6 +147,47 @@ test('scheduler article closes the ready, delayed, tick, and pending-ready paths
   assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据)：/m);
   assert.doesNotMatch(body, /^\|/m);
   assert.doesNotMatch(body, /Cortex-M|RISC-V|BASEPRI|PendSV|mstatus|mcause/);
+});
+test('Cortex-M4 port article follows initial frame, SVC, SysTick, and PendSV', () => {
+  const markdown = readFileSync(article4Path, 'utf8');
+  const body = markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
+
+  assert.match(markdown, /^order: 4$/m);
+  for (const symbol of [
+    'pxPortInitialiseStack', 'portINITIAL_EXC_RETURN', 'prvPortStartFirstTask',
+    'vPortSVCHandler', 'xPortSysTickHandler', 'xPortPendSVHandler',
+    'vTaskSwitchContext', 'PSP', 'MSP', 'EXC_RETURN', 'BASEPRI',
+    'configMAX_SYSCALL_INTERRUPT_PRIORITY', 'S16-S31',
+    'vPortValidateInterruptPriority',
+  ]) {
+    assert.match(body, new RegExp(symbol), `missing Cortex-M4 port concept: ${symbol}`);
+  }
+  assert.match(body, /portable\/GCC\/ARM_CM4F\/port\.c/);
+  assert.doesNotMatch(body, /STM32|CubeMX|HAL_/);
+  assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据)：/m);
+  assert.doesNotMatch(body, /^\|/m);
+});
+
+test('RISC-V port article follows context frame, trap dispatch, and restore', () => {
+  const markdown = readFileSync(article5Path, 'utf8');
+  const body = markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
+
+  assert.match(markdown, /^order: 5$/m);
+  for (const symbol of [
+    'portContext.h', 'portASM.S', 'pxPortInitialiseStack',
+    'xPortStartFirstTask', 'freertos_risc_v_trap_handler',
+    'portcontextSAVE_CONTEXT_INTERNAL', 'portcontextRESTORE_CONTEXT',
+    'mstatus', 'mepc', 'mcause', 'ecall', 'mret',
+    'xISRStackTop', 'vPortSetupTimerInterrupt',
+    'configENABLE_FPU', 'configENABLE_VPU',
+    'portasmADDITIONAL_CONTEXT_SIZE',
+  ]) {
+    assert.match(body, new RegExp(symbol), `missing RISC-V port concept: ${symbol}`);
+  }
+  assert.match(body, /portable\/GCC\/RISC-V\/portASM\.S/);
+  assert.doesNotMatch(body, /开发板|SiFive|ESP32|Milk-V/);
+  assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据)：/m);
+  assert.doesNotMatch(body, /^\|/m);
 });
 test('article prose allows long technical identifiers to wrap on narrow screens', () => {
   const globalCss = readFileSync('src/styles/global.css', 'utf8');
