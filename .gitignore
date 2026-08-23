@@ -3,6 +3,7 @@ dist/
 .astro/
 .tmp/
 .superpowers/
+.worktrees/
 /covers/
 .env
 npm-debug.log*
