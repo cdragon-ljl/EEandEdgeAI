@@ -21,6 +21,12 @@ const article7Name = 'freertos-07-semaphore-mutex-priority-inheritance.md';
 const article7Path = join(freertosDir, article7Name);
 const article8Name = 'freertos-08-task-notification-event-group.md';
 const article8Path = join(freertosDir, article8Name);
+const article9Name = 'freertos-09-stream-message-buffer.md';
+const article9Path = join(freertosDir, article9Name);
+const article10Name = 'freertos-10-software-timer-daemon.md';
+const article10Path = join(freertosDir, article10Name);
+const article11Name = 'freertos-11-static-allocation-heap-one-to-five.md';
+const article11Path = join(freertosDir, article11Name);
 const expectedChapters = [
   '源码阅读方法与 List_t/ListItem_t',
   'TCB、任务创建与删除',
@@ -41,7 +47,7 @@ test('freertos directory contains the framework and approved first sample only',
     .filter((file) => file.endsWith('.md'))
     .sort();
 
-  assert.deepEqual(files, [article1Name, article2Name, article3Name, article4Name, article5Name, article6Name, article7Name, article8Name, 'freertos-kernel-framework.md']);
+  assert.deepEqual(files, [article1Name, article2Name, article3Name, article4Name, article5Name, article6Name, article7Name, article8Name, article9Name, article10Name, article11Name, 'freertos-kernel-framework.md']);
 });
 
 test('freertos framework defines the approved 12-article sequence', () => {
@@ -243,6 +249,59 @@ test('notification and Event Group article closes both wait and wake protocols',
   assert.match(body, /github\.com\/FreeRTOS\/FreeRTOS-Kernel\/blob\/V11\.3\.0\/(tasks|event_groups)\.c/);
   assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据)：/m);
   assert.doesNotMatch(body, /^\|/m);
+});
+test('Stream and Message Buffer article preserves ring and message boundaries', () => {
+  const markdown = readFileSync(article9Path, 'utf8');
+  const body = markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
+  assert.match(markdown, /^order: 9$/m);
+  for (const symbol of [
+    'StreamBuffer_t', 'xHead', 'xTail', 'xTriggerLevelBytes',
+    'xTaskWaitingToReceive', 'xTaskWaitingToSend',
+    'xStreamBufferSend', 'xStreamBufferReceive',
+    'prvWriteBytesToBuffer', 'prvReadBytesFromBuffer',
+    'sbFLAGS_IS_MESSAGE_BUFFER', 'sbBYTES_TO_STORE_MESSAGE_LENGTH',
+    'prvReadMessageFromBuffer', 'xStreamBufferNextMessageLengthBytes',
+    'sbSEND_COMPLETED', 'sbRECEIVE_COMPLETED',
+  ]) assert.match(body, new RegExp(symbol), `missing stream/message concept: ${symbol}`);
+  assert.match(body, /github\.com\/FreeRTOS\/FreeRTOS-Kernel\/blob\/V11\.3\.0\/stream_buffer\.c/);
+  assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据)：/m);
+});
+
+test('software timer article closes command, list, expiry, and callback paths', () => {
+  const markdown = readFileSync(article10Path, 'utf8');
+  const body = markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
+  assert.match(markdown, /^order: 10$/m);
+  for (const symbol of [
+    'Timer_t', 'xTimerQueue', 'xActiveTimerList1',
+    'pxCurrentTimerList', 'pxOverflowTimerList',
+    'xTimerGenericCommandFromTask', 'xTimerGenericCommandFromISR',
+    'prvTimerTask', 'prvProcessTimerOrBlockTask',
+    'prvInsertTimerInActiveList', 'prvProcessExpiredTimer',
+    'prvProcessReceivedCommands', 'prvReloadTimer',
+    'xTimerPendFunctionCall', 'tmrSTATUS_IS_AUTORELOAD',
+  ]) assert.match(body, new RegExp(symbol), `missing software timer concept: ${symbol}`);
+  assert.match(body, /github\.com\/FreeRTOS\/FreeRTOS-Kernel\/blob\/V11\.3\.0\/timers\.c/);
+  assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据)：/m);
+});
+
+test('memory article distinguishes all five heap contracts and statistics', () => {
+  const markdown = readFileSync(article11Path, 'utf8');
+  const body = markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
+  assert.match(markdown, /^order: 11$/m);
+  for (const symbol of [
+    'heap_1', 'heap_2', 'heap_3', 'heap_4', 'heap_5',
+    'pvPortMalloc', 'vPortFree', 'BlockLink_t', 'prvHeapInit',
+    'prvInsertBlockIntoFreeList', 'vPortDefineHeapRegions',
+    'xPortGetFreeHeapSize', 'xPortGetMinimumEverFreeHeapSize',
+    'vPortGetHeapStats', 'HeapStats', 'ucStaticallyAllocated',
+  ]) assert.match(body, new RegExp(symbol), `missing heap concept: ${symbol}`);
+  for (const heap of [1, 2, 3, 4, 5]) {
+    assert.match(body, new RegExp(`portable/MemMang/heap_${heap}\\.c`), `missing heap_${heap} source link`);
+  }
+  assert.match(body, /heap_4[\s\S]+first sufficient/);
+  assert.match(body, /heap_5[\s\S]+vPortDefineHeapRegions/);
+  assert.doesNotMatch(body, /所有 heap[^\n。]*支持[^\n。]*vPortGetHeapStats|五种实现[^\n。]*统一[^\n。]*heap stats/);
+  assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据)：/m);
 });
 test('article prose allows long technical identifiers to wrap on narrow screens', () => {
   const globalCss = readFileSync('src/styles/global.css', 'utf8');
