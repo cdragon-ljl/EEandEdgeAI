@@ -39,6 +39,8 @@ flowchart LR
 
 ## 二、应用如何获得设备
 
+节点存在、device object 链接、驱动 init 成功是三种不同状态。`DEVICE_DT_GET` 借用静态 device 引用，不能释放也不表示 ready；init 从只读 config 建立 RAM data 并安装 API vtable，返回 errno 失败后对象仍存在但 `device_is_ready` 为 false。init level 只解决依赖顺序，应用不应读取驱动私有 data。
+
 应用层最常用的模式是从设备树节点取得引用，再检查其初始化是否成功：
 
 ```c
@@ -94,7 +96,92 @@ sequenceDiagram
 
 这与 Linux platform driver 的设备与驱动匹配思想相近，也比在 FreeRTOS 项目里把 HAL 调用包成一堆全局函数更有边界。统一 API 的代价是：不能绕过设备树和 Kconfig。若节点 disabled、binding 不匹配或驱动未开启，正确答案是修配置，而不是在应用里手写寄存器访问。
 
-## 五、检查设备依赖
+## 五、贯穿实验：I2C 设备 API
+
+本实验固定 **Zephyr 4.4.x** 与 `nrf52dk/nrf52832`：BME280 使用 3.3 V、共地、SDA=P0.26、SCL=P0.27、CSB 拉高、SDO 接 GND（地址 `0x76`）。其芯片 ID 寄存器 `0xD0` 应读为 `0x60`。这直接使用 I2C API，不启用 sensor driver；第 11 篇才使用 sensor API。
+
+```text
+app/
+├── CMakeLists.txt
+├── prj.conf
+├── app.overlay
+└── src/main.c
+```
+
+```cmake
+# CMakeLists.txt
+cmake_minimum_required(VERSION 3.20.0)
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(device_api_i2c)
+target_sources(app PRIVATE src/main.c)
+```
+
+```ini
+# prj.conf
+CONFIG_I2C=y
+CONFIG_LOG=y
+```
+
+```dts
+/* app.overlay: nRF52 DK 连接 BME280 */
+#include <zephyr/dt-bindings/pinctrl/nrf-pinctrl.h>
+&pinctrl { i2c0_default: i2c0_default { group1 {
+    psels = <NRF_PSEL(TWIM_SDA, 0, 26)>, <NRF_PSEL(TWIM_SCL, 0, 27)>;
+}; }; };
+&i2c0 {
+    status = "okay"; pinctrl-0 = <&i2c0_default>; pinctrl-names = "default";
+    bme280: bme280@76 { compatible = "bosch,bme280"; reg = <0x76>; status = "okay"; };
+};
+```
+
+`I2C_DT_SPEC_GET(node_id)` 是宏，编译期从 child 的 `reg` 和父控制器产生 `struct i2c_dt_spec`。`i2c_is_ready_dt(const struct i2c_dt_spec *spec)` 返回总线 init 状态。`i2c_write_read_dt(const struct i2c_dt_spec *spec, const uint8_t *write_buf, size_t num_write, uint8_t *read_buf, size_t num_read)` 是线程上下文同步 API，写后重复起始读，返回 `0` 或负 errno；buffer 在返回前必须有效，不能在 ISR 调用。
+
+```c
+/* src/main.c */
+#include <errno.h>
+#include <stdint.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/i2c.h>
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(device_i2c, LOG_LEVEL_INF);
+#define BME280_NODE DT_NODELABEL(bme280)
+static const struct i2c_dt_spec bme280 = I2C_DT_SPEC_GET(BME280_NODE);
+/** @brief 读取 BME280 固定芯片 ID。
+ * @return 0 表示匹配；负 errno 表示传输或识别失败。 */
+static int check_id(void)
+{
+    uint8_t reg = 0xD0U;
+    uint8_t id = 0U;
+    int err = i2c_write_read_dt(&bme280, &reg, 1U, &id, 1U);
+    if (err != 0) { LOG_ERR("I2C failed: %d", err); return err; }
+    if (id != 0x60U) { LOG_ERR("unexpected ID: 0x%02x", id); return -ENODEV; }
+    LOG_INF("BME280 ID: 0x%02x", id);
+    return 0;
+}
+int main(void)
+{
+    if (!i2c_is_ready_dt(&bme280)) { return -ENODEV; }
+    return check_id();
+}
+```
+
+```powershell
+west build -p always -b nrf52dk/nrf52832 app
+west flash
+Select-String build/zephyr/zephyr.dts -Pattern "bme280@76|i2c0"
+Select-String build/zephyr/.config -Pattern "CONFIG_I2C"
+```
+
+预期日志是 `BME280 ID: 0x60`，但本文未在本地硬件验证。`DEVICE_DT_GET(node_id)` 是静态引用宏：节点缺失时编译错误，驱动未编入常表现为 `__device_dts_ord_*` 链接错误；`device_is_ready(dev)` 才能验证 init 成功。`device_get_binding(const char *name)` 是运行期字符串查询，适合设备名来自 Shell 输入，不是静态应用首选。`DEVICE_DT_INST_DEFINE(inst, init, pm, data, config, level, prio, api)` 是驱动作者宏，`config`/`data` 分别为只读配置/RAM 状态，init 返回错误会使 device 不 ready；I2C vtable 由 `struct i2c_driver_api` 实现。
+
+| 症状 | 根因与检查 |
+| --- | --- |
+| `__device_dts_ord_*` | driver/Kconfig 未链接；检查 `status` 与 `.config` |
+| bus not ready | i2c0/pinctrl init 失败；检查最终 DTS 和日志 |
+| 负 errno | NACK、0x76/0x77、供电、共地或上拉错误 |
+| ID 非 0x60 | 非 BME280、CSB 不是 I2C 模式或总线噪声 |
+
+## 六、从实验验证设备依赖
 
 构建结束后检查两个文件：
 
@@ -105,7 +192,7 @@ Select-String -Path build/zephyr/.config -Pattern "CONFIG_I2C"
 
 第一条确认最终硬件描述中节点是否启用；第二条确认相应子系统与驱动是否被 Kconfig 选中。设备不 ready 时，也应检查 build/zephyr/zephyr.map，确认驱动对象确实链接进镜像。
 
-## 六、常见问题
+## 七、故障模型与排错
 
 | 现象 | 根因 | 处理 |
 | --- | --- | --- |
@@ -115,14 +202,16 @@ Select-String -Path build/zephyr/.config -Pattern "CONFIG_I2C"
 | 初始化依赖错误 | 上层驱动过早访问总线 | 修正 init level 和依赖描述 |
 | 字符串查找设备失败 | 名称变化或拼写错误 | 改用 DEVICE_DT_GET |
 
-## 七、动手练习
+> 本章所有命令面向 Zephyr 4.4.x；命令输出是预期诊断样例，不代表本文已经在本地硬件上运行，也不替代实际板卡验证。
+
+## 八、动手练习
 
 1. 在 nRF52 DK 上取得 uart0 和 gpio0 的设备引用，打印各自的 ready 状态。
 2. 将一个 overlay 中的节点设为 disabled，观察 DEVICE_DT_GET 和 device_is_ready 的差异。
 3. 在 zephyr.dts 中跟踪 LED 节点到 GPIO 控制器的依赖。
 4. 对比 gpio_dt_spec 与手工传入 port、pin、flag 的代码量。
 
-## 八、里程碑自检
+## 九、里程碑自检
 
 - [ ] 能说明 compatible 在节点、binding 和驱动之间的作用
 - [ ] 会用 DEVICE_DT_GET 和 device_is_ready 获取并验证设备

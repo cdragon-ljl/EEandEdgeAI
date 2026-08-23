@@ -12,83 +12,121 @@ draft: false
 
 如果你已经用 FreeRTOS 做过几个项目，手里的板子是 STM32 或者 ESP32，工程里是 `Makefile` 或 Keil 工程，任务用 `xTaskCreate` 创建、队列用 `xQueueSend` 收发——那么欢迎来到 Zephyr 的世界。
 
-先说结论：**Zephyr 不是一个"FreeRTOS 的替代品"，而是一整套嵌入式操作系统生态**。
+先说结论：**Zephyr 不是一个“把 FreeRTOS API 换个名字”的内核，而是一套把内核、驱动、配置、构建和协议栈放进同一工程模型的嵌入式操作系统。**
 
 FreeRTOS 本质上是一个**内核库**：它提供任务、队列、信号量这些调度原语，但外设驱动、协议栈、构建系统都要你自己去找、自己去拼。跑 BLE 要集成第三方的协议栈，换个芯片要移植 HAL，工程结构千人千面。
 
-Zephyr 则像嵌入式世界里的"Linux 体验"：它由 Linux 基金会托管，内置了**构建系统（Kconfig + CMake + west）**、**设备树（Devicetree）硬件描述**、**统一的驱动框架**，以及 BLE / Thread / Zigbee / WiFi 等一整套协议栈。你拿到一块官方支持的板子，`west build` + `west flash` 两步就能跑起来——这种体验和 FreeRTOS 时代"配环境两小时"是完全不同的。
+Zephyr 则把这些部分放进同一个版本化系统：内核决定线程如何运行，Kconfig 决定哪些能力被编译，Devicetree 描述这块板上的硬件连接，驱动模型把硬件节点变成可调用的设备对象，CMake/Ninja 完成编译，west 管理工作区并把构建、烧录等命令组织起来。
 
-对 FreeRTOS 老兵来说，学 Zephyr 最大的障碍不是内核概念（线程、队列、信号量你全会），而是**它的工程范式**。本系列默认你已经懂 RTOS 基础，只讲差异：Kconfig 怎么裁剪、设备树怎么描述硬件、驱动怎么注册、BLE 怎么写。第一讲，先把环境搭起来，让 nRF52832 DK 跑通 Hello World。
+先把几个经常混淆的名词分开：
+
+| 名词 | 它解决什么 | 它不是什么 |
+| --- | --- | --- |
+| Zephyr kernel | 调度、同步、超时、内存等运行时机制 | 不是完整 Zephyr 的全部 |
+| Zephyr OS | 内核、驱动、子系统、构建描述和工具约定 | 不是一个需要动态安装的桌面操作系统 |
+| Zephyr SDK | 交叉编译器、调试器和主机工具集合 | 不包含你的应用源码，也不负责依赖版本 |
+| west workspace | 由 manifest 管理的一组 Git 仓库与应用 | 不是编译器，也不取代 CMake |
+| board target | 一组 SoC、板级 DTS、默认配置和 runner 选择 | 不只是一个预定义宏 |
+
+这个区分很重要：遇到“找不到板”“Kconfig 依赖不满足”“编译器不存在”时，它们分别属于板级描述、配置图和 SDK 工具链问题，不能都归结为“Zephyr 环境坏了”。
+
+对 FreeRTOS 老兵来说，学 Zephyr 最大的障碍不是线程和信号量，而是**从“手工拼工程”转向“由声明驱动构建和设备生成”**。本篇先建立这套心智模型，再安装工具；Hello World 只是验证模型闭环的最小实验。
 
 ## 一、Zephyr 是什么：三个关键词
 
 **关键词一：west + CMake + Kconfig（构建系统）**
 
-FreeRTOS 的工程：一堆 `.c/.h` 文件 + 一个 Makefile 或 IDE 工程，用宏定义裁剪功能。Zephyr 的工程：`west` 管理代码仓库和依赖，`CMake` 组织编译，`Kconfig` 负责配置裁剪。
+这三个名字经常被统称为“Zephyr 构建系统”，但职责不同：
 
-Kconfig 你可能在 Linux 内核里见过——`menuconfig` 那个界面。Zephyr 完全复用了这套机制：每个模块都有 Kconfig 选项，应用通过 `prj.conf` 文件集中配置，比如：
+- **west 管工作区和命令入口**：它读取 manifest 同步仓库，也把 build、flash、debug 等扩展命令统一暴露出来。west 不解析 C 文件，也不是编译器。
+- **CMake 生成构建图**：它决定应用、内核、驱动和库的哪些源文件进入 Ninja 构建，并传递 include、编译选项和链接规则。
+- **Kconfig 求解配置图**：它处理布尔值、整数、字符串、默认值、依赖和 select/imply 关系，最终得到一份自洽配置。
+
+FreeRTOS 工程常用头文件宏直接裁剪功能。Zephyr 则把“用户意图”和“最终结果”分开：应用在 `prj.conf` 写请求，Kconfig 合并板级默认值和依赖后生成 `build/zephyr/.config`，再生成 C 可见的 `autoconf.h`。因此 `prj.conf` 不是简单复制成头文件，写了 `CONFIG_X=y` 也不代表依赖一定满足。
+
+例如：
 
 ```ini
+# 请求启用日志子系统。
 CONFIG_LOG=y
+
+# 请求启用 Bluetooth Host；实际还会触发其依赖检查。
 CONFIG_BT=y
 ```
 
-一行配置开启日志，一行配置开启蓝牙协议栈。相比 FreeRTOS 的 `#define configUSE_TIMERS 1`，Kconfig 的优势是**全量可搜索、依赖自动解析、配置与代码分离**。后面专门有一讲深入 Kconfig。
+这两行表达的是“应用需要什么”，不是“编译器立刻定义两个宏”。配置过程可以概括为：
+
+```mermaid
+flowchart LR
+    P[prj.conf<br/>应用请求] --> K[Kconfig 求解]
+    B[board defconfig<br/>板级默认] --> K
+    D[依赖与默认值] --> K
+    K --> C[build/zephyr/.config<br/>最终配置]
+    C --> H[autoconf.h<br/>C 条件编译]
+    C --> M[CMake 条件源文件]
+```
+
+【图 1：Kconfig 从多个输入求出最终配置，而不是复制 prj.conf】
+
+相比 `#define configUSE_TIMERS 1`，Kconfig 的价值不是“换一种宏语法”，而是把配置变成可搜索、可校验、可复现的依赖图。排查问题时应查看最终 `.config`，不能只看 `prj.conf`。
 
 **关键词二：Devicetree（设备树）**
 
-设备树（DT）是从 Linux 继承下来的硬件描述语言：用一个 `.dts` 文本文件描述板子上有什么外设、挂在哪条总线上、引脚怎么接。代码不直接写寄存器地址，而是通过设备树节点获取硬件信息。
+Devicetree 是**构建期硬件描述**。它用树形文本描述 SoC 外设、板级连接、总线层级、中断、引脚和外接器件。与 Linux 常见的运行时 DTB 不同，Zephyr 通常在构建时解析 DTS，把结果生成 C 宏和设备初始化数据；固件启动后不是再读取一遍文本文件。
+
+一个节点能否变成可用设备，要经过三层关系：
+
+1. **节点描述实例**：地址、IRQ、GPIO、总线父节点等“这块板上有什么”。
+2. **binding 解释属性**：`compatible` 对应的 YAML 规定属性类型、必选项和语义。
+3. **驱动实例化设备对象**：匹配驱动读取生成宏，创建 `struct device`；应用再通过统一 API 使用它。
 
 ```dts
 &uart0 {
+    /* status 决定该节点是否参与当前固件构建。 */
     status = "okay";
+
+    /* 属性值由 UART binding 定义，不是任意字符串。 */
     current-speed = <115200>;
 };
 ```
 
-这段的意思是：启用 UART0，波特率 115200。驱动代码里用 `DEVICE_DT_GET(DT_NODELABEL(uart0))` 拿到这个设备，完全不用关心 UART0 的寄存器基地址是多少——地址在设备树里已经描述了。
+这段 overlay 只覆盖已有 `uart0` 节点：把状态改为可用，并设置默认波特率。`&uart0` 是节点标签引用；`status = "okay"` 不等于硬件已经初始化成功，它只让满足依赖的驱动实例进入构建。运行时仍要用 `device_is_ready()` 检查驱动初始化结果。
 
-这解决了 FreeRTOS 生态里最头疼的问题：**同一个驱动代码，换一块板子，改设备树就行，不用改 C 代码**。对应关系可以这么记：FreeRTOS 时代改引脚要改 `GPIO_InitTypeDef` 初始化代码，Zephyr 时代改引脚只改 `.overlay` 设备树文件。
+应用通过 `DEVICE_DT_GET(DT_NODELABEL(uart0))` 获得编译期确定的设备对象地址。它不执行字符串查找，也不会“动态发现”UART。寄存器基址、IRQ 等底层信息由 SoC DTS 和驱动消费，应用只面向 UART API。
+
+设备树提高的是**硬件连接与驱动逻辑的分离程度**，不是保证 C 代码在任意板上原样运行。真正可移植还要求目标板提供相同 alias/chosen、兼容驱动和相近能力。例如应用使用 `DT_ALIAS(led0)` 时，换板只需新板也定义 `led0`；若应用硬编码 `DT_NODELABEL(uart0)` 或依赖 Nordic 专有属性，移植仍要改代码。
 
 **关键词三：生态（协议栈 + 驱动 + 工具链一体）**
 
-Zephyr 内置了驱动框架（GPIO / UART / SPI / I2C / PWM / ADC 全都有统一 API）和协议栈（BLE / 802.15.4 / WiFi / Ethernet / USB）。官方支持 800+ 开发板，你的 nRF52832 DK 就是官方维护的板级之一。这意味着：**你写的应用代码，理论上可以原样编译到任何一块官方支持的板子上**。这在 FreeRTOS 世界几乎不可想象。
+“生态”不等于仓库里文件很多，而是各部分遵守同一组契约：
+
+- 驱动按设备类别提供统一 API，例如 GPIO 和 sensor API；应用不直接调用某家芯片 HAL。
+- 网络、Bluetooth、USB、文件系统、日志等子系统都由 Kconfig 管理依赖，并接入同一构建和初始化模型。
+- CMSIS、厂商 HAL、加密库等外部代码由 west manifest 固定版本，不靠开发者手工复制目录。
+- board、shield、sample 和 test 使用相同的目标命名和构建入口，CI 能复用本地命令。
+
+这带来的是**有条件的可移植性**。如果两个目标板都提供相同设备类别、alias 和配置能力，应用层通常不需要改业务逻辑；如果硬件能力不同，Kconfig、overlay 甚至业务策略仍要调整。统一 API 降低了移植成本，但不能消除硬件差异。
+
+nRF52 DK 是官方维护目标，SoC、板级 DTS、默认配置和 J-Link runner 已经接入这套契约，所以最小应用只需选择 `nrf52dk/nrf52832`，无需从启动文件和链接脚本开始搭建。
 
 ## 二、Zephyr 架构全景
 
-理解了三个关键词，再看整体架构就清楚了。Zephyr 从上到下分五层：
+![zephyr-01-1](./assets/zephyr-01-1.png)
 
-```mermaid
-flowchart TD
-    subgraph APP[应用层]
-        A1[main.c / 业务逻辑 / 传感器处理 / BLE 应用]
-    end
-    subgraph SVC[服务层]
-        S1[BLE · Thread · 传感器 · 日志 · Shell · 电源管理]
-    end
-    subgraph KERNEL[内核层]
-        K1[线程调度 · 信号量/队列/互斥 · 定时器 · 内存管理<br/>对应 FreeRTOS 的 task / queue / semaphore]
-    end
-    subgraph DRV[驱动框架层]
-        D1[统一 API：GPIO / UART / SPI / I2C / PWM / ADC<br/>通过设备树绑定到具体硬件]
-    end
-    subgraph HAL[HAL / 芯片支持层]
-        H1[寄存器访问 · 时钟 · 中断 · Nordic HAL]
-    end
+这张分层图表达的是职责依赖，不代表一次函数调用一定逐层穿过。应用调用 `gpio_pin_set_dt()` 时会进入 GPIO 驱动 API；Bluetooth Host 处理协议时则主要使用内核同步、控制器和网络缓冲区。
 
-    A1 --> S1
-    S1 --> K1
-    K1 --> D1
-    D1 --> H1
-```
+还要区分**构建期**和**运行期**：
 
-- **应用层**：你写的 `main.c` 和业务模块。
-- **服务层**：BLE、日志、Shell 等"内核之外"的子系统。FreeRTOS 里这些要自己找第三方库，Zephyr 内置且经过统一 API 设计。
-- **内核层**：调度、同步、内存管理。概念与 FreeRTOS 一一对应，但 API 不同（`k_thread_create` 对应 `xTaskCreate`，`k_sem_take` 对应 `xSemaphoreTake`）。
-- **驱动层**：统一驱动模型 + 设备树绑定，这是和 FreeRTOS 差异最大的地方，后续专门展开。
-- **HAL 层**：芯片厂商提供的寄存器封装。nRF52832 用的是 Nordic 官方 HAL，Zephyr 以 west 模块方式引入，随 `west update` 一起拉取。
+| 阶段 | 发生什么 | 典型产物或状态 |
+| --- | --- | --- |
+| CMake 配置期 | 选择 board，合并 Kconfig，展开 Devicetree，收集源文件 | `.config`、`autoconf.h`、`devicetree_generated.h`、Ninja 构建图 |
+| 编译链接期 | 编译应用/内核/驱动，链接 iterable sections 和设备对象 | `zephyr.elf`、`zephyr.map`、`zephyr.hex` |
+| 内核启动期 | 初始化内核对象，按 init level 初始化设备与子系统 | 设备 ready 或初始化失败 |
+| 应用运行期 | `main` 线程与静态线程进入调度，业务通过统一 API 使用设备 | 日志、事件、协议状态与硬件 I/O |
 
-一句话总结这张图：**内核只占很小一部分，Zephyr 的价值在"内核之上的生态"和"内核之下的标准化"**。
+Zephyr 中的 `main()` 不是复位后直接跳转的裸机入口，而是内核创建的 main 线程入口。很多设备会在 main 之前按初始化级别完成 probe；这解释了为什么应用拿到 `struct device` 后仍要检查 `device_is_ready()`，也解释了设备依赖顺序为什么是系统设计的一部分。
+
+一句话总结：**内核只负责运行时基础机制，Zephyr 的主要工程价值来自构建期声明、标准设备模型和版本化子系统共同形成的闭环。**
 
 ## 三、硬件与工具链准备
 
@@ -115,7 +153,7 @@ VSCode（编辑器/插件）
 
 ## 四、环境搭建（Windows 为例）
 
-以下步骤以 Windows 10/11 为例，与 Zephyr 官方 Getting Started 一致。官方推荐的命令行工具是 **Windows Terminal**（Microsoft Store 可安装）。**不建议使用 WSL**：Zephyr 官方目前不支持在 WSL 中烧录调试（会找不到 USB 设备），直接在 Windows 原生环境开发。
+以下步骤以 Windows 10/11 原生环境为例。这样 J-Link、虚拟串口和 USB 驱动直接由 Windows 使用，构建与烧录处于同一环境。WSL 可以承担部分构建工作，但 USB 转发、路径和宿主工具会增加额外变量，不作为本系列主线。
 
 **第一步：用 winget 安装系统依赖**
 
@@ -166,12 +204,28 @@ pip install west
 **第三步：拉取 Zephyr 源码**
 
 ```powershell
-west init zephyrproject
+# 创建固定在 Zephyr v4.4.0 manifest 的工作区。
+west init -m https://github.com/zephyrproject-rtos/zephyr `
+  --mr v4.4.0 zephyrproject
+
 cd zephyrproject
+
+# 按 manifest 记录的 revision 同步 HAL、CMSIS 等模块。
 west update
 ```
 
-`west init` 创建 workspace 并克隆 Zephyr 主仓库，`west update` 按 manifest 拉取所有依赖模块（Nordic HAL、CMSIS、工具脚本等，约 1~2GB，耐心等待）。
+`west init` 创建的不是普通单仓库项目，而是一个 workspace。根目录的 `.west/config` 记录 manifest 仓库位置；`zephyr/west.yml` 再记录模块 URL、路径和 revision。`west update` 按这些 revision 检出 Nordic HAL、CMSIS、MCUboot 等依赖，因此同一 manifest 能复现一组相互兼容的源码版本。
+
+```text
+zephyrproject/
+├── .west/          # workspace 元数据，不是源代码
+├── zephyr/         # manifest 仓库和 Zephyr 主源码
+├── modules/        # HAL、库和第三方模块
+├── bootloader/     # 例如 MCUboot
+└── tools/          # 部分主机工具
+```
+
+`west topdir` 用来确认当前命令属于哪个 workspace。不要手工把模块目录复制到应用旁边，否则 manifest 将无法保证版本一致。
 
 **第四步：导出 CMake 包并安装 Python 依赖**
 
@@ -213,7 +267,7 @@ west --version
 | **C/C++ Extension Pack** | Microsoft | 代码补全、跳转、lint、调试（必需） |
 | **nRF Kconfig** | Nordic Semiconductor | Kconfig 文件语法高亮与跳转（强烈推荐） |
 | **nRF DeviceTree** | Nordic Semiconductor | 设备树 .dts/.overlay 语法支持（强烈推荐） |
-| **GNU Linker Map files** | ... | 链接脚本/内存映射可视化（可选） |
+| **Linker Map Viewer** | 任选可信扩展 | 辅助浏览 map；也可以直接用文本搜索 |
 
 其中 **C/C++ Extension Pack 是官方指南要求的核心**，后两个 Nordic 扩展让 Kconfig 和设备树文件的阅读体验大幅提升。
 
@@ -262,6 +316,27 @@ west boards | Select-String nrf52dk
 
 **第二步：构建 hello_world**
 
+Hello World 的作用是验证 console、链接、内核启动和 main 线程，而不是展示复杂 API。一个等价的最小应用只有这些内容：
+
+```c
+#include <zephyr/kernel.h>
+#include <zephyr/sys/printk.h>
+
+/**
+ * @brief 验证 main 线程和默认 console 已经可用。
+ *
+ * @return 0，表示 main 线程正常结束。
+ */
+int main(void)
+{
+    /* printk 直接写默认 console，适合最早期 bring-up。 */
+    printk("Hello World from Zephyr\n");
+    return 0;
+}
+```
+
+代码里没有 nRF52832 寄存器、UART 初始化或 J-Link 配置，因为这些由 board target、Devicetree、console 配置和驱动初始化共同提供。`main` 返回只会结束 main 线程；内核和其他系统线程仍可以继续运行。正式应用通常使用 logging 子系统获得级别、模块名和后端缓冲，而不是把 `printk` 当成完整日志框架。
+
 ```powershell
 cd $Env:HOMEPATH\zephyrproject\zephyr
 west build -p always -b nrf52dk/nrf52832 samples/hello_world
@@ -269,7 +344,7 @@ west build -p always -b nrf52dk/nrf52832 samples/hello_world
 
 `-p always` 表示每次强制全量重编（pristine build），避免残留配置干扰。第一次编译要几分钟，之后增量编译很快。
 
-构建成功的关键输出：
+构建成功后会出现目标完成信息和内存区域统计。下面的数字只是格式示意，实际值会随 Zephyr patch、工具链和配置变化：
 
 ```
 [100%] Built target zephyr_final
@@ -278,7 +353,7 @@ Memory region         Used Size  Region Size  %age Used
              RAM:        12336 B        64 KB     18.83%
 ```
 
-注意看这两行——**这是 Zephyr 每次构建都给你打印的资源占用报告**。hello_world 只用了 4% Flash 和 19% RAM，心里就有底了：后面加 BLE、加传感器，RAM 的预算要开始算账了。
+重点不是记住示例数字，而是理解统计边界：FLASH 通常反映最终链接进镜像的只读段，RAM 包含静态数据、内核对象和已链接栈等静态区域，但不能证明运行期堆、最深调用栈和协议峰值一定安全。后续每次增加 BLE 缓冲区或线程，都要比较 map、Kconfig 和运行时高水位。
 
 构建产物都在 `build/` 目录里，常用几个：
 
@@ -334,18 +409,45 @@ west build -p always -b nrf52dk/nrf52832 samples/basic/blinky
 west flash
 ```
 
-板上 LED0 会以 100ms 间隔闪烁。
+板上 LED0 会按样例定义的周期翻转；具体周期以该版本样例源码中的 `SLEEP_TIME_MS` 为准。
+
+### Zephyr 4.4.x 命令核对
+
+本文所有命令以 **Zephyr 4.4.x** 和 `nrf52dk/nrf52832` 为准。Windows 上按官方 [Getting Started](https://docs.zephyrproject.org/4.4.0/develop/getting_started/index.html) 安装 Python、CMake、Ninja、west 与 Zephyr SDK；不要在应用 CMake 中硬编码 SDK 路径。
+
+```powershell
+west --version
+west sdk list
+west boards | Select-String nrf52dk
+west build -p always -b nrf52dk/nrf52832 samples/hello_world
+west flash
+```
+
+预期生成 `build/zephyr/zephyr.elf` 并在串口出现 Hello World banner（具体文本随样例 patch 变化）；这是预期步骤，不是本地硬件成功声明。`-p always` 清除旧 board/Kconfig/DTS 缓存。`west` 找不到时检查 Python Scripts PATH；SDK/compiler 找不到时以 `west sdk list` 和官方安装步骤修复；烧录找不到 probe 时检查 USB 数据线、J-Link 驱动与板载调试器。
+
+```mermaid
+sequenceDiagram
+    participant W as west
+    participant S as Zephyr SDK
+    participant B as nrf52dk/nrf52832
+    W->>S: 发现编译工具链
+    W->>W: pristine build
+    W->>B: J-Link flash
+```
 
 ## 七、里程碑自检
 
 完成本讲后，你应该能确认以下几点：
 
+- [ ] 能区分 Zephyr kernel、Zephyr OS、SDK、west workspace 和 board target。
+- [ ] 能解释 `prj.conf → .config → autoconf.h` 的配置流，而不是把 Kconfig 当成普通宏文件。
+- [ ] 能解释 Devicetree 如何通过 binding 和生成宏形成设备对象，知道它不是运行时硬件扫描。
 - [ ] `west --version` 能正常输出，激活 venv（`Activate.ps1`）成为肌肉记忆
 - [ ] 知道 `west init / west update / west zephyr-export / west sdk install` 各自干什么
 - [ ] VSCode 中打开 Zephyr 源码能跳转、无红波浪线
 - [ ] `west build -p always -b nrf52dk/nrf52832 samples/hello_world` 一次成功
 - [ ] `west flash` 烧录后串口看到 `Hello World! nrf52dk/nrf52832`
-- [ ] 能看懂构建输出的 FLASH / RAM 占用报告
+- [ ] 知道静态 FLASH/RAM 报告不能替代运行期堆和栈峰值测量。
 
 ## 动手练习
 

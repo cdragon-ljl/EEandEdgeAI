@@ -12,7 +12,7 @@ draft: true
 
 > 系列名：**嵌入式知识体系 · Zephyr 实战：从 FreeRTOS 到物联网开发**
 > 定位：面向已有 FreeRTOS / 裸机经验的嵌入式软件工程师，从入门到实战，覆盖 **构建体系 → 内核机制 → 设备树驱动 → BLE 应用 → 移植与综合项目** 全链路
-> 硬件：**nRF52832 DK**（PCA10040，板载 nRF52832，Zephyr 官方板级 `nrf52dk_nrf52832`）
+> 硬件：**nRF52 DK**（PCA10040，板载 nRF52832，Zephyr 4.4.x 板目标 `nrf52dk/nrf52832`）
 > 编号：**独立编号 ZEP-01 ~ ZEP-NN**，与其他系列无关（不并入主系列、不并入 NPU / RISC-V 系列）
 > 创建日期：2026-08-08
 > 最近更新：2026-08-08（初始框架）
@@ -94,7 +94,7 @@ FreeRTOS/裸机工程师 ──west + Kconfig + Devicetree──▶ Zephyr 工�
 - **ZEP-22** 外设进阶：PWM / ADC / PPI / 定时器 / Pinctrl / DMA（按实际需要选取）
 - **ZEP-23** 板级移植（上）：SoC 支持、板级目录结构、链接脚本与启动流程（衔接已有链接脚本系列知识）
 - **ZEP-24** 板级移植（下）：外设驱动适配、pinmux 与时钟，把一块新 MCU 跑进 Zephyr
-- **ZEP-25** 综合项目：BLE 环境监测节点（传感器 + GATT + 低功耗 + DFU 完整闭环）
+- **ZEP-25** 综合项目：智能健康戒指（PPG + 皮温 + 运动感知 + BLE + 低功耗完整闭环）
 - **ZEP-26** 测试与工程化：twister、单元测试（ztest）、Zephyr 在真实产品的落地经验
 
 ## 硬件说明
@@ -102,7 +102,7 @@ FreeRTOS/裸机工程师 ──west + Kconfig + Devicetree──▶ Zephyr 工�
 - **板卡**：nRF52 DK（PCA10040），板载 **nRF52832-QFAA**
   - Cortex-M4F @ 64MHz、**512KB Flash / 64KB RAM**、BLE 5、2.4GHz 私有协议、ANT
   - 板载 J-Link OB 调试器、4 个 LED、4 个按键、SMA 天线、Arduino 兼容排针
-- **Zephyr 板级名称**：`nrf52dk_nrf52832`（旧名 `nrf52_pca10040`）
+- **Zephyr 4.4.x 板目标**：`nrf52dk/nrf52832`；应用的板级覆盖文件仍使用下划线文件名 `boards/nrf52dk_nrf52832.overlay`。
 - ⚠️ **资源约束是特色**：64KB RAM 跑 BLE + 应用偏紧，系列中会专门讲"在受限资源下的取舍"（堆规划、缓冲区、栈大小、日志降级等）
 - ⚠️ **与 Nordic 传统路线的关系**：Zephyr 自带开源 BLE 控制器（非 Nordic SoftDevice），本系列以 Zephyr 栈为主线，SoftDevice 仅作对比讲解
 - 可选拓展：nRF52840 / nRF5340 可作对比提及，但**不改变主线硬件**
@@ -134,7 +134,7 @@ FreeRTOS/裸机工程师 ──west + Kconfig + Devicetree──▶ Zephyr 工�
   - `zephyr-22-peripheral-advanced-pwm-adc-ppi.md`
   - `zephyr-23-board-porting-part1-bsp.md`
   - `zephyr-24-board-porting-part2-peripherals.md`
-  - `zephyr-25-final-project-ble-sensor-node.md`
+  - `zephyr-25-final-project-smart-ring.md`
   - `zephyr-26-testing-twister-ztest-engineering.md`
 
 ## 写作规范（沿用 NPU / RISC-V 系列标准 + 红线）
@@ -143,7 +143,9 @@ FreeRTOS/裸机工程师 ──west + Kconfig + Devicetree──▶ Zephyr 工�
 - **硬性要求**：
   - 每个 Zephyr 概念首次出现必须定义 + **FreeRTOS/裸机类比**（如：Kconfig = 裁剪宏 + 配置界面、Devicetree = 硬件描述文件、线程 = 任务）
   - 关键机制（设备树节点匹配、驱动注册、GATT 属性、移植流程）完整展开到可照抄复现
-  - 每篇有可运行代码 + 动手练习 + 里程碑自检（在 nRF52832 DK 上验证）
+- 每篇有可运行代码 + 动手练习 + 里程碑自检（在 nRF52832 DK 上验证）
+  - 每个实验必须列出完整项目树、CMakeLists.txt、prj.conf、overlay/binding/模块文件（适用时）、完整 C 源、构建/烧录命令、预期输出与接线前提；片段必须标明插入点和依赖，不能伪装成完整程序。
+  - 每个完整 C 块应包含头文件、初始化与返回码处理；自定义函数使用简洁中文 Doxygen。宏必须称为宏，并说明编译期/运行期、线程/ISR 上下文和对象生命周期。
 - **正确性**：API 签名、Kconfig 选项、设备树属性、板级配置必须核实 Zephyr 官方文档（当前 **Zephyr 4.4.x / LTS 3.7.x**，写作时标注版本号）；不确定的内容宁缺毋滥并标注"待核实"，绝不编造
   - 硬件参数（Flash/RAM/外设列表）以 Nordic nRF52832 产品规格书为准
 - **核心性**：聚焦核心知识点讲深，不堆砌冷门 API
