@@ -1,4 +1,4 @@
-export type SeriesId = 'cuda' | 'ee-system' | 'rknn' | 'riscv' | 'fpga' | 'zephyr' | 'bsp' | 'usb' | 'pcie' | 'video-audio';
+export type SeriesId = 'cuda' | 'ee-system' | 'freertos' | 'rknn' | 'riscv' | 'fpga' | 'zephyr' | 'bsp' | 'usb' | 'pcie' | 'video-audio';
 
 export interface SeriesMeta {
   id: SeriesId;
@@ -36,6 +36,16 @@ export const SERIES: Record<SeriesId, SeriesMeta> = {
     href: '/ee-system/',
     label: '底层工程',
     cover: { src: '/covers/ee-system.webp', width: 1922, height: 818, alt: '嵌入式知识体系系列封面' },
+  },
+  freertos: {
+    id: 'freertos',
+    title: 'FreeRTOS 内核源码解读',
+    shortTitle: 'FreeRTOS',
+    description: '沿真实调用链拆解任务、调度、通信、同步、内存管理与 Cortex-M4/RISC-V 移植层。',
+    accent: 'rose',
+    href: '/freertos/',
+    label: 'RTOS 内核',
+    cover: { src: '/covers/freertos.webp', width: 1920, height: 820, alt: 'FreeRTOS 内核源码解读系列封面' },
   },
   rknn: {
     id: 'rknn',
@@ -119,4 +129,4 @@ export const SERIES: Record<SeriesId, SeriesMeta> = {
   },
 };
 
-export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'rknn', 'riscv', 'fpga', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio'];
+export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'freertos', 'rknn', 'riscv', 'fpga', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio'];
