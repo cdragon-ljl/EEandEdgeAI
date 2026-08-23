@@ -15,6 +15,12 @@ const article4Name = 'freertos-04-cortex-m4-port-context-switch.md';
 const article4Path = join(freertosDir, article4Name);
 const article5Name = 'freertos-05-riscv-port-trap-context.md';
 const article5Path = join(freertosDir, article5Name);
+const article6Name = 'freertos-06-queue-isr-queue-set.md';
+const article6Path = join(freertosDir, article6Name);
+const article7Name = 'freertos-07-semaphore-mutex-priority-inheritance.md';
+const article7Path = join(freertosDir, article7Name);
+const article8Name = 'freertos-08-task-notification-event-group.md';
+const article8Path = join(freertosDir, article8Name);
 const expectedChapters = [
   '源码阅读方法与 List_t/ListItem_t',
   'TCB、任务创建与删除',
@@ -35,7 +41,7 @@ test('freertos directory contains the framework and approved first sample only',
     .filter((file) => file.endsWith('.md'))
     .sort();
 
-  assert.deepEqual(files, [article1Name, article2Name, article3Name, article4Name, article5Name, 'freertos-kernel-framework.md']);
+  assert.deepEqual(files, [article1Name, article2Name, article3Name, article4Name, article5Name, article6Name, article7Name, article8Name, 'freertos-kernel-framework.md']);
 });
 
 test('freertos framework defines the approved 12-article sequence', () => {
@@ -186,6 +192,55 @@ test('RISC-V port article follows context frame, trap dispatch, and restore', ()
   }
   assert.match(body, /portable\/GCC\/RISC-V\/portASM\.S/);
   assert.doesNotMatch(body, /开发板|SiFive|ESP32|Milk-V/);
+  assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据)：/m);
+  assert.doesNotMatch(body, /^\|/m);
+});
+test('Queue article closes task, ISR, lock, and Queue Set paths', () => {
+  const markdown = readFileSync(article6Path, 'utf8');
+  const body = markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
+  assert.match(markdown, /^order: 6$/m);
+  for (const symbol of [
+    'Queue_t', 'xQueueGenericSend', 'xQueueReceive', 'prvCopyDataToQueue',
+    'vTaskPlaceOnEventList', 'prvLockQueue', 'prvUnlockQueue',
+    'cTxLock', 'cRxLock', 'xQueueGenericSendFromISR',
+    'pxHigherPriorityTaskWoken', 'xQueueCreateSet', 'xQueueAddToSet',
+    'xQueueSelectFromSet', 'prvNotifyQueueSetContainer',
+  ]) assert.match(body, new RegExp(symbol), `missing Queue concept: ${symbol}`);
+  assert.match(body, /github\.com\/FreeRTOS\/FreeRTOS-Kernel\/blob\/V11\.3\.0\/queue\.c/);
+  assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据)：/m);
+  assert.doesNotMatch(body, /^\|/m);
+});
+
+test('mutex article closes holder, inheritance, timeout, and recursive paths', () => {
+  const markdown = readFileSync(article7Path, 'utf8');
+  const body = markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
+  assert.match(markdown, /^order: 7$/m);
+  for (const symbol of [
+    'xQueueSemaphoreTake', 'xMutexHolder', 'uxRecursiveCallCount',
+    'uxMessagesWaiting', 'pvTaskIncrementMutexHeldCount',
+    'xTaskPriorityInherit', 'xTaskPriorityDisinherit',
+    'vTaskPriorityDisinheritAfterTimeout', 'uxMutexesHeld',
+    'uxBasePriority', 'xQueueTakeMutexRecursive', 'xQueueGiveMutexRecursive',
+  ]) assert.match(body, new RegExp(symbol), `missing mutex concept: ${symbol}`);
+  assert.match(body, /github\.com\/FreeRTOS\/FreeRTOS-Kernel\/blob\/V11\.3\.0\/(queue|tasks)\.c/);
+  assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据)：/m);
+  assert.doesNotMatch(body, /^\|/m);
+});
+
+test('notification and Event Group article closes both wait and wake protocols', () => {
+  const markdown = readFileSync(article8Path, 'utf8');
+  const body = markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
+  assert.match(markdown, /^order: 8$/m);
+  for (const symbol of [
+    'ulNotifiedValue', 'ucNotifyState', 'ulTaskGenericNotifyTake',
+    'xTaskGenericNotifyWait', 'xTaskGenericNotify',
+    'xTaskGenericNotifyFromISR', 'taskWAITING_NOTIFICATION',
+    'taskNOTIFICATION_RECEIVED', 'eSetValueWithoutOverwrite',
+    'EventGroup_t', 'xEventGroupWaitBits', 'xEventGroupSetBits',
+    'vTaskPlaceOnUnorderedEventList', 'uxBitsToClear',
+    'eventUNBLOCKED_DUE_TO_BIT_SET', 'xTimerPendFunctionCallFromISR',
+  ]) assert.match(body, new RegExp(symbol), `missing notification/event concept: ${symbol}`);
+  assert.match(body, /github\.com\/FreeRTOS\/FreeRTOS-Kernel\/blob\/V11\.3\.0\/(tasks|event_groups)\.c/);
   assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据)：/m);
   assert.doesNotMatch(body, /^\|/m);
 });
