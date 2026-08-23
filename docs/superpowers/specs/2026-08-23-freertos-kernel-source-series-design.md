@@ -1,395 +1,212 @@
-# FreeRTOS 内核源码解读系列设计
+# FreeRTOS 内核源码解读系列重新规划
 
-## 1. 目标与边界
+## 设计状态
 
-本系列定名为《FreeRTOS 内核源码解读：从任务创建到上下文切换》，面向具备 C 语言、裸机或基础 RTOS 使用经验，希望系统理解 FreeRTOS 内部实现的嵌入式工程师。
+- 方案已确认。
+- 目标文章数：12 篇。
+- 当前阶段只确定系列边界、文章顺序和写作标准，不开始批量写作。
 
-系列的核心不是罗列 API，也不是围绕某块开发板搭建应用，而是沿真实执行链阅读 FreeRTOS-Kernel 源码：
+## 系列目标
 
-- 一个任务如何创建、初始化并进入就绪队列；
-- 调度器如何启动、选择任务、处理 Tick、阻塞和唤醒；
-- 队列、信号量、互斥锁、任务通知和事件组如何复用内核对象；
-- Stream Buffer、Message Buffer 和软件定时器如何运行；
-- heap_1 到 heap_5 如何实现不同的内存策略；
-- 公共内核如何通过 portable 层落到 Cortex-M4 和 RISC-V；
-- MPU、SMP、低功耗和调试机制如何扩展经典单核内核。
+本系列面向已经掌握 C 语言和基本 RTOS API，希望真正读懂 FreeRTOS 内核实现的嵌入式工程师。
 
-公共内核部分保持平台无关，不绑定 MCU、开发板、HAL、IDE、引脚或外设。只有移植层文章进入 Cortex-M4 和 RISC-V 的架构细节。
+文章不是 API 百科、配置清单或移植教程。主线是从公开入口进入源码，持续跟踪函数调用、对象所有权和状态变化，直到一个机制完整闭合。读者应能用文章提供的源码路径独立回到上游仓库复核结论。
 
-## 2. 固定源码版本与权威来源
+系列固定使用：
 
-所有源码分析固定到 `FreeRTOS-Kernel V11.3.0`，不引用随时变化的 `main` 分支。该版本属于 FreeRTOS `202604-LTS`，便于稳定引用宏分支、结构体、函数和 GitHub 行锚点。
+```text
+FreeRTOS-Kernel V11.3.0
+commit 9b777ae5c5b8e9e456065a00294d1e5f5f9facf5
+FreeRTOS 202604-LTS
+```
 
-主要来源：
+不引用漂移的 `main` 行号，不用 vendor fork 代替上游实现，也不把某个开发板、HAL 或 IDE 写进公共内核机制。
 
-- [FreeRTOS-Kernel V11.3.0](https://github.com/FreeRTOS/FreeRTOS-Kernel/tree/V11.3.0)
-- [FreeRTOS 202604-LTS](https://github.com/FreeRTOS/FreeRTOS-LTS)
-- [FreeRTOS Kernel Book](https://github.com/FreeRTOS/FreeRTOS-Kernel-Book)
-- [GCC ARM_CM4F port](https://github.com/FreeRTOS/FreeRTOS-Kernel/tree/V11.3.0/portable/GCC/ARM_CM4F)
-- [GCC RISC-V port](https://github.com/FreeRTOS/FreeRTOS-Kernel/tree/V11.3.0/portable/GCC/RISC-V)
-- Arm Cortex-M4 架构与异常模型官方文档
-- RISC-V Privileged Architecture 官方规范
+## 清理边界
 
-涉及行为结论时必须同时核对公共内核、目标 port 和官方架构文档。不能从单个函数片段推断跨上下文行为，也不能把某个 vendor fork 的实现写成上游 FreeRTOS 行为。
+删除 `docs/articles/freertos` 中现有的 15 篇已发布文章。
 
-## 3. 内容组织方案
+保留并重新编写：
 
-系列采用“执行链驱动主线 + 源码索引辅助”的组织方式。
+- `docs/articles/freertos/freertos-kernel-framework.md`；
+- FreeRTOS 系列封面；
+- 站点中的 FreeRTOS 系列注册和导航入口。
 
-正文按系统运行过程展开，不按源文件顺序做百科式介绍。每篇围绕一个较大的机制，跟踪公开 API、内部静态函数、数据结构、链表变化、临界区和 portable hook。文章末尾再提供本篇涉及的文件、结构体、函数、配置宏和官方链接索引。
+删除文章后，系列页面可以暂时没有已发布文章。新文章必须从样稿开始重新建立，不复用旧文章段落。
 
-单核调度器是公共主线。MPU 和 SMP 不贯穿基础文章，避免每个函数同时展开多套条件编译路径；它们在最后的进阶文章中单独解释。
+## 组织原则
 
-## 4. 系列结构
+采用执行链驱动，而不是 API 分类或源码文件顺序。
 
-系列规划为 8 个技术阶段、12 篇源码长文，并追加 3 篇面试专题，共 15 篇。规划文件本身使用 `draft: true`，正文使用连续的 `order: 1` 到 `order: 15`。
+每篇文章只回答一个中心问题。文章结构由该问题的实际源码路径决定，不要求所有文章使用相同标题。数据结构、条件编译、临界区和 portable 交接只在解释当前机制时出现，不单独拼成固定章节。
 
-### 阶段一：源码地图与基础设施
+学习顺序分为四层：
 
-#### 01. 源码地图与阅读方法：FreeRTOS-Kernel 是怎样组织起来的
+1. 先掌握内核通用容器和任务对象；
+2. 再理解调度和任务状态变化；
+3. 然后进入两种架构的 portable 实现；
+4. 最后分析通信、同步、定时和内存管理。
 
-文件：`freertos-01-kernel-source-map-config.md`
+面试专题放在全部核心文章之后，只使用前文已经解释过的源码事实。
 
-核心内容：
+## 十二篇文章
 
-- V11.3.0 目录结构和公共内核与 `portable` 的边界；
-- `FreeRTOSConfig.h` 如何通过条件编译改变内核；
-- 基础数据类型、命名方式、宏、断言和 trace hook；
-- 从公开 API 找到内部函数、数据结构和 port hook；
-- 建立后续文章统一使用的源码索引与调用链记录方法。
+### 1. 源码阅读方法与 List_t/ListItem_t
 
-实践结果：能够从一个 API 入口画出“公开头文件 -> 公共内核 -> portable 层”的最小调用图，并解释配置宏为何是源码阅读的一部分。
+中心问题：FreeRTOS 如何用一套通用链表表达任务状态、等待顺序和对象归属？
 
-### 阶段二：任务生命周期与调度器
+主要源码：`include/FreeRTOS.h`、`include/list.h`、`list.c`、`include/portable.h`。
 
-#### 02. 链表、TCB 与任务创建：一个任务如何进入就绪队列
+核心内容：固定源码版本和配置的方法，`List_t`、`ListItem_t`、`MiniListItem_t` 的内存关系，owner/container 语义，插入、尾插和删除，`portMAX_DELAY` 特殊分支，以及如何从调用点判断并发保护由谁提供。
 
-文件：`freertos-02-list-tcb-task-creation.md`
+本篇不提前解释 TCB 全部字段，也不讨论具体处理器的上下文切换。
 
-核心内容：
+### 2. TCB、任务创建与删除
 
-- `list.c/list.h` 中 `List_t`、`ListItem_t` 和 `MiniListItem_t`；
-- 初始化、有序插入、尾部插入、删除、owner 和 item value；
-- `TCB_t` 内嵌的状态链表项和事件链表项；
-- 动态和静态任务创建路径；
-- `xTaskCreate`、内部创建函数、任务初始化、初始栈和 ready list；
-- 调度器已运行时创建高优先级任务的抢占条件。
+中心问题：一个任务函数如何变成调度器可以选择和最终回收的 TCB？
 
-实践结果：手工追踪两个不同优先级任务创建后各个链表的节点、owner、value 和索引位置。
+主要源码：`include/task.h`、`tasks.c`、`include/portable.h`。
 
-#### 03. 调度器完整运行链：启动、Tick、阻塞、唤醒与任务销毁
+核心内容：`TCB_t` 的关键字段，状态节点和事件节点，`xTaskCreate`、`xTaskCreateStatic`、`prvCreateTask`、`prvInitialiseNewTask`、`prvAddNewTaskToReadyList`，静态与动态内存所有权，任务删除和 Idle 延迟回收。
 
-文件：`freertos-03-scheduler-tick-task-lifecycle.md`
+portable 层只讲 `pxPortInitialiseStack` 契约，不展开 Cortex-M4 或 RISC-V 栈帧。
 
-核心内容：
+### 3. 调度器、Tick、阻塞与唤醒
 
-- `vTaskStartScheduler` 的初始化和 portable 交接；
-- ready、delayed、overflow delayed、pending ready、suspended 和 termination lists；
-- `vTaskSwitchContext`、最高优先级选择、抢占和时间片；
-- `xTaskIncrementTick`、延时链表交换和任务解阻塞；
-- relative delay、absolute delay、timeout、suspend 和 resume；
-- task delete、Idle task 延迟回收和任务生命周期闭环。
+中心问题：任务如何在 ready、delayed、event wait 和 running 之间移动，调度器又在何时选择新任务？
 
-实践结果：重建一次“运行 -> 延时 -> Tick 解阻塞 -> 抢占 -> 删除 -> Idle 回收”的完整时间线。
+主要源码：`tasks.c`、`include/task.h`、`list.c`。
 
-### 阶段三：移植层与上下文切换
+核心内容：`vTaskStartScheduler`、ready list、`vTaskSwitchContext`、同优先级轮转、`vTaskDelay`、`vTaskDelayUntil`、两条 delayed list、Tick 回绕、`xTaskIncrementTick`、事件解除阻塞、scheduler suspend 与 pending ready。
 
-#### 04. 移植层契约与 Cortex-M4 上下文切换
+重点是公共调度策略。实际寄存器保存留给两篇 port 文章。
 
-文件：`freertos-04-cortex-m4-port-context-switch.md`
+### 4. Cortex-M4 移植与上下文切换
 
-核心内容：
+中心问题：GCC ARM_CM4F port 如何利用 Cortex-M 异常机制启动首任务并切换上下文？
 
-- `port.c/portmacro.h` 必须向公共内核提供的契约；
-- Cortex-M4 初始任务栈帧；
-- SVC 启动首个任务；
-- PendSV 保存与恢复上下文；
-- SysTick 到调度请求的路径；
-- PRIMASK、BASEPRI、临界区和可调用 RTOS API 的中断优先级；
-- EXC_RETURN、硬件自动压栈和浮点上下文。
+主要源码：`portable/GCC/ARM_CM4F/port.c`、`portable/GCC/ARM_CM4F/portmacro.h`、`tasks.c`。
 
-实践结果：按指令顺序标注一次任务切换前后的 PSP、通用寄存器、异常栈帧和 `pxCurrentTCB` 变化。
+核心内容：初始任务栈、硬件异常帧和软件保存帧、SVC、PendSV、SysTick、PSP/MSP、EXC_RETURN、BASEPRI、FPU 上下文和 ISR API 优先级边界。
 
-#### 05. RISC-V 移植层：trap、Tick 与上下文保存
+不绑定任何 Cortex-M4 MCU、开发板、启动工程或厂商 HAL。
 
-文件：`freertos-05-riscv-port-trap-context-switch.md`
+### 5. RISC-V 移植与 trap 上下文
 
-核心内容：
+中心问题：GCC RISC-V port 如何定义上下文布局、分派 trap 并完成任务切换？
 
-- GCC RISC-V `port.c`、`portASM.S` 和 port macro；
-- 初始任务上下文和首任务启动；
-- trap 入口、通用寄存器和关键 CSR 保存；
-- Tick 来源与平台提供接口；
-- 中断退出和任务切换；
-- 与 Cortex-M4 的自动压栈、异常返回和中断屏蔽方式对照；
-- 新架构 port 的检查清单。
+主要源码：`portable/GCC/RISC-V/port.c`、`portASM.S`、`portContext.h`、`portmacro.h`。
 
-实践结果：用同一张上下文切换清单比较 Cortex-M4 和 RISC-V，明确公共内核保持不变而 port 必须实现的部分。
+核心内容：初始上下文、通用寄存器和 CSR 保存、`mstatus`、`mepc`、`mcause`、ecall yield、timer interrupt、ISR stack、chip-specific extension，以及 save/restore 对称性。
 
-### 阶段四：线程通信与同步
+不绑定具体 RISC-V SoC、开发板或 timer 外设实现。
 
-#### 06. 队列源码全链路：创建、发送、接收、阻塞与 ISR 路径
+### 6. Queue、ISR 路径与 Queue Set
 
-文件：`freertos-06-queue-send-receive-isr.md`
+中心问题：Queue 如何同时管理数据、等待任务和 ISR 与任务之间的并发？
 
-核心内容：
+主要源码：`include/queue.h`、`queue.c`、`tasks.c`。
 
-- `Queue_t`、存储区、读写位置和等待任务链表；
-- queue create 与静态/动态存储；
-- send to back、send to front 和 overwrite；
-- receive、peek、阻塞、timeout 和唤醒；
-- `FromISR` 路径与是否需要 yield；
-- `cTxLock/cRxLock` 的延迟解锁机制；
-- queue reset、delete 和状态不变量。
+核心内容：`Queue_t`、存储区和读写指针，发送与接收快速路径，满/空时的阻塞与超时，事件链表，scheduler suspend，queue lock，FromISR 路径和 `pxHigherPriorityTaskWoken`，Queue Set 如何复用 queue 机制实现多对象等待。
 
-实践结果：跟踪一个满队列上发送者阻塞、接收者取走元素、发送者被唤醒的完整链表和数据指针变化。
+### 7. 信号量、互斥锁与优先级继承
 
-#### 07. 信号量与互斥锁：同一个 Queue_t 如何实现不同同步语义
+中心问题：信号量和互斥锁为什么共享 Queue_t，却具有不同的所有权和调度语义？
 
-文件：`freertos-07-semaphore-mutex-priority-inheritance.md`
+主要源码：`include/semphr.h`、`queue.c`、`tasks.c`。
 
-核心内容：
+核心内容：binary/counting semaphore、mutex holder、recursive mutex、`uxMutexesHeld`、优先级继承、释放时降级、等待超时后的部分降级，以及 priority inheritance 能解决和不能解决的问题。
 
-- binary/counting semaphore 如何复用 queue；
-- mutex holder、recursive count 和所有权；
-- priority inheritance、timeout 和 disinherit；
-- 多 mutex 场景的继承边界；
-- ISR 可以使用哪些同步对象；
-- 信号量、互斥锁和队列的内部差异与选择原则。
+### 8. 任务通知与 Event Group
 
-实践结果：用低、中、高三个优先级任务重建一次优先级反转、继承和恢复过程。
+中心问题：不使用完整 Queue 时，FreeRTOS 如何实现轻量级单任务通知和多任务 bit 条件等待？
 
-#### 08. 任务通知、事件组与 Queue Set：轻量同步机制如何实现
+主要源码：`tasks.c`、`include/task.h`、`event_groups.c`、`include/event_groups.h`。
 
-文件：`freertos-08-task-notification-event-group-queue-set.md`
+核心内容：notification state/value、不同 `eNotifyAction`、wait/take、FromISR 通知、Event Group 的 wait-all/wait-any、clear-on-exit、控制位编码和 scheduler suspended 扫描。
 
-核心内容：
+不写机制选型清单，直接通过对象模型和调用路径解释两者边界。
 
-- TCB notification 数组、状态和值；
-- notify、take、wait、clear 和 ISR 路径；
-- event group 的位等待、clear 语义和同步屏障；
-- event bits 与控制位的边界；
-- queue set 如何转发成员可读事件；
-- notification、event group、queue set 的内存、唤醒和表达能力对比。
+### 9. Stream Buffer 与 Message Buffer
 
-实践结果：为三个通信场景选择最小内核对象，并从源码证明选择理由。
+中心问题：FreeRTOS 如何用同一个环形缓冲核心分别表达字节流和有边界消息？
 
-### 阶段五：流式通信与软件定时器
+主要源码：`stream_buffer.c`、`include/stream_buffer.h`、`include/message_buffer.h`。
 
-#### 09. Stream Buffer、Message Buffer 与软件定时器
+核心内容：head/tail、空槽约束、分段复制、trigger level、消息长度头、发送和接收阻塞、single-writer/single-reader 契约、ISR 完成回调，以及内部任务通知的使用方式。
 
-文件：`freertos-09-stream-message-buffer-software-timer.md`
+### 10. 软件定时器与 Timer daemon
 
-核心内容：
+中心问题：软件定时器命令如何从调用者进入 daemon task，并最终变成 callback 执行？
 
-- `stream_buffer.c` 的环形缓冲、head/tail、space 和 trigger level；
-- 单写者/单读者契约及其并发边界；
-- message buffer 的长度字段和原子消息语义；
-- `Timer_t`、timer command queue 和 timer service task；
-- active/overflow timer lists、到期处理和 callback 上下文；
-- pended function call 和 timer API 的异步语义。
+主要源码：`timers.c`、`include/timers.h`、`queue.c`、`tasks.c`。
 
-实践结果：分别重建一段字节流跨越缓冲区回绕，以及 timer command 从调用者进入 daemon 并执行 callback 的时间线。
+核心内容：timer command queue、`Timer_t`、active/overflow timer list、daemon 启动、start/reset/change/stop/delete 命令、到期计算、auto reload、callback 串行执行和 ISR 命令路径。
 
-### 阶段六：内存管理
+### 11. 静态分配与 heap_1 到 heap_5
 
-#### 10. 内存管理：静态分配与 heap_1 到 heap_5 源码比较
+中心问题：FreeRTOS 的对象内存来自哪里，五种 heap 实现分别提供什么分配、释放和碎片行为？
 
-文件：`freertos-10-memory-management-heap-one-to-five.md`
+主要源码：`include/portable.h` 和 `portable/MemMang/heap_1.c` 至 `heap_5.c`。
 
-核心内容：
+核心内容：静态对象内存归属，动态创建和删除路径，块头与对齐，heap_1 bump allocation，heap_2 按大小链表且不合并，heap_3 libc 包装，heap_4 地址有序链表与相邻合并，heap_5 region 定义与边界，以及各实现实际提供的统计能力。
 
-- `pvPortMalloc/vPortFree` 与内核对象分配契约；
-- 静态任务、队列、timer 和 Idle/Timer task memory hooks；
-- heap_1 到 heap_5 的适用条件和限制；
-- heap_4 空闲链表、对齐、block split 和 adjacent block coalescing；
-- heap_5 多区域初始化与地址排序；
-- 碎片、分配失败、统计和并发保护。
+### 12. 源码与工程面试专题
 
-实践结果：对同一分配/释放序列手工推演 heap_2、heap_4 和 heap_5 的空闲块变化。
+中心问题：如何从源码事实回答 FreeRTOS 工程问题，而不是背诵 API 结论？
 
-### 阶段七：可靠性、低功耗与调试
+问题范围包括任务状态、调度和 Tick，两种架构的 context switch，Queue、信号量、mutex、notification 和 Event Group，ISR API 与优先级边界，内存所有权与碎片，以及实际系统中的优先级反转、超时、丢事件和资源回收。
 
-#### 11. 可靠性、低功耗与内核调试
+每个问题使用真实工程场景，引用准确源码位置，给出完整推导和错误答案分析。问题之间可以跨模块，但不重复前 11 篇正文。
 
-文件：`freertos-11-reliability-tickless-trace-debug.md`
+## 写作标准
 
-核心内容：
+### 不使用数量配额
 
-- scheduler suspend、critical section 和 interrupt mask 的边界；
-- `configASSERT`、stack overflow、malloc failed、Idle/Tick hooks；
-- stack high-water mark 与任务状态快照；
-- tickless idle 决策、预期空闲时间和 portable sleep hook；
-- trace macros、run-time stats 和内核感知调试；
-- 死锁、活锁、优先级反转和长临界区的取证顺序。
+不规定文章行数、二级标题数量、源码片段数量、表格数量、Mermaid 数量或图片数量。完成标准是中心问题已经被源码闭合，而不是达到某个数量门槛。
 
-实践结果：为调度、队列、内存和 Tick 建立一套不改变核心语义的观测点，并生成可关联的事件记录。
+### 沿源码推进
 
-### 阶段八：MPU、SMP 与综合源码实验
+正文按实际控制流组织。一个函数调用另一个函数时，先说明传入条件，再解释被调用函数改变的对象，最后回到调用者判断返回值如何影响后续执行。
 
-#### 12. MPU、SMP 与综合源码观测实验
+不能把同一段信息拆成“入口条件、执行动作、状态变化、观察证据”等固定字段，也不能把这些字段换成表格继续使用。
 
-文件：`freertos-12-mpu-smp-kernel-observability.md`
+### 源码摘录
 
-核心内容：
+只截取理解当前判断所需的连续代码。摘录必须保留决定行为的特殊分支，不能为了缩短代码而删掉会改变结论的路径。
 
-- MPU wrapper、特权/非特权任务、系统调用和内存区域；
-- 单核主线与 `configNUMBER_OF_CORES > 1` 条件分支；
-- task affinity、跨核调度、yield 和 scheduler lock；
-- SMP 不是简单复制单核调度器的原因；
-- 综合实验：为 task、queue、ISR、Tick 和 context switch 加入 trace；
-- 从 trace 重建一条跨公共内核与 port 的完整执行链。
+每组摘录注明 FreeRTOS-Kernel 版本、文件和函数、相关配置条件以及 V11.3.0 fixed-tag permalink。新增注释要明确是文章注释，不得伪装成上游源码。
 
-实践结果：形成一份可查询的源码地图、调用链、事件时间线和配置清单，能够解释单核、MPU 和 SMP 的职责边界。
+### 表格与图示
 
-### 面试专题：源码理解与工程应用
+表格只用于确实需要横向比较的数据，例如五种 heap 的能力差异或不同 port 的上下文组成。
 
-面试专题不重复前面文章的章节摘要。每个问题都从实际故障、设计取舍或调试现场出发，回答必须同时给出源码证据、运行机制、工程判断和追问扩展。
+Mermaid 只在调用链、状态迁移或对象关系仅靠文字难以保持清晰时使用。能够用两段文字讲清楚的内容不作图。不设置视觉点配额，不生成装饰性图片。
 
-#### 13. FreeRTOS 任务、调度与上下文切换面试专题
+### 平台边界
 
-文件：`freertos-13-interview-task-scheduler-context-switch.md`
+只有第 4、5 篇详细讨论平台机制。其他文章使用公共内核语义，不依赖 Cortex-M 或 RISC-V 异常名称、寄存器和中断屏蔽模型。
 
-核心场景：
+第 12 篇面试专题可以比较两种 port，但必须明确公共内核契约与架构实现的边界。
 
-- 高优先级任务已经 ready，为什么仍未立即运行；
-- `vTaskDelay` 与 `vTaskDelayUntil` 在周期任务中如何选择；
-- 同优先级任务在抢占、时间片和主动 yield 下如何切换；
-- Tick 计数溢出后延时任务为什么仍能正确唤醒；
-- 调度器挂起和中断关闭为何不是同一个概念；
-- Cortex-M4 的 SVC、PendSV、SysTick 如何协作完成首任务启动和上下文切换；
-- RISC-V trap 路径与 Cortex-M 异常路径有哪些本质差异；
-- 删除当前任务后，栈和 TCB 为什么不能当场释放。
+## 编写顺序与审核方式
 
-回答要求：每题至少给出状态或时序图、关键结构体字段、入口到内部函数的调用链、适用配置宏、易混淆回答和工程追问。
+1. 删除现有 15 篇文章并重写系列框架；
+2. 只编写第 1 篇样稿；
+3. 人工检查文章是否连续、准确、无模板痕迹；
+4. 用户确认样稿写法；
+5. 按顺序逐篇编写后续文章，每完成一篇单独复核。
 
-#### 14. FreeRTOS 通信、同步与内存管理面试专题
+不再一次性批量生成整套文章。
 
-文件：`freertos-14-interview-ipc-synchronization-memory.md`
+## 测试策略
 
-核心场景：
+自动测试只检查可以机械验证的事实：frontmatter、series 和 order，文件顺序，固定源码版本和 permalink，公共文章的平台边界，已知模板字段和空表，以及 Mermaid 和站点构建。
 
-- queue、task notification、stream buffer 和 message buffer 如何选；
-- 二值信号量、计数信号量和 mutex 为何共享 `Queue_t` 却语义不同；
-- 优先级反转何时发生，priority inheritance 能解决什么、不能解决什么；
-- ISR 中为什么不能使用普通阻塞 API，`pxHigherPriorityTaskWoken` 如何参与切换；
-- event group 等待多个 bit 时，clear-on-exit 如何影响并发任务；
-- queue 满或空时，任务如何进入事件链表并在超时/事件到达后退出；
-- heap_2 与 heap_4 的碎片行为为何不同；
-- 静态分配、heap_4、heap_5 在产品中的选择依据。
+测试不检查行数、标题数、源码片段数、图数量或固定章节名称。技术准确性和可读性必须通过源码复核与人工阅读判断。
 
-回答要求：每题从对象数据结构和阻塞/唤醒链路证明结论，并给出错误设计的后果、修复方案和资源取舍。
+## 暂不纳入主线
 
-#### 15. FreeRTOS 移植、可靠性与系统设计面试专题
+以下主题不塞入这 12 篇主线：MPU wrapper 的完整安全模型、SMP 调度和 affinity、Tickless idle、trace recorder 与运行时统计体系。
 
-文件：`freertos-15-interview-porting-reliability-system-design.md`
-
-核心场景：
-
-- 一个新架构 port 最少要实现哪些契约；
-- 中断优先级配置错误为何会表现为随机崩溃或链表损坏；
-- 如何从 HardFault、栈水位、`configASSERT` 和 trace 判断栈溢出；
-- tickless idle 如何计算可睡眠时间，哪些条件会提前退出；
-- 软件定时器 callback 阻塞会影响哪些任务；
-- 如何定位死锁、活锁、长临界区和调度延迟尖峰；
-- MPU 与 SMP 分别解决什么问题，引入了哪些内核复杂度；
-- 如何设计“ISR 采集数据 -> 任务处理 -> 超时恢复 -> 低功耗”的完整 RTOS 系统。
-
-回答要求：每题包含排查顺序、需要采集的证据、源码落点和设计权衡；综合设计题必须给出任务划分、优先级、通信对象、内存策略和失败恢复。
-
-## 5. 单篇写作标准
-
-每篇不设置行数目标，以机制完整、叙事连续和源码证据充分为验收标准。文章使用 6 到 9 个二级标题，避免把函数逐个拆成互不相连的小节，也禁止用固定字段模板重复同一信息。
-
-每篇必须包含：
-
-- 一个明确的核心问题；
-- 至少两条完整调用链；
-- 4 到 8 组关键源码片段；
-- 关键结构体、链表、状态和锁范围说明；
-- 配置宏与编译分支矩阵；
-- 至少一个可重复的观测或推演实验；
-- 常见误读、排错顺序、阶段验收和面试表达；
-- 文件、结构体、函数、宏和官方链接组成的源码索引。
-
-## 6. 源码截取与注释规范
-
-源码片段只截取解释当前机制所需的关键分支，不复制整个大型函数。每个片段必须注明：
-
-- 版本 `V11.3.0`；
-- 文件路径；
-- 函数或宏名称；
-- 生效的关键配置条件；
-- GitHub 固定 tag 的 permalink。
-
-注释必须区分原始源码和作者解读。可以在截取代码中添加带统一前缀的短注释，也可以在代码后按行组解释，但不能改写源码后仍声称是原文。涉及大量样板代码时使用等价伪代码和调用链说明。
-
-## 7. 图示与图片 prompt 规范
-
-不使用 ASCII 图。
-
-以下内容直接使用 Mermaid：
-
-- 函数调用链；
-- 任务状态机；
-- 链表和对象关系；
-- 队列阻塞与唤醒时序；
-- Tick、timer daemon 和上下文切换时序；
-- 内存块分裂与合并流程。
-
-以下内容可以保留隐藏的 `IMAGE_PROMPT` HTML 注释，供后续单独生成图片：
-
-- Cortex-M4 硬件异常栈帧；
-- RISC-V trap 上下文布局；
-- CPU 寄存器保存位置；
-- MPU region 和权限关系；
-- SMP 多核调度示意。
-
-每篇至少规划 5 个视觉点，其中至少 3 个为可直接渲染的 Mermaid。图片 prompt 必须写清主体、布局、标签、配色、比例和禁止项，且不作为网页可见正文发布。
-
-## 8. 网站接入设计
-
-文章目录：`docs/articles/freertos/`
-
-规划文件：`docs/articles/freertos/freertos-kernel-framework.md`
-
-系列 ID：`freertos`
-
-站点标题：`FreeRTOS 内核源码解读`
-
-短标题：`FreeRTOS`
-
-描述：`沿真实调用链拆解任务、调度、通信、同步、内存管理与 Cortex-M4/RISC-V 移植层。`
-
-站点顺序放在 `Embedded Systems` 之后、`RISC-V` 之前。封面路径使用 `/covers/freertos.webp`，尺寸和构图比例遵循现有系列封面规范；正式注册系列前必须准备可构建的 WebP 封面。
-
-内容集合需要把 `freertos` 加入 glob、schema、`SeriesId`、`SERIES`、`SERIES_ORDER` 和 `isSeriesId`。
-
-## 9. 测试与验收契约
-
-新增 `tests/freertos-articles.test.mjs`，至少验证：
-
-- 15 篇正文和 1 个 draft framework 文件数量准确；
-- 文件名、order、series、draft 状态连续且唯一；
-- 每篇满足长文、二级标题、Mermaid、源码索引、阶段验收和面试表达要求；
-- 所有文章明确引用 V11.3.0，关键源码文件与文章主题匹配；
-- Cortex-M4 port 文章包含 SVC、PendSV、SysTick、BASEPRI 和上下文栈；
-- RISC-V port 文章包含 trap、CSR、portASM 和上下文保存；
-- 公共内核文章不依赖具体 MCU、开发板、HAL 或 IDE；
-- MPU、SMP 只在进阶文章中系统展开，基础文章保持单核主线；
-- 3 篇面试专题均包含实际场景、源码证据、详细回答、错误答案辨析和追问扩展；
-- 禁止草稿口吻、逐篇预告、正文文章编号和虚构运行结果；
-- 站点注册、封面、路由和生产构建通过。
-
-发布前执行全仓测试、生产构建，并在桌面与 390px 移动端检查系列页、至少一篇公共内核文章、两个 port 文章和最终进阶文章。所有 Mermaid 必须生成非空 SVG，页面不能横向溢出。
-
-## 10. 非目标
-
-本系列不负责：
-
-- 从零教授 C 语言；
-- 介绍 STM32 HAL、CubeMX、具体开发板外设和引脚；
-- 罗列全部 FreeRTOS API；
-- 展开 FreeRTOS+TCP、MQTT、OTA 等外围库；
-- 深入 vendor fork，例如 ESP-IDF FreeRTOS；
-- 伪造硬件时序、性能数据或未执行的实验结果。
+这些内容可以在核心系列完成后单独规划进阶篇，避免主线在过多概念之间跳跃。
