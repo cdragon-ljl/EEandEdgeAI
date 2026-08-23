@@ -38,7 +38,6 @@ for (const [file, order] of articles) {
   test(`${file} meets the source-driven long-form contract`, () => {
     const markdown = readArticle(file);
     const body = markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
-    const lineCount = markdown.split(/\r?\n/).length;
     const h2Count = (markdown.match(/^## /gm) ?? []).length;
     const mermaidCount = (markdown.match(/^```mermaid$/gm) ?? []).length;
     const imagePromptCount = (markdown.match(/<!-- IMAGE_PROMPT:/g) ?? []).length;
@@ -51,7 +50,6 @@ for (const [file, order] of articles) {
     assert.match(markdown, /^series: freertos$/m);
     assert.match(markdown, new RegExp(`^order: ${order}$`, 'm'));
     assert.match(markdown, /^draft: false$/m);
-    assert.ok(lineCount >= 700, `${file} must contain at least 700 lines, got ${lineCount}`);
     assert.ok(h2Count >= 6 && h2Count <= 9, `${file} must use 6-9 H2 sections, got ${h2Count}`);
     assert.ok(mermaidCount >= 3, `${file} must contain at least three Mermaid diagrams`);
     assert.ok(mermaidCount + imagePromptCount >= 5, `${file} must contain at least five visual points`);
@@ -64,15 +62,36 @@ for (const [file, order] of articles) {
     assert.match(body, /阶段验收/);
     assert.match(body, /面试表达/);
     assert.doesNotMatch(body, /让我想想|记错了|Hmm|草稿内容|Part [ABC]|下一篇|下一章|预告|FREERTOS-\d{2}/i);
+    assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|离开这一步时必须成立|可观察证据|停止条件|角色|所有权|变化时机|观察方法|常见误读|进入时|本步读取|本步修改|并发边界|返回或转交)：/m);
+    assert.doesNotMatch(body, /^\| 阶段 \| 前提与读取 \| 状态变化 \| 并发边界 \| 结果与证据 \|$/m);
+    assert.doesNotMatch(body, /^## 1\. 问题边界、前置条件与验收证据$/m);
+
+    if (order <= 12) {
+      const experiment = body.match(/^### 实验步骤\r?\n([\s\S]*?)(?=^### 证据表$)/m)?.[1] ?? '';
+      assert.ok((experiment.match(/^\d+\. \*\*/gm) ?? []).length >= 5, `${file} must provide concrete experiment steps`);
+      assert.doesNotMatch(experiment, /^\| [^|]+ \|\s*\|\s*\|\s*\|$/m);
+    }
   });
 }
 
+test('article prose allows long technical identifiers to wrap on narrow screens', () => {
+  const globalCss = readFileSync('src/styles/global.css', 'utf8');
+
+  assert.doesNotMatch(globalCss, /\.prose\s*\{[^}]*overflow-wrap:\s*anywhere;/s);
+  assert.match(globalCss, /\.prose :where\(p, li, blockquote\)\s*\{[^}]*overflow-wrap:\s*anywhere;/s);
+});
+
+test('mobile article reading is not occluded by the floating back-to-top button', () => {
+  const siteLayout = readFileSync('src/layouts/SiteLayout.astro', 'utf8');
+
+  assert.match(siteLayout, /id="back-to-top" class="[^"]*\bhidden\b[^"]*\bsm:flex\b/);
+});
 test('common-kernel articles remain board and vendor neutral', () => {
-  const commonOrders = new Set([1, 2, 3, 6, 7, 8, 9, 10, 11, 12]);
+  const commonOrders = new Set([1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 14]);
 
   for (const [file] of articles.filter(([, order]) => commonOrders.has(order))) {
     const body = readArticle(file).replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
-    assert.doesNotMatch(body, /STM32F\d+|CubeMX|HAL_[A-Za-z0-9_]+/);
+    assert.doesNotMatch(body, /STM32F\d+|CubeMX|HAL_[A-Za-z0-9_]+|ARM_CM4F|Cortex-M|RISC-V|HardFault|BASEPRI|PendSV|SysTick|\bPSP\b|EXC_RETURN|\bmstatus\b|\bmcause\b|\bmepc\b/);
   }
 });
 
@@ -92,14 +111,36 @@ test('RISC-V port article covers trap and context implementation', () => {
   }
 });
 
+test('list insertion documents the portMAX_DELAY sentinel branch', () => {
+  const markdown = readArticle('freertos-02-list-tcb-task-creation.md');
+
+  assert.match(markdown, /xValueOfInsertion\s*==\s*portMAX_DELAY/);
+  assert.match(markdown, /xListEnd\.pxPrevious/);
+});
+
+test('memory guide distinguishes heap initialization and statistics contracts', () => {
+  const markdown = readArticle('freertos-10-memory-management-heap-one-to-five.md');
+
+  assert.match(markdown, /heap_4[^\n]*prvHeapInit/);
+  assert.match(markdown, /heap_5[^\n]*vPortDefineHeapRegions/);
+  assert.match(markdown, /heap_1\/heap_2[^\n]*xPortGetFreeHeapSize/);
+  assert.match(markdown, /heap_4\/heap_5[^\n]*vPortGetHeapStats/);
+  assert.doesNotMatch(markdown, /每步调用 heap stats/);
+});
 test('interview guides use scenario and source-evidence answers', () => {
   for (const [file] of articles.filter(([, order]) => order >= 13)) {
     const markdown = readArticle(file);
     assert.ok((markdown.match(/^### 问题 \d+/gm) ?? []).length >= 8, `${file} must contain at least eight questions`);
 
-    for (const marker of ['场景', '源码落点', '详细回答', '错误回答', '追问']) {
-      const count = (markdown.match(new RegExp(`\\*\\*${marker}\\*\\*`, 'g')) ?? []).length;
-      assert.ok(count >= 8, `${file} must provide ${marker} for every question`);
+    assert.doesNotMatch(markdown, /^回答检查：$/m);
+    const questions = markdown.split(/^### 问题 \d+[^\r\n]*$/m).slice(1);
+    assert.ok(questions.length >= 8, `${file} must contain at least eight complete questions`);
+    for (const [index, question] of questions.entries()) {
+      assert.match(question, /\*\*场景\*\*/, `${file} question ${index + 1} must include a scenario`);
+      assert.match(question, /> \*\*源码依据\*\*：/, `${file} question ${index + 1} must cite source evidence`);
+      assert.match(question, /\*\*详细回答\*\*/, `${file} question ${index + 1} must provide a detailed answer`);
+      assert.match(question, /> \*\*常见误区\*\*：/, `${file} question ${index + 1} must explain a misconception`);
+      assert.match(question, /\*\*追问：/, `${file} question ${index + 1} must include a follow-up`);
     }
   }
 });

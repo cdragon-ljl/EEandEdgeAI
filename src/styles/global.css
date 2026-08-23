@@ -261,6 +261,10 @@
   color: #3fb950;
 }
 
+.prose :where(p, li, blockquote) {
+  overflow-wrap: anywhere;
+}
+
 .prose table {
   display: block;
   width: max-content;

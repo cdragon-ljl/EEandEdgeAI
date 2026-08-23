@@ -16,13 +16,9 @@ draft: false
 
 本篇先比较对象初始化，再沿 take/give、阻塞、inherit、timeout disinherit 与 recursive 路径证明语义差异。
 
-## 1. 问题边界、前置条件与验收证据
+## 1. 优先级继承解决的具体反转
 
 讨论上游简化 priority inheritance 机制，不承诺解决死锁、嵌套锁顺序或任意形式的优先级反转。
-
-读者已经会使用基本任务 API，但不能把 API 行为替代为源码证明。
-
-阅读源码前先写清输入状态、允许的状态变化和输出证据。只看函数名或最终返回值，无法判断链表、锁和调度点是否正确。
 
 ```mermaid
 flowchart TD
@@ -41,119 +37,9 @@ flowchart TD
     S5 --> S6
 ```
 
-| 顺序 | 阅读动作 | 入口条件 | 状态变化 | 验收证据 |
-|---:|---|---|---|---|
-| 1 | 创建 semaphore | max/initial count 合法。 | token 模型成立。 | 字段快照。 |
-| 2 | 创建 mutex | 选择 mutex type。 | mutex 可 take。 | queue type/holder。 |
-| 3 | 成功 take | token 可用。 | 调用者拥有资源。 | holder/current 一致。 |
-| 4 | 阻塞并 inherit | token 不可用且允许等待。 | holder 可能提升。 | base/current 和 ready list。 |
-| 5 | timeout 重新计算 | 等待超时。 | 必要时降低 holder 但不低于约束。 | priority trace。 |
-| 6 | give 与 disinherit | holder 释放。 | 可能恢复 base。 | holder/priority/list。 |
-| 7 | 递归配对 | 同一 holder 再 take。 | ownership 连续。 | 递归深度。 |
-
-### 1. 创建 semaphore
-
-入口条件：max/initial count 合法。
-
-执行动作：初始化 queue length 和 messages。
-
-核心状态变化：token 模型成立。
-
-离开这一步时必须成立：无 holder 语义。
-
-可观察证据：字段快照。
-
-停止条件：initial>max 时停止。
-
-### 2. 创建 mutex
-
-入口条件：选择 mutex type。
-
-执行动作：创建长度一 queue 并初始化 holder/recursive/type。
-
-核心状态变化：mutex 可 take。
-
-离开这一步时必须成立：初始 token 正确。
-
-可观察证据：queue type/holder。
-
-停止条件：普通 queue type 时停止。
-
-### 3. 成功 take
-
-入口条件：token 可用。
-
-执行动作：messages--，mutex 记录 holder 并 mutexesHeld++。
-
-核心状态变化：调用者拥有资源。
-
-离开这一步时必须成立：critical section。
-
-可观察证据：holder/current 一致。
-
-停止条件：ISR 上下文时停止。
-
-### 4. 阻塞并 inherit
-
-入口条件：token 不可用且允许等待。
-
-执行动作：查 holder，调用 xTaskPriorityInherit，等待者进入 event list。
-
-核心状态变化：holder 可能提升。
-
-离开这一步时必须成立：scheduler/critical 边界。
-
-可观察证据：base/current 和 ready list。
-
-停止条件：holder 为空时不继承。
-
-### 5. timeout 重新计算
-
-入口条件：等待超时。
-
-执行动作：查看仍在等待的最高优先级。
-
-核心状态变化：必要时降低 holder 但不低于约束。
-
-离开这一步时必须成立：timeout path。
-
-可观察证据：priority trace。
-
-停止条件：直接恢复 base 时停止。
-
-### 6. give 与 disinherit
-
-入口条件：holder 释放。
-
-执行动作：清 holder、mutexesHeld--、token++，唤醒等待者。
-
-核心状态变化：可能恢复 base。
-
-离开这一步时必须成立：只有 owner 可 give。
-
-可观察证据：holder/priority/list。
-
-停止条件：非 owner give 时停止。
-
-### 7. 递归配对
-
-入口条件：同一 holder 再 take。
-
-执行动作：recursive count++，最终 give 到零才真正释放。
-
-核心状态变化：ownership 连续。
-
-离开这一步时必须成立：无需重新 inherit。
-
-可观察证据：递归深度。
-
-停止条件：普通 give 混用时停止。
-
-## 2. 核心数据结构、所有权与不变量
+## 2. Token、Holder 与任务优先级之间的关系
 
 semaphore 使用 uxMessagesWaiting 表示 token；mutex 还把 queue type、holder 与 recursive count 连接到 TCB 的 base/current priority 和 mutexesHeld。
-
-这里不把字段当作词汇表，而是解释字段由谁修改、在哪个临界区修改、它和哪个链表或对象保持一致。
 
 ```mermaid
 flowchart LR
@@ -177,109 +63,9 @@ flowchart LR
 | uxMutexesHeld | 任务当前持有 mutex 数。 | give 后递减且不能下溢。 | 记录计数。 | 持有任意一个 mutex 后都立即恢复。 |
 | Priority Inheritance | holder 临时提升到最高等待者优先级。 | current >= base，恢复受持锁数和等待者约束。 | trace inherit/disinherit。 | 等同 priority ceiling。 |
 
-### Binary Semaphore
-
-角色：token 最大一，不记录 owner。
-
-所有权：Queue_t。
-
-不变量：messages 为 0 或 1。
-
-变化时机：give/take。
-
-观察方法：读取 token。
-
-常见误读：认为 give 必须由 take 者执行。
-
-### Counting Semaphore
-
-角色：token 上限为 uxLength。
-
-所有权：Queue_t。
-
-不变量：messages 不超过 max count。
-
-变化时机：give/take。
-
-观察方法：记录计数。
-
-常见误读：把它当携带数据的 queue。
-
-### Mutex Holder
-
-角色：记录当前持有任务句柄。
-
-所有权：Queue_t union。
-
-不变量：非空 holder 必须对应已 take mutex 的任务。
-
-变化时机：take/give。
-
-观察方法：读取 holder。
-
-常见误读：ISR 可以持有 mutex。
-
-### uxRecursiveCallCount
-
-角色：同一 holder 的递归深度。
-
-所有权：Mutex Queue_t。
-
-不变量：只有 holder 修改且 give 次数配对。
-
-变化时机：recursive take/give。
-
-观察方法：记录深度。
-
-常见误读：普通 mutex 自动支持递归。
-
-### uxBasePriority
-
-角色：任务原始分配优先级。
-
-所有权：TCB。
-
-不变量：inherit 期间保持原值。
-
-变化时机：优先级设置/inherit。
-
-观察方法：对比 current/base。
-
-常见误读：inherit 直接覆盖原始优先级。
-
-### uxMutexesHeld
-
-角色：任务当前持有 mutex 数。
-
-所有权：TCB。
-
-不变量：give 后递减且不能下溢。
-
-变化时机：take/give。
-
-观察方法：记录计数。
-
-常见误读：持有任意一个 mutex 后都立即恢复。
-
-### Priority Inheritance
-
-角色：holder 临时提升到最高等待者优先级。
-
-所有权：tasks.c/queue.c。
-
-不变量：current >= base，恢复受持锁数和等待者约束。
-
-变化时机：高优先级任务阻塞时。
-
-观察方法：trace inherit/disinherit。
-
-常见误读：等同 priority ceiling。
-
 ## 3. 调用链一：mutex take 触发 priority inheritance
 
 高优先级任务在 holder 持有 mutex 时阻塞，queue.c 找到 holder，tasks.c 再修改 TCB 优先级和 ready list 位置。
-
-调用链中的每一跳都要区分普通函数调用、宏展开、临界区边界和可能触发调度的 port hook。
 
 ```mermaid
 sequenceDiagram
@@ -296,89 +82,11 @@ sequenceDiagram
 
 ### 调用链一：xQueueSemaphoreTake -> xTaskPriorityInherit -> vTaskPlaceOnEventList -> holder runs
 
-#### 链路步骤 1：检测空 token
+xQueueSemaphoreTake 发现 mutex token 不可用时，先从 xMutexHolder 找到持有者。只有对象类型确实是 mutex、holder 存在且等待任务优先级更高，xTaskPriorityInherit 才需要修改 holder 的当前优先级；binary semaphore 没有 holder 语义，因此不会进入这条路径。
 
-进入时：take 进入。
+如果 holder 仍在 ready list，内核把它的 xStateListItem 从原优先级桶移出并插入新的高优先级桶，同时保留 uxBasePriority 作为最终恢复依据。等待者随后进入 mutex 的接收事件链表和 delayed list，调度器便有机会优先运行 holder，让它尽快离开资源临界段。
 
-本步读取：messages/type/holder。
-
-本步修改：无。
-
-并发边界：critical section。
-
-返回或转交：确认需等待。
-
-证据：queue trace。
-
-#### 链路步骤 2：找到 holder
-
-进入时：对象为 mutex。
-
-本步读取：xMutexHolder。
-
-本步修改：无。
-
-并发边界：holder 只在 owner 路径改变。
-
-返回或转交：任务句柄有效。
-
-证据：holder field。
-
-#### 链路步骤 3：比较优先级
-
-进入时：holder 存在。
-
-本步读取：holder base/current 与 waiter。
-
-本步修改：可能提升 current。
-
-并发边界：tasks critical。
-
-返回或转交：inherit 条件明确。
-
-证据：priority snapshot。
-
-#### 链路步骤 4：移动 ready 节点
-
-进入时：holder 位于 ready。
-
-本步读取：旧/新优先级桶。
-
-本步修改：state item container。
-
-并发边界：scheduler list lock。
-
-返回或转交：holder 可按新优先级运行。
-
-证据：list owner。
-
-#### 链路步骤 5：阻塞等待者
-
-进入时：inherit 已处理。
-
-本步读取：mutex event list 和 timeout。
-
-本步修改：等待任务双链表。
-
-并发边界：scheduler suspended。
-
-返回或转交：current 切走。
-
-证据：event container。
-
-#### 链路步骤 6：holder 得到执行
-
-进入时：调度器选择。
-
-本步读取：最高 ready priority。
-
-本步修改：资源临界段推进。
-
-并发边界：正常任务上下文。
-
-返回或转交：减少反转时间。
-
-证据：switch trace。
+优先级继承不会转移 mutex 所有权，也不会让等待者越过 take 操作。验证时应沿时间线记录 holder、base/current priority、ready list 归属、等待链表头和切换顺序，才能区分真正的继承与普通高优先级任务抢占。
 
 ### 源码片段：mutex 在 Queue_t 上增加特殊字段
 
@@ -394,19 +102,12 @@ traceCREATE_MUTEX( pxNewQueue );
 ( void ) xQueueGenericSend( pxNewQueue, NULL, 0U, queueSEND_TO_BACK );
 ```
 
-这段摘录只保留当前机制需要的语句；省略的参数检查、trace hook 或条件分支必须回到固定链接核对。
+- holder 初始为空。
+- queue type 区分 mutex 特例。
+- recursive count 只由 owner 修改。
+- 发送一个空 item 建立初始可用 token。
 
-解读 1：holder 初始为空。
-
-解读 2：queue type 区分 mutex 特例。
-
-解读 3：recursive count 只由 owner 修改。
-
-解读 4：发送一个空 item 建立初始可用 token。
-
-不变量：可用 mutex 的 token、holder 与 recursive count 组合必须一致。
-
-观察点：创建后记录 messages、type、holder、recursive count。
+> **关键约束**：可用 mutex 的 token、holder 与 recursive count 组合必须一致。 **验证重点**：创建后记录 messages、type、holder、recursive count。
 
 ### 源码片段：take mutex 时记录 holder 与持锁数
 
@@ -426,25 +127,16 @@ pxQueue->uxMessagesWaiting = uxSemaphoreCount - 1U;
 #endif
 ```
 
-这段摘录只保留当前机制需要的语句；省略的参数检查、trace hook 或条件分支必须回到固定链接核对。
+- semaphore count 与 queue messages 共用。
+- 只有 mutex type 记录 owner。
+- pvTaskIncrementMutexHeldCount 同时更新 TCB 计数。
+- 普通 semaphore 不产生所有权。
 
-解读 1：semaphore count 与 queue messages 共用。
-
-解读 2：只有 mutex type 记录 owner。
-
-解读 3：pvTaskIncrementMutexHeldCount 同时更新 TCB 计数。
-
-解读 4：普通 semaphore 不产生所有权。
-
-不变量：mutex token 被取走时 holder 非空且 holder mutexesHeld 已增加。
-
-观察点：同步记录 queue 与 holder TCB。
+> **关键约束**：mutex token 被取走时 holder 非空且 holder mutexesHeld 已增加。 **验证重点**：同步记录 queue 与 holder TCB。
 
 ## 4. 调用链二：give、timeout 与 priority disinherit
 
 恢复优先级不是简单写回 base；需要考虑任务仍持有多少 mutex，以及 timeout 后仍等待该 mutex 的最高优先级。
-
-第二条链用于验证同一对象在另一条执行路径上的行为，重点检查它是否复用相同不变量，还是进入 ISR、daemon 或 portable 层的特殊规则。
 
 ```mermaid
 sequenceDiagram
@@ -461,89 +153,11 @@ sequenceDiagram
 
 ### 调用链二：give/timeout -> uxMutexesHeld update -> xTaskPriorityDisinherit / vTaskPriorityDisinheritAfterTimeout -> ready relocation
 
-#### 链路步骤 1：验证 owner
+give 路径首先确认当前任务确实是 holder，然后在真正释放时递减 uxMutexesHeld。内核不能看到一次 give 就无条件恢复 base priority，因为任务可能还持有其他 mutex，而那些 mutex 上仍有更高优先级等待者。
 
-进入时：give 路径进入。
+xTaskPriorityDisinherit 根据剩余持锁计数决定是否恢复基础优先级；timeout 路径则由 vTaskPriorityDisinheritAfterTimeout 查看仍在等待链表中的最高优先级，必要时只下降到该优先级，而不是直接回到 base。优先级变化发生时，ready 状态节点还要同步迁移到新的优先级桶。
 
-本步读取：current 与 holder。
-
-本步修改：无。
-
-并发边界：任务上下文。
-
-返回或转交：仅 owner 继续。
-
-证据：assert/return。
-
-#### 链路步骤 2：递减持锁计数
-
-进入时：真正释放 mutex。
-
-本步读取：uxMutexesHeld。
-
-本步修改：计数--。
-
-并发边界：TCB critical。
-
-返回或转交：不下溢。
-
-证据：TCB snapshot。
-
-#### 链路步骤 3：选择恢复优先级
-
-进入时：current!=base。
-
-本步读取：base、held、waiting highest。
-
-本步修改：目标 priority。
-
-并发边界：tasks helper。
-
-返回或转交：不破坏其他 mutex 约束。
-
-证据：计算记录。
-
-#### 链路步骤 4：移动 ready item
-
-进入时：holder ready。
-
-本步读取：旧优先级桶。
-
-本步修改：进入目标桶。
-
-并发边界：scheduler lock。
-
-返回或转交：top ready 更新。
-
-证据：list trace。
-
-#### 链路步骤 5：释放 token
-
-进入时：holder 清空。
-
-本步读取：messages/holder。
-
-本步修改：等待者可 take。
-
-并发边界：queue critical。
-
-返回或转交：event wake。
-
-证据：queue trace。
-
-#### 链路步骤 6：超时特殊路径
-
-进入时：waiter timeout。
-
-本步读取：剩余 wait list head。
-
-本步修改：holder 可部分降低。
-
-并发边界：timeout helper。
-
-返回或转交：priority 仍满足剩余等待者。
-
-证据：timeout trace。
+最后 queue 核心清除 holder、恢复 token 并唤醒等待者。验证释放链要把 uxMutexesHeld、holder 字段、base/current priority、等待链表头和 ready list 搬迁放在同一时间线上，避免把一次正常的部分降级误判为“优先级没有恢复”。
 
 ### 源码片段：inherit 提升 holder 当前优先级
 
@@ -564,19 +178,12 @@ if( pxMutexHolderTCB->uxPriority < pxCurrentTCB->uxPriority )
 }
 ```
 
-这段摘录只保留当前机制需要的语句；省略的参数检查、trace hook 或条件分支必须回到固定链接核对。
+- 等待者是当前高优先级任务。
+- holder 在 ready 时需要移动优先级桶。
+- base priority 保持不变。
+- holder blocked 时 event item value 也可能需要调整。
 
-解读 1：等待者是当前高优先级任务。
-
-解读 2：holder 在 ready 时需要移动优先级桶。
-
-解读 3：base priority 保持不变。
-
-解读 4：holder blocked 时 event item value 也可能需要调整。
-
-不变量：继承后 current priority 不低于触发继承的等待者。
-
-观察点：记录 base/current 与 ready container。
+> **关键约束**：继承后 current priority 不低于触发继承的等待者。 **验证重点**：记录 base/current 与 ready container。
 
 ### 源码片段：disinherit 受持有 mutex 数限制
 
@@ -597,25 +204,14 @@ if( pxTCB->uxPriority != pxTCB->uxBasePriority )
 }
 ```
 
-这段摘录只保留当前机制需要的语句；省略的参数检查、trace hook 或条件分支必须回到固定链接核对。
+- 释放前必须确实持有 mutex。
+- 计数先递减。
+- 仍持有其他 mutex 时不直接恢复。
+- 恢复时还要维护 ready/event list。
 
-解读 1：释放前必须确实持有 mutex。
+> **关键约束**：current priority 不低于 base，且恢复不能违反仍持有 mutex 的约束。 **验证重点**：记录 held count、base/current 与 ready list。
 
-解读 2：计数先递减。
-
-解读 3：仍持有其他 mutex 时不直接恢复。
-
-解读 4：恢复时还要维护 ready/event list。
-
-不变量：current priority 不低于 base，且恢复不能违反仍持有 mutex 的约束。
-
-观察点：记录 held count、base/current 与 ready list。
-
-## 5. 配置矩阵、观测实验与证据记录
-
-使用可控输入和 trace hook 观察对象变化，不依赖特定开发板。
-
-实验只承诺观察软件状态和调用顺序。没有实际目标硬件或 trace 数据时，不写虚构时间和性能数字。
+## 5. 构造三任务反转，观察继承与降级
 
 ```mermaid
 flowchart TD
@@ -645,53 +241,12 @@ flowchart TD
 
 ### 实验步骤
 
-1. **创建三种对象**
-
-   操作：binary/counting/mutex。
-
-   记录：Queue_t 关键字段。
-
-   通过标准：type/token/holder 正确。
-
-2. **执行普通 take/give**
-
-   操作：记录 token。
-
-   记录：messages 与 wait list。
-
-   通过标准：无 owner 语义。
-
-3. **制造优先级反转**
-
-   操作：低持锁、中计算、高等待。
-
-   记录：base/current 与切换。
-
-   通过标准：holder 被提升。
-
-4. **释放 mutex**
-
-   操作：记录 disinherit。
-
-   记录：held count 与 ready move。
-
-   通过标准：恢复 base。
-
-5. **让高任务 timeout**
-
-   操作：mutex 仍被持有。
-
-   记录：remaining highest 与 holder。
-
-   通过标准：部分恢复正确。
-
-6. **递归 take/give**
-
-   操作：同一 owner 重入。
-
-   记录：recursive count。
-
-   通过标准：到零才释放。
+1. **创建三种对象。** binary/counting/mutex，并保存 Queue_t 关键字段；只有 type/token/holder 正确，这一步才算完成。
+2. **执行普通 take/give。** 记录 token。重点核对 messages 与 wait list，结果应满足“无 owner 语义”。
+3. **制造优先级反转。** 低持锁、中计算、高等待，把 base/current 与切换保存为证据；判断依据是 holder 被提升。
+4. **释放 mutex。** 记录 disinherit；观察 held count 与 ready move。若恢复 base，即可进入下一步。
+5. **让高任务 timeout。** mutex 仍被持有，随后比较 remaining highest 与 holder；预期是部分恢复正确。
+6. **递归 take/give。** 同一 owner 重入。最后用 recursive count 确认到零才释放。
 
 ### 证据表
 
@@ -704,69 +259,7 @@ flowchart TD
 | ready 迁移 | 两个优先级 list | holder owner 移到新桶 | 只改字段会让 scheduler 看错 |
 | timeout 约束 | 剩余 wait head | holder 不低于剩余最高等待者 | 直接 base 会再次反转 |
 
-#### 证据：对象类型
-
-获取方法：读取 uxQueueType
-
-应当看到：mutex 与 semaphore 分支明确
-
-如果不满足：type 错会走错误 copy 路径
-
-为什么这项证据有效：type 是语义选择入口。
-
-#### 证据：所有权
-
-获取方法：holder 与 current
-
-应当看到：take 后相同、give 后清空
-
-如果不满足：非 owner give 破坏互斥
-
-为什么这项证据有效：mutex 与 semaphore 关键区别。
-
-#### 证据：持锁计数
-
-获取方法：TCB uxMutexesHeld
-
-应当看到：take/give 配对
-
-如果不满足：下溢或残留阻止恢复
-
-为什么这项证据有效：简化继承依赖计数。
-
-#### 证据：优先级对
-
-获取方法：base/current
-
-应当看到：inherit 时 current 提升、base 不变
-
-如果不满足：覆盖 base 无法恢复
-
-为什么这项证据有效：两个字段保存临时与长期策略。
-
-#### 证据：ready 迁移
-
-获取方法：两个优先级 list
-
-应当看到：holder owner 移到新桶
-
-如果不满足：只改字段会让 scheduler 看错
-
-为什么这项证据有效：priority 与 list 归属必须同步。
-
-#### 证据：timeout 约束
-
-获取方法：剩余 wait head
-
-应当看到：holder 不低于剩余最高等待者
-
-如果不满足：直接 base 会再次反转
-
-为什么这项证据有效：timeout helper 需要重算。
-
-## 6. 常见误读、故障定位与修复原则
-
-排错从最早被破坏的不变量开始，不从最终崩溃位置随机回退。
+## 6. 从 holder、等待者和优先级桶定位互斥故障
 
 先验证对象成员和链表归属，再检查锁、配置分支和调度请求。
 
@@ -787,93 +280,17 @@ flowchart TD
     E5 --> I5["检查调用上下文"]
 ```
 
-### 1. mutex 永久不可用
-
-根因：非 owner give 或递归次数未归零
-
-第一检查点：检查 holder/count
-
-需要保存的证据：take/give trace
-
-修复原则：修复所有权和配对
-
-不能采用的绕过方式：不要重新创建 mutex 绕过。
-
-### 2. 高任务仍被中任务阻塞
-
-根因：inherit 未触发或 holder 不可识别
-
-第一检查点：检查 queue type/holder
-
-需要保存的证据：base/current/wait list
-
-修复原则：使用 mutex 并确保 holder 正确
-
-不能采用的绕过方式：不要用 binary semaphore 期待继承。
-
-### 3. holder 优先级不恢复
-
-根因：uxMutexesHeld 残留或锁未释放
-
-第一检查点：检查 TCB 计数
-
-需要保存的证据：所有 mutex owner
-
-修复原则：配对 give 并统一锁顺序
-
-不能采用的绕过方式：不要手工 vTaskPrioritySet。
-
-### 4. 过早恢复导致再次反转
-
-根因：timeout 路径忽略剩余等待者
-
-第一检查点：检查 wait head
-
-需要保存的证据：timeout 前后 priority
-
-修复原则：使用 disinheritAfterTimeout 语义
-
-不能采用的绕过方式：不要直接写 base。
-
-### 5. 递归 mutex 死锁
-
-根因：使用普通 take 或 give 次数不足
-
-第一检查点：检查 queue type/depth
-
-需要保存的证据：recursive trace
-
-修复原则：统一 recursive API
-
-不能采用的绕过方式：不要混用普通 give。
-
-### 6. ISR 操作 mutex
-
-根因：mutex 需要任务 owner 与继承
-
-第一检查点：检查调用上下文
-
-需要保存的证据：ISR stack/call trace
-
-修复原则：ISR 使用 semaphore/notification 延迟处理
-
-不能采用的绕过方式：不要伪造 holder。
-
-### 7. 多 mutex 锁顺序死锁
-
-根因：inherit 不解决循环等待
-
-第一检查点：画 wait-for graph
-
-需要保存的证据：holder/wait chain
-
-修复原则：固定全局锁顺序和 timeout
-
-不能采用的绕过方式：不要提高优先级当修复。
+| 现象 | 根因 | 第一检查点 | 应保存的证据 | 修复原则 |
+|---|---|---|---|---|
+| mutex 永久不可用 | 非 owner give 或递归次数未归零 | 检查 holder/count | take/give trace | 修复所有权和配对 |
+| 高任务仍被中任务阻塞 | inherit 未触发或 holder 不可识别 | 检查 queue type/holder | base/current/wait list | 使用 mutex 并确保 holder 正确 |
+| holder 优先级不恢复 | uxMutexesHeld 残留或锁未释放 | 检查 TCB 计数 | 所有 mutex owner | 配对 give 并统一锁顺序 |
+| 过早恢复导致再次反转 | timeout 路径忽略剩余等待者 | 检查 wait head | timeout 前后 priority | 使用 disinheritAfterTimeout 语义 |
+| 递归 mutex 死锁 | 使用普通 take 或 give 次数不足 | 检查 queue type/depth | recursive trace | 统一 recursive API |
+| ISR 操作 mutex | mutex 需要任务 owner 与继承 | 检查调用上下文 | ISR stack/call trace | ISR 使用 semaphore/notification 延迟处理 |
+| 多 mutex 锁顺序死锁 | inherit 不解决循环等待 | 画 wait-for graph | holder/wait chain | 固定全局锁顺序和 timeout |
 
 ## 7. 源码索引、阶段验收与面试表达
-
-完成本篇后，读者应能不依赖文章复述对象模型、两条调用链、配置差异和取证顺序。
 
 ### 源码索引
 
@@ -895,19 +312,6 @@ flowchart TD
 6. 能解释 base/current priority。
 7. 能解释 timeout 后部分恢复。
 8. 能说明 inheritance 不解决死锁。
-
-### 验收记录模板
-
-| 项目 | 实际证据 | 结论 |
-|---|---|---|
-| 能证明 semaphore 复用 Queue_t。 |  |  |
-| 能解释 mutex 特殊字段。 |  |  |
-| 能区分 token 与 owner。 |  |  |
-| 能跟踪 take 到 holder TCB。 |  |  |
-| 能重建 priority inheritance。 |  |  |
-| 能解释 base/current priority。 |  |  |
-| 能解释 timeout 后部分恢复。 |  |  |
-| 能说明 inheritance 不解决死锁。 |  |  |
 
 ### 面试表达
 

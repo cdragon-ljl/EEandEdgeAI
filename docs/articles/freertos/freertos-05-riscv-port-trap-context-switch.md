@@ -16,13 +16,11 @@ RISC-V 没有 Cortex-M 那套固定异常自动压栈，FreeRTOS port 必须显�
 
 本篇把公共 portASM.S、portContext.h 和 chip-specific extensions 分开，沿 initial stack、first task、timer interrupt、ecall yield 与通用 trap 五条路径建立契约。
 
-## 1. 问题边界、前置条件与验收证据
+## 1. RISC-V 端口要解决什么
 
 只解释上游 Machine mode GCC port。mtime/mtimecmp、CLINT 与额外寄存器属于平台能力，不能写成所有 RISC-V 的固定事实。
 
 读者理解通用寄存器和 M-mode CSR，需要进一步理解 port 为什么同时支持 RV32I/RV64I、RV32E、FPU/VPU 与芯片扩展。
-
-阅读源码前先写清输入状态、允许的状态变化和输出证据。只看函数名或最终返回值，无法判断链表、锁和调度点是否正确。
 
 ```mermaid
 flowchart TD
@@ -41,119 +39,9 @@ flowchart TD
     S5 --> S6
 ```
 
-| 顺序 | 阅读动作 | 入口条件 | 状态变化 | 验收证据 |
-|---:|---|---|---|---|
-| 1 | 确认 ISA 与 port 变体 | 构建目标已知。 | context size 唯一。 | 编译宏清单。 |
-| 2 | 定义初始上下文 | TCB/stack 与任务入口有效。 | 可由 restore 宏启动。 | 逐槽布局。 |
-| 3 | 配置 Tick 来源 | scheduler 尚未启动。 | timer compare 能产生周期 trap。 | timer 地址和频率证据。 |
-| 4 | 启动首任务 | current TCB 已选。 | 任务在预期特权运行。 | 首 PC/SP/CSR。 |
-| 5 | 保存 trap 上下文 | trap 到达。 | 任务 frame 完整。 | sp、mepc、mstatus。 |
-| 6 | 按 mcause 分派 | context 已保存。 | 决定是否改变 current。 | cause 和调用 trace。 |
-| 7 | 恢复任务上下文 | handler 完成。 | CSR/通用寄存器和 sp 恢复。 | 切换后 PC/CSR。 |
-
-### 1. 确认 ISA 与 port 变体
-
-入口条件：构建目标已知。
-
-执行动作：记录 XLEN、RV32E、FPU/VPU 和扩展头。
-
-核心状态变化：context size 唯一。
-
-离开这一步时必须成立：汇编器 include 正确。
-
-可观察证据：编译宏清单。
-
-停止条件：ISA 条件不明时停止。
-
-### 2. 定义初始上下文
-
-入口条件：TCB/stack 与任务入口有效。
-
-执行动作：pxPortInitialiseStack 写 critical nesting、参数、mstatus、PC。
-
-核心状态变化：可由 restore 宏启动。
-
-离开这一步时必须成立：栈对齐。
-
-可观察证据：逐槽布局。
-
-停止条件：mstatus/PC 不明时停止。
-
-### 3. 配置 Tick 来源
-
-入口条件：scheduler 尚未启动。
-
-执行动作：调用 vPortSetupTimerInterrupt 或平台实现。
-
-核心状态变化：timer compare 能产生周期 trap。
-
-离开这一步时必须成立：不假设 CLINT。
-
-可观察证据：timer 地址和频率证据。
-
-停止条件：平台无 mtime 却使用默认时停止。
-
-### 4. 启动首任务
-
-入口条件：current TCB 已选。
-
-执行动作：xPortStartFirstTask 恢复寄存器/mstatus 并跳转。
-
-核心状态变化：任务在预期特权运行。
-
-离开这一步时必须成立：中断状态正确。
-
-可观察证据：首 PC/SP/CSR。
-
-停止条件：ISR stack 未对齐时停止。
-
-### 5. 保存 trap 上下文
-
-入口条件：trap 到达。
-
-执行动作：portcontextSAVE_CONTEXT_INTERNAL 保存任务并切 ISR stack。
-
-核心状态变化：任务 frame 完整。
-
-离开这一步时必须成立：异步/同步尚未分派。
-
-可观察证据：sp、mepc、mstatus。
-
-停止条件：保存未完成时禁止调 C。
-
-### 6. 按 mcause 分派
-
-入口条件：context 已保存。
-
-执行动作：timer 调 Tick、ecall 调 switch、其他交应用 handler。
-
-核心状态变化：决定是否改变 current。
-
-离开这一步时必须成立：返回 PC 规则正确。
-
-可观察证据：cause 和调用 trace。
-
-停止条件：未知异常被误当 yield 时停止。
-
-### 7. 恢复任务上下文
-
-入口条件：handler 完成。
-
-执行动作：portcontextRESTORE_CONTEXT 读取 current TCB。
-
-核心状态变化：CSR/通用寄存器和 sp 恢复。
-
-离开这一步时必须成立：mret/ret 路径符合 port。
-
-可观察证据：切换后 PC/CSR。
-
-停止条件：额外寄存器不对称时停止。
-
-## 2. 核心数据结构、所有权与不变量
+## 2. Context frame、CSR 与 trap 分派的共同约束
 
 RISC-V port 以 portCONTEXT_SIZE 统一栈布局，保存 mepc、mstatus、通用寄存器、critical nesting 和可选扩展状态；trap handler 再按 mcause 分流。
-
-这里不把字段当作词汇表，而是解释字段由谁修改、在哪个临界区修改、它和哪个链表或对象保持一致。
 
 ```mermaid
 flowchart LR
@@ -178,123 +66,9 @@ flowchart LR
 | chip-specific extensions | 保存 ISA 实现额外寄存器。 | additional save/restore 对称且 assembler include 正确。 | 检查 include path 和 size。 | 选错扩展头仍期望稳定运行。 |
 | ecall yield | 同步异常触发调度。 | mepc 前移避免重复执行 ecall。 | 记录 cause、mepc、current。 | 把 ecall 当普通函数调用。 |
 
-### portContext.h
-
-角色：定义上下文大小与保存恢复宏。
-
-所有权：通用 RISC-V port。
-
-不变量：save 与 restore 使用同一偏移。
-
-变化时机：trap 与首任务恢复。
-
-观察方法：检查宏展开。
-
-常见误读：只阅读 portASM.S 不看布局宏。
-
-### mepc
-
-角色：保存异常返回 PC。
-
-所有权：CPU CSR/port frame。
-
-不变量：同步 ecall 返回地址需要前移。
-
-变化时机：trap 进入与 restore。
-
-观察方法：记录异常前后值。
-
-常见误读：所有 trap 都原样保存 mepc。
-
-### mstatus
-
-角色：保存 MIE/MPIE/MPP 与扩展状态。
-
-所有权：CPU 与 port。
-
-不变量：恢复值决定返回特权和中断状态。
-
-变化时机：初始栈与 trap。
-
-观察方法：查看 FS/VS/MPIE。
-
-常见误读：只把它当中断开关。
-
-### mcause
-
-角色：区分中断位和 cause 编号。
-
-所有权：CPU CSR。
-
-不变量：handler 必须先分同步/异步再分具体 source。
-
-变化时机：trap 分派。
-
-观察方法：记录高位和 code。
-
-常见误读：把 cause 数字脱离 XLEN 解读。
-
-### xISRStackTop
-
-角色：trap 处理切换到独立 ISR stack。
-
-所有权：port/链接环境。
-
-不变量：对齐且不覆盖任务 context frame。
-
-变化时机：保存任务后。
-
-观察方法：记录 sp 切换。
-
-常见误读：在任务栈上运行所有 ISR C 代码。
-
-### mtime 接口
-
-角色：一种可选 Machine timer Tick 来源。
-
-所有权：平台/CLINT。
-
-不变量：地址与频率由配置或应用提供。
-
-变化时机：scheduler start 与 timer ISR。
-
-观察方法：检查 configMTIME 地址。
-
-常见误读：认为 RISC-V 必然有 CLINT。
-
-### chip-specific extensions
-
-角色：保存 ISA 实现额外寄存器。
-
-所有权：目标芯片扩展头。
-
-不变量：additional save/restore 对称且 assembler include 正确。
-
-变化时机：context macro。
-
-观察方法：检查 include path 和 size。
-
-常见误读：选错扩展头仍期望稳定运行。
-
-### ecall yield
-
-角色：同步异常触发调度。
-
-所有权：portYIELD 与 trap handler。
-
-不变量：mepc 前移避免重复执行 ecall。
-
-变化时机：任务主动 yield。
-
-观察方法：记录 cause、mepc、current。
-
-常见误读：把 ecall 当普通函数调用。
-
 ## 3. 调用链一：初始栈到首任务启动
 
 RISC-V 初始栈由汇编函数构造，保存任务参数、mstatus、入口 PC、critical nesting 和可选扩展槽位。
-
-调用链中的每一跳都要区分普通函数调用、宏展开、临界区边界和可能触发调度的 port hook。
 
 ```mermaid
 sequenceDiagram
@@ -312,89 +86,11 @@ sequenceDiagram
 
 ### 调用链一：prvInitialiseNewTask -> pxPortInitialiseStack -> xPortStartScheduler -> xPortStartFirstTask
 
-#### 链路步骤 1：预留 critical nesting
+RISC-V port 的 pxPortInitialiseStack 先按 portBYTE_ALIGNMENT 对齐栈顶，并为每任务 critical nesting、通用寄存器和必要的 chip-specific 扩展预留固定槽位。任务参数写入 a0 对应槽，任务入口写入返回 PC 槽；mstatus 则根据 Machine mode、初始中断状态以及 FPU/向量扩展配置构造。
 
-进入时：栈顶对齐。
+xPortStartScheduler 在进入汇编恢复前准备 ISR stack 和 Tick 来源。xPortStartFirstTask 从 pxCurrentTCB 读取保存的 sp，按 portContext.h 定义的偏移恢复 CSR 与通用寄存器，再跳转到任务入口。context size、保存宏和恢复宏必须使用同一组条件编译，否则任一可选扩展都会让后续槽位整体错位。
 
-本步读取：每任务 nesting 初值。
-
-本步修改：stack slot。
-
-并发边界：任务尚未运行。
-
-返回或转交：值为零。
-
-证据：内存窗口。
-
-#### 链路步骤 2：预留通用寄存器
-
-进入时：ISA 变体已知。
-
-本步读取：RV32E 或完整寄存器集。
-
-本步修改：context frame 大小。
-
-并发边界：汇编宏条件。
-
-返回或转交：参数位于 a0 槽。
-
-证据：偏移表。
-
-#### 链路步骤 3：构造 mstatus
-
-进入时：当前 CSR 可读。
-
-本步读取：MIE/MPIE/MPP/FS/VS。
-
-本步修改：初始 CSR 槽。
-
-并发边界：Machine mode port。
-
-返回或转交：任务启动中断状态。
-
-证据：mstatus 解码。
-
-#### 链路步骤 4：写入口 PC
-
-进入时：任务函数已知。
-
-本步读取：pxCode。
-
-本步修改：mepc/return slot。
-
-并发边界：栈写入。
-
-返回或转交：restore 可跳转。
-
-证据：PC 槽。
-
-#### 链路步骤 5：配置 timer/ISR stack
-
-进入时：port start 进入。
-
-本步读取：xISRStackTop 和 timer hook。
-
-本步修改：trap 环境。
-
-并发边界：启动前。
-
-返回或转交：Tick 可用。
-
-证据：对齐断言和 timer register。
-
-#### 链路步骤 6：恢复首任务
-
-进入时：current TCB 有 top。
-
-本步读取：sp、CSR、通用寄存器。
-
-本步修改：CPU context。
-
-并发边界：汇编恢复原子性。
-
-返回或转交：进入任务。
-
-证据：首 PC/SP/mstatus。
+验证首任务时应把栈内存按 portContext.h 的槽位表解码，确认 a0、mepc/返回 PC、mstatus 和 critical nesting 的初值，同时核对 sp 对齐及启用扩展对应的额外保存区。
 
 ### 源码片段：RISC-V 初始上下文由汇编构造
 
@@ -413,19 +109,12 @@ pxPortInitialiseStack:
     store_x a1, 0(a0)
 ```
 
-这段摘录只保留当前机制需要的语句；省略的参数检查、trace hook 或条件分支必须回到固定链接核对。
+- 真实偏移受 RV32E/FPU/VPU/extension 条件影响。
+- critical nesting 每任务从零开始。
+- 任务参数进入 a0 寄存器槽。
+- mstatus 与入口 PC 都是 context frame 一部分。
 
-解读 1：真实偏移受 RV32E/FPU/VPU/extension 条件影响。
-
-解读 2：critical nesting 每任务从零开始。
-
-解读 3：任务参数进入 a0 寄存器槽。
-
-解读 4：mstatus 与入口 PC 都是 context frame 一部分。
-
-不变量：初始 frame 与 portcontextRESTORE_CONTEXT 偏移完全一致。
-
-观察点：展开宏后生成完整偏移表。
+> **关键约束**：初始 frame 与 portcontextRESTORE_CONTEXT 偏移完全一致。 **验证重点**：展开宏后生成完整偏移表。
 
 ### 源码片段：scheduler start 把 timer 来源留给平台
 
@@ -444,25 +133,16 @@ vPortSetupTimerInterrupt();
 xPortStartFirstTask();
 ```
 
-这段摘录只保留当前机制需要的语句；省略的参数检查、trace hook 或条件分支必须回到固定链接核对。
+- ISR stack 对齐在启动前验证。
+- vPortSetupTimerInterrupt 是平台交接点。
+- 只有配置了 mtime 地址才使用默认 machine timer 路径。
+- 首任务由汇编恢复。
 
-解读 1：ISR stack 对齐在启动前验证。
-
-解读 2：vPortSetupTimerInterrupt 是平台交接点。
-
-解读 3：只有配置了 mtime 地址才使用默认 machine timer 路径。
-
-解读 4：首任务由汇编恢复。
-
-不变量：没有可用 mtime 时应用必须提供正确 Tick 配置。
-
-观察点：记录 configMTIME 地址、mie 和 timer compare。
+> **关键约束**：没有可用 mtime 时应用必须提供正确 Tick 配置。 **验证重点**：记录 configMTIME 地址、mie 和 timer compare。
 
 ## 4. 调用链二：trap 分派到 Tick 或 ecall context switch
 
 通用 trap handler 先保存任务，再在 ISR stack 上按 mcause 区分 machine timer、ecall 和应用异常/中断。
-
-第二条链用于验证同一对象在另一条执行路径上的行为，重点检查它是否复用相同不变量，还是进入 ISR、daemon 或 portable 层的特殊规则。
 
 ```mermaid
 sequenceDiagram
@@ -481,89 +161,11 @@ sequenceDiagram
 
 ### 调用链二：trap -> SAVE_CONTEXT -> mcause -> Tick/ecall/application -> vTaskSwitchContext -> RESTORE_CONTEXT
 
-#### 链路步骤 1：保存 internal context
+trap handler 进入后先通过 SAVE_CONTEXT 把当前任务的寄存器、CSR 和 sp 保存到任务栈，并将新 top 写回 TCB；只有上下文完整后，汇编才能切到 ISR stack 调用 C 逻辑。随后读取 mcause 与 mepc，区分 timer interrupt、ecall 和应用提供的其他异常/中断处理入口。
 
-进入时：trap 刚进入。
+machine timer 路径推进 Tick，并根据 xTaskIncrementTick 的返回值决定是否调用 vTaskSwitchContext。ecall 是同步异常，若它承担 yield，返回 PC 必须越过触发指令；异步 timer interrupt 则保留被打断位置。应用中断还必须在返回前清除自己的硬件源，否则 restore 后会立即再次进入 trap。
 
-本步读取：sp 与所有 context 槽。
-
-本步修改：任务栈和 TCB top。
-
-并发边界：中断关闭/汇编边界。
-
-返回或转交：可安全调用 C。
-
-证据：frame dump。
-
-#### 链路步骤 2：读取 cause 与 PC
-
-进入时：保存完成。
-
-本步读取：mcause、mepc。
-
-本步修改：a0/a1 参数。
-
-并发边界：ISR stack。
-
-返回或转交：进入分派。
-
-证据：CSR trace。
-
-#### 链路步骤 3：处理 timer interrupt
-
-进入时：cause 为 machine timer。
-
-本步读取：compare register、Tick。
-
-本步修改：xTickCount 和 maybe current。
-
-并发边界：handler 上下文。
-
-返回或转交：决定是否 switch。
-
-证据：Tick 返回值。
-
-#### 链路步骤 4：处理 ecall
-
-进入时：cause 为 M environment call。
-
-本步读取：mepc。
-
-本步修改：返回 PC 加一条指令。
-
-并发边界：同步异常规则。
-
-返回或转交：调用 switch。
-
-证据：更新后的 mepc。
-
-#### 链路步骤 5：处理应用 source
-
-进入时：非内核 source。
-
-本步读取：application handler hook。
-
-本步修改：设备状态。
-
-并发边界：应用负责清 source。
-
-返回或转交：返回 common restore。
-
-证据：handler trace。
-
-#### 链路步骤 6：恢复 current
-
-进入时：分派完成。
-
-本步读取：pxCurrentTCB top。
-
-本步修改：寄存器、CSR、sp。
-
-并发边界：restore 对称。
-
-返回或转交：旧或新任务继续。
-
-证据：PC 与 current 对应。
+分派结束后，RESTORE_CONTEXT 始终从当前 pxCurrentTCB 读取 top，所以它既可以恢复原任务，也可以恢复调度器刚选中的新任务。保存与恢复的寄存器集合、mepc 更新规则以及 current TCB 对应关系必须逐项对称。
 
 ### 源码片段：上下文宏保存 CSR 与可扩展寄存器
 
@@ -580,19 +182,12 @@ csrr a0, mcause
 csrr a1, mepc
 ```
 
-这段摘录只保留当前机制需要的语句；省略的参数检查、trace hook 或条件分支必须回到固定链接核对。
+- portCONTEXT_SIZE 根据 ISA 特性改变。
+- mstatus 和 mepc 有固定槽位。
+- chip extension 通过宏追加对称保存。
+- 保存结束后才能切到 ISR stack 调 C。
 
-解读 1：portCONTEXT_SIZE 根据 ISA 特性改变。
-
-解读 2：mstatus 和 mepc 有固定槽位。
-
-解读 3：chip extension 通过宏追加对称保存。
-
-解读 4：保存结束后才能切到 ISR stack 调 C。
-
-不变量：additional save/restore 数量与 portCONTEXT_SIZE 一致。
-
-观察点：反汇编核对 sp 差值和每个 store/load。
+> **关键约束**：additional save/restore 数量与 portCONTEXT_SIZE 一致。 **验证重点**：反汇编核对 sp 差值和每个 store/load。
 
 ### 源码片段：trap handler 区分 timer、ecall 和应用 source
 
@@ -615,27 +210,16 @@ addi a1, a1, 4
 call vTaskSwitchContext
 ```
 
-这段摘录只保留当前机制需要的语句；省略的参数检查、trace hook 或条件分支必须回到固定链接核对。
+- mcause 最高位区分中断和异常。
+- 同步 ecall 必须跳过触发指令。
+- timer 只有在 Tick 返回 true 时切换。
+- 其他 source 转交应用 handler。
 
-解读 1：mcause 最高位区分中断和异常。
-
-解读 2：同步 ecall 必须跳过触发指令。
-
-解读 3：timer 只有在 Tick 返回 true 时切换。
-
-解读 4：其他 source 转交应用 handler。
-
-不变量：restore 前保存的返回 PC 必须与 trap 类型语义一致。
-
-观察点：记录 mcause、原始/更新 mepc 和 current TCB。
+> **关键约束**：restore 前保存的返回 PC 必须与 trap 类型语义一致。 **验证重点**：记录 mcause、原始/更新 mepc 和 current TCB。
 
 <!-- IMAGE_PROMPT: 16:9 深色技术插画，展示 RISC-V 任务栈中的 mepc、mstatus、x1-x31、critical nesting 和 chip-specific slots；右侧是 trap handler 按 mcause 分为 timer interrupt、ecall、application handler 三条路径；标签简洁，无具体开发板、无厂商 logo。 -->
 
-## 5. 配置矩阵、观测实验与证据记录
-
-使用可控输入和 trace hook 观察对象变化，不依赖特定开发板。
-
-实验只承诺观察软件状态和调用顺序。没有实际目标硬件或 trace 数据时，不写虚构时间和性能数字。
+## 5. 用栈槽、mcause 与 mepc 验证 RISC-V port
 
 ```mermaid
 flowchart TD
@@ -665,53 +249,12 @@ flowchart TD
 
 ### 实验步骤
 
-1. **展开 context 宏**
-
-   操作：按目标 ISA 预处理汇编。
-
-   记录：context size 与槽位。
-
-   通过标准：save/restore 对称。
-
-2. **构造初始栈**
-
-   操作：调用汇编初始化逻辑。
-
-   记录：参数、mstatus、PC。
-
-   通过标准：首恢复布局正确。
-
-3. **验证 timer 接口**
-
-   操作：分别设置 mtime 地址零/非零。
-
-   记录：timer hook 与 mie。
-
-   通过标准：走正确平台路径。
-
-4. **触发 ecall yield**
-
-   操作：任务执行 portYIELD。
-
-   记录：mcause/mepc/current。
-
-   通过标准：mepc 前移且任务切换。
-
-5. **触发 timer Tick**
-
-   操作：推进到高优先级任务到期。
-
-   记录：compare、Tick 返回值。
-
-   通过标准：必要时 switch。
-
-6. **触发应用异常**
-
-   操作：使用非 ecall cause。
-
-   记录：application hook 与返回。
-
-   通过标准：不误走内核 yield。
+1. **展开 context 宏。** 按目标 ISA 预处理汇编，并保存 context size 与槽位；只有 save/restore 对称，这一步才算完成。
+2. **构造初始栈。** 调用汇编初始化逻辑。重点核对参数、mstatus、PC，结果应满足“首恢复布局正确”。
+3. **验证 timer 接口。** 分别设置 mtime 地址零/非零，把 timer hook 与 mie 保存为证据；判断依据是走正确平台路径。
+4. **触发 ecall yield。** 任务执行 portYIELD；观察 mcause/mepc/current。若 mepc 前移且任务切换，即可进入下一步。
+5. **触发 timer Tick。** 推进到高优先级任务到期，随后比较 compare、Tick 返回值；预期是必要时 switch。
+6. **触发应用异常。** 使用非 ecall cause。最后用 application hook 与返回确认不误走内核 yield。
 
 ### 证据表
 
@@ -724,69 +267,7 @@ flowchart TD
 | mepc 处理 | 比较异常前后 PC | ecall 前移，异步中断保持 | 重复 ecall 会死循环 |
 | extension 对称 | 保存恢复前后寄存器 | 额外状态不污染 | 选错头会跨任务泄漏 |
 
-#### 证据：context size
-
-获取方法：预处理和反汇编
-
-应当看到：sp 调整等于定义大小
-
-如果不满足：不一致会覆盖 frame
-
-为什么这项证据有效：布局宏是所有保存恢复证据。
-
-#### 证据：initial mstatus
-
-获取方法：解码栈中 CSR
-
-应当看到：MPP/MPIE/FS/VS 符合配置
-
-如果不满足：错误状态会首启异常
-
-为什么这项证据有效：CSR 决定返回权限和中断。
-
-#### 证据：timer source
-
-获取方法：配置与寄存器/hook trace
-
-应当看到：只有一个 Tick 来源
-
-如果不满足：双 Tick 会加速时间
-
-为什么这项证据有效：平台接口必须唯一。
-
-#### 证据：mcause 分派
-
-获取方法：trap trace
-
-应当看到：timer/ecall/application 各走正确分支
-
-如果不满足：错误分派会重复异常或漏清源
-
-为什么这项证据有效：cause 是控制流直接依据。
-
-#### 证据：mepc 处理
-
-获取方法：比较异常前后 PC
-
-应当看到：ecall 前移，异步中断保持
-
-如果不满足：重复 ecall 会死循环
-
-为什么这项证据有效：同步与异步返回语义不同。
-
-#### 证据：extension 对称
-
-获取方法：保存恢复前后寄存器
-
-应当看到：额外状态不污染
-
-如果不满足：选错头会跨任务泄漏
-
-为什么这项证据有效：芯片差异必须封装在扩展宏。
-
-## 6. 常见误读、故障定位与修复原则
-
-排错从最早被破坏的不变量开始，不从最终崩溃位置随机回退。
+## 6. 从上下文布局和 trap 返回点定位端口故障
 
 先验证对象成员和链表归属，再检查锁、配置分支和调度请求。
 
@@ -807,93 +288,17 @@ flowchart TD
     E5 --> I5["检查 __riscv_32e 分支"]
 ```
 
-### 1. 启动首任务立即 trap
-
-根因：初始 context size/布局不匹配
-
-第一检查点：检查预处理汇编
-
-需要保存的证据：sp、mstatus、PC 槽
-
-修复原则：统一 portContext 与 portASM
-
-不能采用的绕过方式：不要随机调整栈深度。
-
-### 2. Tick 完全不发生
-
-根因：平台无 mtime 却未实现 timer hook
-
-第一检查点：检查 configMTIME 地址
-
-需要保存的证据：mie、timer compare、hook trace
-
-修复原则：提供正确 vPortSetupTimerInterrupt
-
-不能采用的绕过方式：不要假设所有核有 CLINT。
-
-### 3. ecall yield 无限重复
-
-根因：mepc 未前移
-
-第一检查点：检查同步异常分支
-
-需要保存的证据：连续 mcause/mepc
-
-修复原则：保存 pxCode 后一条指令
-
-不能采用的绕过方式：不要在应用 handler 吞掉。
-
-### 4. 外部中断返回后再次进入
-
-根因：应用 handler 未清中断源
-
-第一检查点：检查 cause 和设备状态
-
-需要保存的证据：handler 前后 pending
-
-修复原则：在应用 hook 正确 ack
-
-不能采用的绕过方式：不要让内核通用 handler猜设备。
-
-### 5. 任务间寄存器污染
-
-根因：save/restore 或 extension 不对称
-
-第一检查点：比较 portCONTEXT_SIZE 和宏
-
-需要保存的证据：切换前后寄存器样本
-
-修复原则：修复扩展头与汇编路径
-
-不能采用的绕过方式：不要在任务入口重置寄存器掩盖。
-
-### 6. RV32E 构建偏移错误
-
-根因：仍按 31 寄存器 frame
-
-第一检查点：检查 __riscv_32e 分支
-
-需要保存的证据：反汇编 sp 调整
-
-修复原则：使用正确 context size
-
-不能采用的绕过方式：不要硬编码偏移。
-
-### 7. FPU/VPU 状态丢失
-
-根因：配置和硬件扩展不一致
-
-第一检查点：检查 misa/mstatus 与宏
-
-需要保存的证据：FS/VS 和任务结果
-
-修复原则：启用并验证扩展保存
-
-不能采用的绕过方式：不要所有任务共享扩展状态。
+| 现象 | 根因 | 第一检查点 | 应保存的证据 | 修复原则 |
+|---|---|---|---|---|
+| 启动首任务立即 trap | 初始 context size/布局不匹配 | 检查预处理汇编 | sp、mstatus、PC 槽 | 统一 portContext 与 portASM |
+| Tick 完全不发生 | 平台无 mtime 却未实现 timer hook | 检查 configMTIME 地址 | mie、timer compare、hook trace | 提供正确 vPortSetupTimerInterrupt |
+| ecall yield 无限重复 | mepc 未前移 | 检查同步异常分支 | 连续 mcause/mepc | 保存 pxCode 后一条指令 |
+| 外部中断返回后再次进入 | 应用 handler 未清中断源 | 检查 cause 和设备状态 | handler 前后 pending | 在应用 hook 正确 ack |
+| 任务间寄存器污染 | save/restore 或 extension 不对称 | 比较 portCONTEXT_SIZE 和宏 | 切换前后寄存器样本 | 修复扩展头与汇编路径 |
+| RV32E 构建偏移错误 | 仍按 31 寄存器 frame | 检查 __riscv_32e 分支 | 反汇编 sp 调整 | 使用正确 context size |
+| FPU/VPU 状态丢失 | 配置和硬件扩展不一致 | 检查 misa/mstatus 与宏 | FS/VS 和任务结果 | 启用并验证扩展保存 |
 
 ## 7. 源码索引、阶段验收与面试表达
-
-完成本篇后，读者应能不依赖文章复述对象模型、两条调用链、配置差异和取证顺序。
 
 ### 源码索引
 
@@ -915,19 +320,6 @@ flowchart TD
 6. 能说明 mtime 不是所有平台必备。
 7. 能解释 chip-specific extension。
 8. 能与 Cortex-M4 port 做契约级比较。
-
-### 验收记录模板
-
-| 项目 | 实际证据 | 结论 |
-|---|---|---|
-| 能解释 RISC-V port 为什么显式保存上下文。 |  |  |
-| 能展开 portCONTEXT_SIZE。 |  |  |
-| 能标注 mstatus/mepc/通用寄存器槽位。 |  |  |
-| 能跟踪首任务恢复。 |  |  |
-| 能区分 timer interrupt 与 ecall。 |  |  |
-| 能说明 mtime 不是所有平台必备。 |  |  |
-| 能解释 chip-specific extension。 |  |  |
-| 能与 Cortex-M4 port 做契约级比较。 |  |  |
 
 ### 面试表达
 
