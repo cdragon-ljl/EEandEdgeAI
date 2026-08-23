@@ -6,6 +6,7 @@ import test from 'node:test';
 const covers = {
   cuda: [1923, 818],
   'ee-system': [1922, 818],
+  freertos: [1923, 818],
   rknn: [1938, 811],
   riscv: [1919, 820],
   fpga: [1921, 819],
@@ -16,13 +17,39 @@ const covers = {
   'video-audio': [1920, 819],
 };
 
+function readWebpDimensions(path) {
+  const buffer = readFileSync(path);
+  assert.equal(buffer.toString('ascii', 0, 4), 'RIFF', `${path} must be a RIFF file`);
+  assert.equal(buffer.toString('ascii', 8, 12), 'WEBP', `${path} must be a WebP file`);
+
+  const chunk = buffer.toString('ascii', 12, 16);
+  if (chunk === 'VP8X') {
+    return [buffer.readUIntLE(24, 3) + 1, buffer.readUIntLE(27, 3) + 1];
+  }
+
+  if (chunk === 'VP8 ') {
+    assert.equal(buffer.toString('hex', 23, 26), '9d012a', `${path} has an invalid VP8 frame header`);
+    return [buffer.readUInt16LE(26) & 0x3fff, buffer.readUInt16LE(28) & 0x3fff];
+  }
+
+  if (chunk === 'VP8L') {
+    assert.equal(buffer[20], 0x2f, `${path} has an invalid VP8L signature`);
+    const dimensions = buffer.readUInt32LE(21);
+    return [(dimensions & 0x3fff) + 1, ((dimensions >>> 14) & 0x3fff) + 1];
+  }
+
+  assert.fail(`${path} uses unsupported WebP chunk ${chunk}`);
+}
+
 test('every registered series has a deployable webp cover with intrinsic dimensions', () => {
   const seriesConfig = readFileSync('src/lib/series.ts', 'utf8');
 
   for (const [id, [width, height]] of Object.entries(covers)) {
+    const coverPath = join('public/covers', `${id}.webp`);
     assert.match(seriesConfig, new RegExp(`src: '/covers/${id}\\.webp'`));
     assert.match(seriesConfig, new RegExp(`width: ${width}, height: ${height}`));
-    assert.ok(existsSync(join('public/covers', `${id}.webp`)), `${id}.webp must exist`);
+    assert.ok(existsSync(coverPath), `${id}.webp must exist`);
+    assert.deepEqual(readWebpDimensions(coverPath), [width, height], `${id}.webp dimensions must match metadata`);
   }
 });
 

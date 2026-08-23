@@ -45,7 +45,7 @@ export const SERIES: Record<SeriesId, SeriesMeta> = {
     accent: 'rose',
     href: '/freertos/',
     label: 'RTOS 内核',
-    cover: { src: '/covers/freertos.webp', width: 1920, height: 820, alt: 'FreeRTOS 内核源码解读系列封面' },
+    cover: { src: '/covers/freertos.webp', width: 1923, height: 818, alt: 'FreeRTOS 内核源码解读系列封面' },
   },
   rknn: {
     id: 'rknn',
