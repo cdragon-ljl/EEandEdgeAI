@@ -45,7 +45,7 @@ Every published article must satisfy all of the following:
 
 - frontmatter title `嵌入式知识体系 · FreeRTOS 内核源码解读 #NN · ...`;
 - `series: freertos`, contiguous `order`, and `draft: false`;
-- normally 800-1500 lines, with a hard test floor of 700 lines;
+- no line-count target; require complete mechanisms, continuous prose, and source evidence without duplicated field templates;
 - 6-9 H2 sections;
 - at least 3 Mermaid blocks and at least 5 total visual points when hidden `IMAGE_PROMPT` comments are included;
 - explicit `FreeRTOS-Kernel V11.3.0` scope;
@@ -102,7 +102,6 @@ Define all 15 filenames and orders from the File Map. Assert that `docs/articles
 For each article, parse frontmatter and body and assert:
 
 ```js
-assert.ok(lines >= 700);
 assert.ok(h2Count >= 6 && h2Count <= 9);
 assert.ok(mermaidCount >= 3);
 assert.ok(mermaidCount + imagePromptCount >= 5);

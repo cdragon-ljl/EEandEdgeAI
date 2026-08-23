@@ -12,7 +12,7 @@ draft: false
 
 分析范围固定为 **FreeRTOS-Kernel V11.3.0**。问题必须从该 tag 的源码和明确配置条件推导。
 
-## 1. 面试题的回答方法与证据边界
+## 1. 调度题要从状态证据开始回答
 
 先复述场景中的任务优先级、状态和触发源，不在条件不完整时直接给结论。
 
@@ -66,15 +66,10 @@ sequenceDiagram
 ```
 
 1. 确认任务是否真的位于 ready list。
-
 2. 确认 scheduler 是否运行、挂起或处于临界区。
-
 3. 找到解除阻塞的 Tick 或对象事件。
-
 4. 比较新 ready 任务与各 current TCB 优先级。
-
 5. 确认公共内核设置 yield 请求。
-
 6. 在 port 异常/trap 中验证实际切换。
 
 ### 源码片段：单核调度器只从最高 ready priority 选择
@@ -91,14 +86,10 @@ while( listLIST_IS_EMPTY( &( pxReadyTasksLists[ uxTopPriority ] ) ) != pdFALSE )
 listGET_OWNER_OF_NEXT_ENTRY( pxCurrentTCB, &( pxReadyTasksLists[ uxTopPriority ] ) );
 ```
 
-解读 1：ready 按优先级分桶。
-
-解读 2：同优先级用 list index 轮转。
-
-解读 3：selected owner 成为 current。
-
-解读 4：scheduler suspended 时不会立即执行该选择。
-
+- ready 按优先级分桶。
+- 同优先级用 list index 轮转。
+- selected owner 成为 current。
+- scheduler suspended 时不会立即执行该选择。
 面试证据：记录 top priority、ready length 和 current owner。
 
 ### 源码片段：Tick 解阻塞后返回是否需要切换
@@ -121,14 +112,10 @@ if( pxTCB->uxPriority > pxCurrentTCB->uxPriority )
 }
 ```
 
-解读 1：两条 delayed list 处理回绕。
-
-解读 2：只需从有序 list head 检查。
-
-解读 3：任务 ready 与实际 port 切换分离。
-
-解读 4：抢占配置仍决定最终行为。
-
+- 两条 delayed list 处理回绕。
+- 只需从有序 list head 检查。
+- 任务 ready 与实际 port 切换分离。
+- 抢占配置仍决定最终行为。
 面试证据：保存 Tick、list swap、unblocked priority 和返回标志。
 
 ### 调用链二：port 保存旧上下文到恢复新任务
@@ -151,15 +138,10 @@ sequenceDiagram
 ```
 
 1. 区分硬件自动保存和软件保存。
-
 2. 确认旧 TCB 首字段收到新 top。
-
 3. 在保护窗口调用公共调度器。
-
 4. 证明新 current 来自合法 ready list。
-
 5. 按对称布局恢复寄存器和 CSR。
-
 6. 用异常返回或 trap return 进入新任务。
 
 ### 源码片段：Cortex-M4 PendSV 保存软件上下文
@@ -178,14 +160,10 @@ str r0, [r2]
 bl vTaskSwitchContext
 ```
 
-解读 1：硬件异常帧已在 PSP。
-
-解读 2：FPU 高寄存器按 EXC_RETURN 条件保存。
-
-解读 3：旧 top 先写回 TCB。
-
-解读 4：公共 scheduler 只负责选 TCB。
-
+- 硬件异常帧已在 PSP。
+- FPU 高寄存器按 EXC_RETURN 条件保存。
+- 旧 top 先写回 TCB。
+- 公共 scheduler 只负责选 TCB。
 面试证据：切换前后保存 PSP、EXC_RETURN 和两个 TCB top。
 
 ### 源码片段：当前任务删除后进入等待回收链表
@@ -203,14 +181,10 @@ pxTCB = listGET_OWNER_OF_HEAD_ENTRY( &xTasksWaitingTermination );
 prvDeleteTCB( pxTCB );
 ```
 
-解读 1：运行任务仍在自己的栈上。
-
-解读 2：delete 只把对象移出可调度集合。
-
-解读 3：Idle 在安全上下文回收 stack/TCB。
-
-解读 4：Idle 饥饿会延迟内存回收。
-
+- 运行任务仍在自己的栈上。
+- delete 只把对象移出可调度集合。
+- Idle 在安全上下文回收 stack/TCB。
+- Idle 饥饿会延迟内存回收。
 面试证据：记录 termination length、deleted count、Idle trace 和 heap。
 
 ## 3. 基础机制场景题
@@ -230,66 +204,19 @@ flowchart TD
 
 一个高优先级任务被 ISR 解阻塞，ready list 中已经能看到它，但当前低优先级任务仍继续执行一段时间。
 
-约束：回答必须绑定 FreeRTOS-Kernel V11.3.0，并明确任务、ISR、daemon 或 portable 上下文。
-
-**源码落点**
-
-tasks.c：xTaskRemoveFromEventList、xTaskIncrementTick、vTaskSwitchContext；port 的 ISR exit yield。
-
-关键对象：xStateListItem、pxReadyTasksLists、xYieldPendings、pxCurrentTCB
-
-配置条件：configUSE_PREEMPTION、scheduler suspend、ISR priority
+> **源码依据**：tasks.c：xTaskRemoveFromEventList、xTaskIncrementTick、vTaskSwitchContext；port 的 ISR exit yield。 关键对象包括 xStateListItem、pxReadyTasksLists、xYieldPendings、pxCurrentTCB；相关配置为 configUSE_PREEMPTION、scheduler suspend、ISR priority。
 
 **详细回答**
 
-ready 只表示可调度，不等于 CPU 已经恢复该任务上下文。
+ready 只表示可调度，不等于 CPU 已经恢复该任务上下文。如果抢占关闭，任务会等当前任务阻塞或主动 yield。如果 scheduler suspended，ISR 只能把事件节点放入 pending ready，恢复 scheduler 后才搬回真正 ready list。如果 ISR 解阻塞了更高优先级任务，FromISR API 必须通过 pxHigherPriorityTaskWoken 把切换请求传到 port。中断屏蔽或更高优先级异常仍在执行时，PendSV/trap 会延迟。最终还要验证 port handler 是否真正更新 pxCurrentTCB 并恢复新栈。
 
-如果抢占关闭，任务会等当前任务阻塞或主动 yield。
+工程上应记录 ready list、pending ready、yield flag、ICSR/port trace 和 current TCB 时间线。即时抢占提高响应，但仍需尊重不可抢占临界区和架构异常优先级。
 
-如果 scheduler suspended，ISR 只能把事件节点放入 pending ready，恢复 scheduler 后才搬回真正 ready list。
+> **常见误区**：高优先级任务一 ready 就会立刻运行。 忽略了抢占配置、scheduler suspend、ISR 交接和 port 延迟切换。 更准确的表述是：高优先级 ready 后是否立即运行取决于调度状态、抢占配置和切换请求是否传到 port。
 
-如果 ISR 解阻塞了更高优先级任务，FromISR API 必须通过 pxHigherPriorityTaskWoken 把切换请求传到 port。
+**追问：如何证明是 scheduler suspend 导致的延迟？**
 
-中断屏蔽或更高优先级异常仍在执行时，PendSV/trap 会延迟。
-
-最终还要验证 port handler 是否真正更新 pxCurrentTCB 并恢复新栈。
-
-推导步骤：
-
-1. 检查任务 state item 是否真的进入 ready list。
-
-2. 检查 scheduler suspend depth 与 pending ready。
-
-3. 检查抢占配置和 current priority。
-
-4. 检查 FromISR 返回的 wake flag。
-
-5. 检查 port pending/异常入口。
-
-现场证据：ready list、pending ready、yield flag、ICSR/port trace 和 current TCB 时间线。
-
-设计取舍：即时抢占提高响应，但仍需尊重不可抢占临界区和架构异常优先级。
-
-**错误回答**
-
-高优先级任务一 ready 就会立刻运行。
-
-错误原因：忽略了抢占配置、scheduler suspend、ISR 交接和 port 延迟切换。
-
-修正后的表达：高优先级 ready 后是否立即运行取决于调度状态、抢占配置和切换请求是否传到 port。
-
-**追问**
-
-如何证明是 scheduler suspend 导致的延迟？
-
-追问回答：同时记录 uxSchedulerSuspended、xPendingReadyList、xYieldPendings；恢复时应看到任务搬回 ready 并紧接一次切换。
-
-回答检查：
-
-- 是否说清对象状态和所有权？
-- 是否给出函数或结构体证据？
-- 是否区分任务、ISR、daemon 或 port 上下文？
-- 是否给出实际排查顺序或设计取舍？
+同时记录 uxSchedulerSuspended、xPendingReadyList、xYieldPendings；恢复时应看到任务搬回 ready 并紧接一次切换。
 
 ### 问题 2：周期任务该使用 vTaskDelay 还是 vTaskDelayUntil？
 
@@ -297,66 +224,19 @@ ready 只表示可调度，不等于 CPU 已经恢复该任务上下文。
 
 一个 10 ms 周期采样任务使用 vTaskDelay(10)，运行数小时后相位不断漂移。
 
-约束：回答必须绑定 FreeRTOS-Kernel V11.3.0，并明确任务、ISR、daemon 或 portable 上下文。
-
-**源码落点**
-
-tasks.c：vTaskDelay、xTaskDelayUntil、prvAddCurrentTaskToDelayedList。
-
-关键对象：xTickCount、previous wake time、delayed list item value
-
-配置条件：INCLUDE_vTaskDelay、INCLUDE_xTaskDelayUntil
+> **源码依据**：tasks.c：vTaskDelay、xTaskDelayUntil、prvAddCurrentTaskToDelayedList。 关键对象包括 xTickCount、previous wake time、delayed list item value；相关配置为 INCLUDE_vTaskDelay、INCLUDE_xTaskDelayUntil。
 
 **详细回答**
 
-vTaskDelay 从调用时刻计算相对等待时间，因此本轮执行耗时会叠加到周期。
+vTaskDelay 从调用时刻计算相对等待时间，因此本轮执行耗时会叠加到周期。xTaskDelayUntil 以保存的 previous wake time 计算绝对下一唤醒点，正常情况下不累计执行时间。如果任务已经错过目标时间，delay-until 不会把一个已过去的时间简单插入 delayed list。Tick 粒度限制可实现的周期精度。长时间关闭调度或中断仍可能产生实际启动抖动。源码证据是最终写入 state list item 的绝对 xTimeToWake。
 
-xTaskDelayUntil 以保存的 previous wake time 计算绝对下一唤醒点，正常情况下不累计执行时间。
+工程上应记录 previous wake、xTickCount、delayed item value 与任务实际 switched-in 时间。固定相位适合 delay-until；相对退避或事件后等待适合 delay。
 
-如果任务已经错过目标时间，delay-until 不会把一个已过去的时间简单插入 delayed list。
+> **常见误区**：两个 API 都是阻塞 N 个 Tick，只是名字不同。 忽略了相对时间与绝对时间基准的区别。 更准确的表述是：vTaskDelay 会累计工作时间，xTaskDelayUntil 以历史唤醒点维持周期相位。
 
-Tick 粒度限制可实现的周期精度。
+**追问：如果任务执行时间超过周期会发生什么？**
 
-长时间关闭调度或中断仍可能产生实际启动抖动。
-
-源码证据是最终写入 state list item 的绝对 xTimeToWake。
-
-推导步骤：
-
-1. 画出每轮 start/work/delay。
-
-2. 比较两个 API 的唤醒时间计算。
-
-3. 检查 delayed item value。
-
-4. 验证 deadline miss 分支。
-
-5. 记录长期相位而非单周期。
-
-现场证据：previous wake、xTickCount、delayed item value 与任务实际 switched-in 时间。
-
-设计取舍：固定相位适合 delay-until；相对退避或事件后等待适合 delay。
-
-**错误回答**
-
-两个 API 都是阻塞 N 个 Tick，只是名字不同。
-
-错误原因：忽略了相对时间与绝对时间基准的区别。
-
-修正后的表达：vTaskDelay 会累计工作时间，xTaskDelayUntil 以历史唤醒点维持周期相位。
-
-**追问**
-
-如果任务执行时间超过周期会发生什么？
-
-追问回答：API 会检测目标时间已过，任务不再等待该过期点；应用需要记录 deadline miss 并决定丢帧、追赶或降级。
-
-回答检查：
-
-- 是否说清对象状态和所有权？
-- 是否给出函数或结构体证据？
-- 是否区分任务、ISR、daemon 或 port 上下文？
-- 是否给出实际排查顺序或设计取舍？
+API 会检测目标时间已过，任务不再等待该过期点；应用需要记录 deadline miss 并决定丢帧、追赶或降级。
 
 ### 问题 3：同优先级任务在什么条件下切换？
 
@@ -364,66 +244,19 @@ Tick 粒度限制可实现的周期精度。
 
 两个同优先级 CPU-bound 任务都不阻塞，有时轮转，有时一个任务长期运行。
 
-约束：回答必须绑定 FreeRTOS-Kernel V11.3.0，并明确任务、ISR、daemon 或 portable 上下文。
-
-**源码落点**
-
-tasks.c：taskSELECT_HIGHEST_PRIORITY_TASK、xTaskIncrementTick；taskYIELD。
-
-关键对象：同优先级 ready list、list index、current TCB
-
-配置条件：configUSE_PREEMPTION、configUSE_TIME_SLICING
+> **源码依据**：tasks.c：taskSELECT_HIGHEST_PRIORITY_TASK、xTaskIncrementTick；taskYIELD。 关键对象包括 同优先级 ready list、list index、current TCB；相关配置为 configUSE_PREEMPTION、configUSE_TIME_SLICING。
 
 **详细回答**
 
-同优先级任务位于同一个 ready list。
+同优先级任务位于同一个 ready list。taskSELECT_HIGHEST_PRIORITY_TASK 使用 listGET_OWNER_OF_NEXT_ENTRY 推进 list index。抢占和 time slicing 都开启时，Tick 看到该 priority list 长度大于一会请求切换。time slicing 关闭后，同优先级任务不会仅因 Tick 自动轮转。当前任务主动 yield、阻塞或被 suspend 仍可触发选择下一 owner。协作式调度还要求任务主动让出处理器。
 
-taskSELECT_HIGHEST_PRIORITY_TASK 使用 listGET_OWNER_OF_NEXT_ENTRY 推进 list index。
+工程上应记录 ready list length、Tick event、yield source 和 current owner 序列。关闭 time slicing 可减少抖动，但 CPU-bound 同优先级任务必须有明确让出点。
 
-抢占和 time slicing 都开启时，Tick 看到该 priority list 长度大于一会请求切换。
+> **常见误区**：FreeRTOS 总是按时间片轮转同优先级任务。 时间片由配置决定，且协作式或主动阻塞路径不同。 更准确的表述是：只有在配置允许或任务主动让出时，同优先级 list index 才推进到另一任务。
 
-time slicing 关闭后，同优先级任务不会仅因 Tick 自动轮转。
+**追问：提高其中一个任务优先级能解决公平性吗？**
 
-当前任务主动 yield、阻塞或被 suspend 仍可触发选择下一 owner。
-
-协作式调度还要求任务主动让出处理器。
-
-推导步骤：
-
-1. 检查两个任务是否都 ready。
-
-2. 检查抢占与 time slicing。
-
-3. 记录 Tick 返回值。
-
-4. 观察 list index/current 序列。
-
-5. 区分主动 yield 与 Tick 轮转。
-
-现场证据：ready list length、Tick event、yield source 和 current owner 序列。
-
-设计取舍：关闭 time slicing 可减少抖动，但 CPU-bound 同优先级任务必须有明确让出点。
-
-**错误回答**
-
-FreeRTOS 总是按时间片轮转同优先级任务。
-
-错误原因：时间片由配置决定，且协作式或主动阻塞路径不同。
-
-修正后的表达：只有在配置允许或任务主动让出时，同优先级 list index 才推进到另一任务。
-
-**追问**
-
-提高其中一个任务优先级能解决公平性吗？
-
-追问回答：不能，它把公平问题变成永久优先级关系，可能让低优先级任务更难运行；应先修正阻塞点或调度配置。
-
-回答检查：
-
-- 是否说清对象状态和所有权？
-- 是否给出函数或结构体证据？
-- 是否区分任务、ISR、daemon 或 port 上下文？
-- 是否给出实际排查顺序或设计取舍？
+不能，它把公平问题变成永久优先级关系，可能让低优先级任务更难运行；应先修正阻塞点或调度配置。
 
 ## 4. 并发、边界与故障场景题
 
@@ -442,66 +275,19 @@ flowchart TD
 
 使用较窄 TickType_t 的测试中，任务在 Tick 接近最大值时延时，唤醒值发生回绕。
 
-约束：回答必须绑定 FreeRTOS-Kernel V11.3.0，并明确任务、ISR、daemon 或 portable 上下文。
-
-**源码落点**
-
-tasks.c：xDelayedTaskList1/2、taskSWITCH_DELAYED_LISTS、prvAddCurrentTaskToDelayedList。
-
-关键对象：xTickCount、pxDelayedTaskList、pxOverflowDelayedTaskList、xNextTaskUnblockTime
-
-配置条件：configUSE_16_BIT_TICKS 或 TickType_t 宽度
+> **源码依据**：tasks.c：xDelayedTaskList1/2、taskSWITCH_DELAYED_LISTS、prvAddCurrentTaskToDelayedList。 关键对象包括 xTickCount、pxDelayedTaskList、pxOverflowDelayedTaskList、xNextTaskUnblockTime；相关配置为 configUSE_16_BIT_TICKS 或 TickType_t 宽度。
 
 **详细回答**
 
-任务阻塞时计算绝对 xTimeToWake。
+任务阻塞时计算绝对 xTimeToWake。如果 xTimeToWake 小于当前 xTickCount，说明目标跨回绕，节点进入 overflow delayed list。当前 delayed list 只保存本轮回绕前到期任务。xTickCount 自然回到零时，taskSWITCH_DELAYED_LISTS 交换两条 list。交换后原 overflow list 成为当前 delayed list，节点仍按绝对值有序。因此不需要对每个任务做复杂的环形时间比较。
 
-如果 xTimeToWake 小于当前 xTickCount，说明目标跨回绕，节点进入 overflow delayed list。
+工程上应记录两条 delayed list 的地址、节点 item value、Tick 回绕和 swap trace。双列表用额外内存换取简单有序比较和 O(1) 头部到期检查。
 
-当前 delayed list 只保存本轮回绕前到期任务。
+> **常见误区**：Tick 回绕时内核把所有延时任务的时间重新计算一遍。 源码实际上交换 list 指针，不遍历重算所有节点。 更准确的表述是：跨回绕任务预先进入 overflow list，Tick 归零时两条 list 交换角色。
 
-xTickCount 自然回到零时，taskSWITCH_DELAYED_LISTS 交换两条 list。
+**追问：portMAX_DELAY 的无限等待也放在 overflow delayed list 吗？**
 
-交换后原 overflow list 成为当前 delayed list，节点仍按绝对值有序。
-
-因此不需要对每个任务做复杂的环形时间比较。
-
-推导步骤：
-
-1. 记录阻塞前 Tick。
-
-2. 计算 xTimeToWake。
-
-3. 判断进入哪条 list。
-
-4. 推进到回绕并观察 swap。
-
-5. 验证 head unblock。
-
-现场证据：两条 delayed list 的地址、节点 item value、Tick 回绕和 swap trace。
-
-设计取舍：双列表用额外内存换取简单有序比较和 O(1) 头部到期检查。
-
-**错误回答**
-
-Tick 回绕时内核把所有延时任务的时间重新计算一遍。
-
-错误原因：源码实际上交换 list 指针，不遍历重算所有节点。
-
-修正后的表达：跨回绕任务预先进入 overflow list，Tick 归零时两条 list 交换角色。
-
-**追问**
-
-portMAX_DELAY 的无限等待也放在 overflow delayed list 吗？
-
-追问回答：在允许 indefinite block 的路径中，任务通常进入 suspended list，而不是依赖一个最终会到达的 Tick 值。
-
-回答检查：
-
-- 是否说清对象状态和所有权？
-- 是否给出函数或结构体证据？
-- 是否区分任务、ISR、daemon 或 port 上下文？
-- 是否给出实际排查顺序或设计取舍？
+在允许 indefinite block 的路径中，任务通常进入 suspended list，而不是依赖一个最终会到达的 Tick 值。
 
 ### 问题 5：调度器挂起和关闭中断有什么区别？
 
@@ -509,66 +295,19 @@ portMAX_DELAY 的无限等待也放在 overflow delayed list 吗？
 
 代码想批量操作内核对象，开发者用 vTaskSuspendAll 代替 critical section，认为 ISR 也不会修改状态。
 
-约束：回答必须绑定 FreeRTOS-Kernel V11.3.0，并明确任务、ISR、daemon 或 portable 上下文。
-
-**源码落点**
-
-tasks.c：vTaskSuspendAll/xTaskResumeAll；port critical macros。
-
-关键对象：uxSchedulerSuspended、xPendingReadyList、xPendedTicks、BASEPRI/interrupt mask
-
-配置条件：scheduler 与 port 配置
+> **源码依据**：tasks.c：vTaskSuspendAll/xTaskResumeAll；port critical macros。 关键对象包括 uxSchedulerSuspended、xPendingReadyList、xPendedTicks、BASEPRI/interrupt mask；相关配置为 scheduler 与 port 配置。
 
 **详细回答**
 
-vTaskSuspendAll 不关闭中断。
+vTaskSuspendAll 不关闭中断。ISR 仍能运行并更新允许的对象状态。当 ISR 需要让任务 ready 时，它不能在 suspend 窗口修改 state list，而会使用 pending ready 机制。Tick 也可能累计到 xPendedTicks，resume 时统一结算。critical section 则通过 port mask 保护短原子更新。阻塞 API 不能在普通 critical section 内等待。
 
-ISR 仍能运行并更新允许的对象状态。
+工程上应记录 ISR trace、pending ready、pended ticks、suspend depth 与 mask 寄存器。scheduler suspend 适合内核需要跨多步保持 task lists 稳定的路径；critical 适合短字段原子更新。
 
-当 ISR 需要让任务 ready 时，它不能在 suspend 窗口修改 state list，而会使用 pending ready 机制。
+> **常见误区**：vTaskSuspendAll 会关闭所有中断。 源码明确允许 ISR 继续运行，并用 pending ready/pended ticks 延迟结算。 更准确的表述是：挂起 scheduler 只推迟任务调度，不等于屏蔽中断。
 
-Tick 也可能累计到 xPendedTicks，resume 时统一结算。
+**追问：能在 scheduler suspended 时调用普通 queue send 吗？**
 
-critical section 则通过 port mask 保护短原子更新。
-
-阻塞 API 不能在普通 critical section 内等待。
-
-推导步骤：
-
-1. 分别记录 interrupt activity 与 scheduler depth。
-
-2. 在 suspend 窗口触发 ISR unblock。
-
-3. 检查 pending ready。
-
-4. resume 后检查 list 搬运和 pended Tick。
-
-5. 比较 BASEPRI/interrupt mask。
-
-现场证据：ISR trace、pending ready、pended ticks、suspend depth 与 mask 寄存器。
-
-设计取舍：scheduler suspend 适合内核需要跨多步保持 task lists 稳定的路径；critical 适合短字段原子更新。
-
-**错误回答**
-
-vTaskSuspendAll 会关闭所有中断。
-
-错误原因：源码明确允许 ISR 继续运行，并用 pending ready/pended ticks 延迟结算。
-
-修正后的表达：挂起 scheduler 只推迟任务调度，不等于屏蔽中断。
-
-**追问**
-
-能在 scheduler suspended 时调用普通 queue send 吗？
-
-追问回答：部分内核内部路径在受控协议下可以，但应用不能把它当通用锁；API 是否允许要看其实现是否自行处理 suspend/lock。
-
-回答检查：
-
-- 是否说清对象状态和所有权？
-- 是否给出函数或结构体证据？
-- 是否区分任务、ISR、daemon 或 port 上下文？
-- 是否给出实际排查顺序或设计取舍？
+部分内核内部路径在受控协议下可以，但应用不能把它当通用锁；API 是否允许要看其实现是否自行处理 suspend/lock。
 
 ### 问题 6：SVC、PendSV 与 SysTick 如何协作？
 
@@ -576,66 +315,19 @@ vTaskSuspendAll 会关闭所有中断。
 
 系统启动后首任务通过 SVC 进入；运行中 SysTick 到期高优先级任务，最终在 PendSV 中切换。
 
-约束：回答必须绑定 FreeRTOS-Kernel V11.3.0，并明确任务、ISR、daemon 或 portable 上下文。
-
-**源码落点**
-
-portable/GCC/ARM_CM4F/port.c。
-
-关键对象：PSP、MSP、EXC_RETURN、BASEPRI、pxCurrentTCB
-
-配置条件：GCC ARM_CM4F port
+> **源码依据**：portable/GCC/ARM_CM4F/port.c。 关键对象包括 PSP、MSP、EXC_RETURN、BASEPRI、pxCurrentTCB；相关配置为 GCC ARM_CM4F port。
 
 **详细回答**
 
-pxPortInitialiseStack 先构造可由异常返回恢复的初始帧。
+pxPortInitialiseStack 先构造可由异常返回恢复的初始帧。xPortStartScheduler 配置异常优先级并通过 SVC 启动首任务。SVC handler 从 current TCB 恢复 R4-R11、EXC_RETURN 和 PSP，硬件再恢复低寄存器帧。SysTick 调 xTaskIncrementTick，只在需要时设置 PendSV pending。PendSV 处于最低优先级，保存旧 PSP 软件帧、调用 vTaskSwitchContext、恢复新帧。BASEPRI 保护公共 scheduler 选择窗口，高紧急度 ISR 仍可先运行。
 
-xPortStartScheduler 配置异常优先级并通过 SVC 启动首任务。
+工程上应记录 VTOR、SHPR、ICSR、PSP、EXC_RETURN、两个 TCB top 和 trace。用 PendSV 延迟切换减少中断嵌套复杂度，并让所有切换共享同一恢复路径。
 
-SVC handler 从 current TCB 恢复 R4-R11、EXC_RETURN 和 PSP，硬件再恢复低寄存器帧。
+> **常见误区**：SysTick 中断里直接保存旧任务并恢复新任务。 上游 port 只在 SysTick 中 pend PendSV，真正切换在 PendSV。 更准确的表述是：SysTick 只推进 Tick 和请求切换，PendSV 才保存/恢复上下文。
 
-SysTick 调 xTaskIncrementTick，只在需要时设置 PendSV pending。
+**追问：为什么 PendSV 要设置最低优先级？**
 
-PendSV 处于最低优先级，保存旧 PSP 软件帧、调用 vTaskSwitchContext、恢复新帧。
-
-BASEPRI 保护公共 scheduler 选择窗口，高紧急度 ISR 仍可先运行。
-
-推导步骤：
-
-1. 画出首启与普通切换两条路径。
-
-2. 区分硬件/软件保存帧。
-
-3. 检查 SysTick 只 pend。
-
-4. 逐条跟踪 PendSV 汇编。
-
-5. 验证 EXC_RETURN/FPU 条件。
-
-现场证据：VTOR、SHPR、ICSR、PSP、EXC_RETURN、两个 TCB top 和 trace。
-
-设计取舍：用 PendSV 延迟切换减少中断嵌套复杂度，并让所有切换共享同一恢复路径。
-
-**错误回答**
-
-SysTick 中断里直接保存旧任务并恢复新任务。
-
-错误原因：上游 port 只在 SysTick 中 pend PendSV，真正切换在 PendSV。
-
-修正后的表达：SysTick 只推进 Tick 和请求切换，PendSV 才保存/恢复上下文。
-
-**追问**
-
-为什么 PendSV 要设置最低优先级？
-
-追问回答：让所有更高优先级中断先完成，避免在仍有中断使用当前上下文时切走，并统一切换边界。
-
-回答检查：
-
-- 是否说清对象状态和所有权？
-- 是否给出函数或结构体证据？
-- 是否区分任务、ISR、daemon 或 port 上下文？
-- 是否给出实际排查顺序或设计取舍？
+让所有更高优先级中断先完成，避免在仍有中断使用当前上下文时切走，并统一切换边界。
 
 ## 5. 架构与系统设计场景题
 
@@ -652,66 +344,19 @@ flowchart TD
 
 同样是 FreeRTOS 任务切换，RISC-V portASM.S 明确保存大量寄存器和 CSR，而 Cortex-M port 借助硬件异常帧。
 
-约束：回答必须绑定 FreeRTOS-Kernel V11.3.0，并明确任务、ISR、daemon 或 portable 上下文。
-
-**源码落点**
-
-portable/GCC/RISC-V/portASM.S、portContext.h；ARM_CM4F/port.c。
-
-关键对象：mepc、mstatus、mcause、通用寄存器、PSP、EXC_RETURN
-
-配置条件：Machine mode RISC-V 与 Cortex-M4F port
+> **源码依据**：portable/GCC/RISC-V/portASM.S、portContext.h；ARM_CM4F/port.c。 关键对象包括 mepc、mstatus、mcause、通用寄存器、PSP、EXC_RETURN；相关配置为 Machine mode RISC-V 与 Cortex-M4F port。
 
 **详细回答**
 
-Cortex-M 异常入口由硬件固定保存 R0-R3/R12/LR/PC/xPSR。
+Cortex-M 异常入口由硬件固定保存 R0-R3/R12/LR/PC/xPSR。ARM port 主要补充 R4-R11、EXC_RETURN 和可选 FPU 高寄存器。RISC-V 通用 port 通过 portContext 宏显式定义 context size、CSR 与通用寄存器槽位。RISC-V handler 读取 mcause/mepc 区分 timer、ecall 与应用 source。ecall 是同步异常，返回 PC 必须跳过触发指令；timer 是异步中断，保存原返回 PC。两者公共契约仍是旧 top 写回 TCB、切换 current、新 top 恢复。
 
-ARM port 主要补充 R4-R11、EXC_RETURN 和可选 FPU 高寄存器。
+工程上应记录两种 port 的栈 dump、CSR/EXC_RETURN、current TCB 与 switch trace。公共内核保持架构无关，port 用不同硬件机制满足同一上下文契约。
 
-RISC-V 通用 port 通过 portContext 宏显式定义 context size、CSR 与通用寄存器槽位。
+> **常见误区**：RISC-V 只是把 PendSV 换成另一个中断名字。 RISC-V 没有 Cortex-M 固定 PendSV 和自动异常帧，trap 分派和保存布局由 port 显式实现。 更准确的表述是：不能用异常名称类比代替上下文保存和返回语义比较。
 
-RISC-V handler 读取 mcause/mepc 区分 timer、ecall 与应用 source。
+**追问：所有 RISC-V 都使用 CLINT mtime 产生 Tick 吗？**
 
-ecall 是同步异常，返回 PC 必须跳过触发指令；timer 是异步中断，保存原返回 PC。
-
-两者公共契约仍是旧 top 写回 TCB、切换 current、新 top 恢复。
-
-推导步骤：
-
-1. 列出两种架构自动保存范围。
-
-2. 比较初始栈构造。
-
-3. 比较 yield 触发方式。
-
-4. 比较返回 PC 规则。
-
-5. 回到共同 TCB 契约。
-
-现场证据：两种 port 的栈 dump、CSR/EXC_RETURN、current TCB 与 switch trace。
-
-设计取舍：公共内核保持架构无关，port 用不同硬件机制满足同一上下文契约。
-
-**错误回答**
-
-RISC-V 只是把 PendSV 换成另一个中断名字。
-
-错误原因：RISC-V 没有 Cortex-M 固定 PendSV 和自动异常帧，trap 分派和保存布局由 port 显式实现。
-
-修正后的表达：不能用异常名称类比代替上下文保存和返回语义比较。
-
-**追问**
-
-所有 RISC-V 都使用 CLINT mtime 产生 Tick 吗？
-
-追问回答：不是；上游 port 允许 configMTIME 地址为零并要求平台实现 vPortSetupTimerInterrupt。
-
-回答检查：
-
-- 是否说清对象状态和所有权？
-- 是否给出函数或结构体证据？
-- 是否区分任务、ISR、daemon 或 port 上下文？
-- 是否给出实际排查顺序或设计取舍？
+不是；上游 port 允许 configMTIME 地址为零并要求平台实现 vPortSetupTimerInterrupt。
 
 ### 问题 8：删除当前任务后为什么不能立即释放 TCB 和栈？
 
@@ -719,66 +364,19 @@ RISC-V 只是把 PendSV 换成另一个中断名字。
 
 任务执行 vTaskDelete(NULL)，希望立刻把内存归还 heap，但删除后代码仍处于该任务调用栈。
 
-约束：回答必须绑定 FreeRTOS-Kernel V11.3.0，并明确任务、ISR、daemon 或 portable 上下文。
-
-**源码落点**
-
-tasks.c：vTaskDelete、xTasksWaitingTermination、prvCheckTasksWaitingTermination。
-
-关键对象：当前 TCB、state list、termination list、Idle task、heap
-
-配置条件：INCLUDE_vTaskDelete == 1
+> **源码依据**：tasks.c：vTaskDelete、xTasksWaitingTermination、prvCheckTasksWaitingTermination。 关键对象包括 当前 TCB、state list、termination list、Idle task、heap；相关配置为 INCLUDE_vTaskDelete == 1。
 
 **详细回答**
 
-当前任务调用 delete 时 CPU 仍使用它的 PSP/SP 和栈帧。
+当前任务调用 delete 时 CPU 仍使用它的 PSP/SP 和栈帧。内核先把任务从 ready/event list 移除，使它不再被调度。对于当前任务，TCB 状态节点进入 xTasksWaitingTermination，并增加待清理计数。delete 请求一次切换，离开当前栈。Idle task 在另一个安全上下文检查 termination list，再调用 prvDeleteTCB 释放 stack/TCB。如果 Idle 长期得不到运行，删除内存的回收也会延迟。
 
-内核先把任务从 ready/event list 移除，使它不再被调度。
+工程上应记录 current TCB、PSP/SP、termination length、Idle trace、heap stats。延迟回收增加一条链表，但保证不会释放正在执行的内存。
 
-对于当前任务，TCB 状态节点进入 xTasksWaitingTermination，并增加待清理计数。
+> **常见误区**：vTaskDelete 返回后再调用 vPortFree 释放自己的栈。 该代码仍在被释放的栈上执行，会立即形成 use-after-free。 更准确的表述是：当前任务删除必须先切走，再由 Idle 在安全上下文回收。
 
-delete 请求一次切换，离开当前栈。
+**追问：删除很多任务后 heap 不回升，首先检查什么？**
 
-Idle task 在另一个安全上下文检查 termination list，再调用 prvDeleteTCB 释放 stack/TCB。
-
-如果 Idle 长期得不到运行，删除内存的回收也会延迟。
-
-推导步骤：
-
-1. 确认删除目标是否 current。
-
-2. 检查状态/event list 移除。
-
-3. 观察 termination insertion。
-
-4. 验证切换离开旧栈。
-
-5. 观察 Idle cleanup 和 heap。
-
-现场证据：current TCB、PSP/SP、termination length、Idle trace、heap stats。
-
-设计取舍：延迟回收增加一条链表，但保证不会释放正在执行的内存。
-
-**错误回答**
-
-vTaskDelete 返回后再调用 vPortFree 释放自己的栈。
-
-错误原因：该代码仍在被释放的栈上执行，会立即形成 use-after-free。
-
-修正后的表达：当前任务删除必须先切走，再由 Idle 在安全上下文回收。
-
-**追问**
-
-删除很多任务后 heap 不回升，首先检查什么？
-
-追问回答：检查 Idle 是否获得运行、termination list 是否增长，以及动态/static allocation ownership 是否正确。
-
-回答检查：
-
-- 是否说清对象状态和所有权？
-- 是否给出函数或结构体证据？
-- 是否区分任务、ISR、daemon 或 port 上下文？
-- 是否给出实际排查顺序或设计取舍？
+检查 Idle 是否获得运行、termination list 是否增长，以及动态/static allocation ownership 是否正确。
 
 ## 6. 配置矩阵、现场证据与错误答案归类
 
@@ -796,13 +394,9 @@ vTaskDelete 返回后再调用 vPortFree 释放自己的栈。
 ### 现场证据优先级
 
 1. **对象归属**：TCB 两个 ListItem 的 container 和 owner。
-
 2. **调度状态**：ready buckets、current TCB、suspend depth、yield pending。
-
 3. **时间线**：Tick/event、ready、switch、port handler 的统一时钟事件。
-
 4. **架构现场**：PSP/EXC_RETURN 或 mcause/mepc/mstatus。
-
 5. **资源回收**：termination list、Idle runtime 与 heap stats。
 
 ```mermaid
