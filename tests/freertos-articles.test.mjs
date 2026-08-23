@@ -70,7 +70,7 @@ for (const [file, order] of articles) {
 test('common-kernel articles remain board and vendor neutral', () => {
   const commonOrders = new Set([1, 2, 3, 6, 7, 8, 9, 10, 11, 12]);
 
-  for (const [file, order] of articles.filter(([, order]) => commonOrders.has(order))) {
+  for (const [file] of articles.filter(([, order]) => commonOrders.has(order))) {
     const body = readArticle(file).replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
     assert.doesNotMatch(body, /STM32F\d+|CubeMX|HAL_[A-Za-z0-9_]+/);
   }
