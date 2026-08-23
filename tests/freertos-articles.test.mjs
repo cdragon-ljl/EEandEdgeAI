@@ -7,6 +7,10 @@ const freertosDir = 'docs/articles/freertos';
 const frameworkPath = join(freertosDir, 'freertos-kernel-framework.md');
 const article1Name = 'freertos-01-source-reading-list-internals.md';
 const article1Path = join(freertosDir, article1Name);
+const article2Name = 'freertos-02-tcb-task-create-delete.md';
+const article2Path = join(freertosDir, article2Name);
+const article3Name = 'freertos-03-scheduler-tick-block-unblock.md';
+const article3Path = join(freertosDir, article3Name);
 const expectedChapters = [
   '源码阅读方法与 List_t/ListItem_t',
   'TCB、任务创建与删除',
@@ -27,7 +31,7 @@ test('freertos directory contains the framework and approved first sample only',
     .filter((file) => file.endsWith('.md'))
     .sort();
 
-  assert.deepEqual(files, [article1Name, 'freertos-kernel-framework.md']);
+  assert.deepEqual(files, [article1Name, article2Name, article3Name, 'freertos-kernel-framework.md']);
 });
 
 test('freertos framework defines the approved 12-article sequence', () => {
@@ -94,6 +98,51 @@ test('first FreeRTOS sample follows the source instead of a fixed article templa
   assert.doesNotMatch(body, /^\|/m);
   assert.doesNotMatch(body, /配置矩阵|证据表|阶段验收|面试表达|视觉点|800|1500/);
   assert.doesNotMatch(body, /STM32|Cortex-M|RISC-V|BASEPRI|PendSV|SysTick|EXC_RETURN/);
+});
+test('task lifecycle article follows TCB creation, publication, deletion, and ownership', () => {
+  const markdown = readFileSync(article2Path, 'utf8');
+  const body = markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
+
+  assert.match(markdown, /^order: 2$/m);
+  assert.match(markdown, /^draft: false$/m);
+  for (const symbol of [
+    'TCB_t', 'xTaskCreate', 'xTaskCreateStatic', 'prvCreateTask',
+    'prvInitialiseNewTask', 'pxPortInitialiseStack',
+    'prvAddNewTaskToReadyList', 'pxReadyTasksLists',
+    'vTaskDelete', 'xTasksWaitingTermination',
+    'prvCheckTasksWaitingTermination', 'prvDeleteTCB',
+    'ucStaticallyAllocated',
+  ]) {
+    assert.match(body, new RegExp(symbol), `missing task lifecycle source concept: ${symbol}`);
+  }
+  assert.match(body, /FreeRTOS-Kernel V11\.3\.0/);
+  assert.match(body, /github\.com\/FreeRTOS\/FreeRTOS-Kernel\/blob\/V11\.3\.0\/tasks\.c/);
+  assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据)：/m);
+  assert.doesNotMatch(body, /^\|/m);
+  assert.doesNotMatch(body, /Cortex-M|RISC-V|BASEPRI|PendSV|mstatus|mcause/);
+});
+
+test('scheduler article closes the ready, delayed, tick, and pending-ready paths', () => {
+  const markdown = readFileSync(article3Path, 'utf8');
+  const body = markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
+
+  assert.match(markdown, /^order: 3$/m);
+  assert.match(markdown, /^draft: false$/m);
+  for (const symbol of [
+    'pxReadyTasksLists', 'pxDelayedTaskList', 'pxOverflowDelayedTaskList',
+    'xPendingReadyList', 'vTaskStartScheduler', 'xPortStartScheduler',
+    'taskSELECT_HIGHEST_PRIORITY_TASK', 'vTaskSwitchContext',
+    'vTaskDelay', 'xTaskDelayUntil', 'prvAddCurrentTaskToDelayedList',
+    'xTaskIncrementTick', 'xNextTaskUnblockTime',
+    'configUSE_TIME_SLICING', 'xTaskResumeAll',
+  ]) {
+    assert.match(body, new RegExp(symbol), `missing scheduler source concept: ${symbol}`);
+  }
+  assert.match(body, /FreeRTOS-Kernel V11\.3\.0/);
+  assert.match(body, /github\.com\/FreeRTOS\/FreeRTOS-Kernel\/blob\/V11\.3\.0\/tasks\.c/);
+  assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据)：/m);
+  assert.doesNotMatch(body, /^\|/m);
+  assert.doesNotMatch(body, /Cortex-M|RISC-V|BASEPRI|PendSV|mstatus|mcause/);
 });
 test('article prose allows long technical identifiers to wrap on narrow screens', () => {
   const globalCss = readFileSync('src/styles/global.css', 'utf8');
