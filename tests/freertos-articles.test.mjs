@@ -27,6 +27,8 @@ const article10Name = 'freertos-10-software-timer-daemon.md';
 const article10Path = join(freertosDir, article10Name);
 const article11Name = 'freertos-11-static-allocation-heap-one-to-five.md';
 const article11Path = join(freertosDir, article11Name);
+const article12Name = 'freertos-12-source-engineering-interview.md';
+const article12Path = join(freertosDir, article12Name);
 const expectedChapters = [
   '源码阅读方法与 List_t/ListItem_t',
   'TCB、任务创建与删除',
@@ -42,12 +44,12 @@ const expectedChapters = [
   '源码与工程面试专题',
 ];
 
-test('freertos directory contains the framework and approved first sample only', () => {
+test('freertos directory contains the framework and approved 12-article series', () => {
   const files = readdirSync(freertosDir)
     .filter((file) => file.endsWith('.md'))
     .sort();
 
-  assert.deepEqual(files, [article1Name, article2Name, article3Name, article4Name, article5Name, article6Name, article7Name, article8Name, article9Name, article10Name, article11Name, 'freertos-kernel-framework.md']);
+  assert.deepEqual(files, [article1Name, article2Name, article3Name, article4Name, article5Name, article6Name, article7Name, article8Name, article9Name, article10Name, article11Name, article12Name, 'freertos-kernel-framework.md']);
 });
 
 test('freertos framework defines the approved 12-article sequence', () => {
@@ -303,6 +305,23 @@ test('memory article distinguishes all five heap contracts and statistics', () =
   assert.doesNotMatch(body, /所有 heap[^\n。]*支持[^\n。]*vPortGetHeapStats|五种实现[^\n。]*统一[^\n。]*heap stats/);
   assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据)：/m);
 });
+test('interview article derives engineering answers from concrete kernel paths', () => {
+  const markdown = readFileSync(article12Path, 'utf8');
+  const body = markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
+  assert.match(markdown, /^order: 12$/m);
+  for (const symbol of [
+    'vTaskDelay', 'xTaskDelayUntil', 'xTasksWaitingTermination',
+    'xPortPendSVHandler', 'freertos_risc_v_trap_handler',
+    'xQueueGenericSendFromISR', 'xTaskPriorityInherit',
+    'xEventGroupSetBitsFromISR', 'vPortGetHeapStats',
+    'ucStaticallyAllocated', 'prvTimerTask',
+  ]) assert.match(body, new RegExp(symbol), `missing interview source path: ${symbol}`);
+  assert.match(body, /高优先级任务[\s\S]+没有立即运行/);
+  assert.match(body, /总空闲[\s\S]+申请[\s\S]+失败/);
+  assert.match(body, /github\.com\/FreeRTOS\/FreeRTOS-Kernel\/blob\/V11\.3\.0/);
+  assert.doesNotMatch(body, /\*\*(场景|源码依据|详细回答|回答检查)\*\*/);
+  assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据|停止条件)：/m);
+});
 test('article prose allows long technical identifiers to wrap on narrow screens', () => {
   const globalCss = readFileSync('src/styles/global.css', 'utf8');
 
@@ -326,3 +345,4 @@ test('freertos remains registered as a first-class site series', () => {
   assert.match(seriesConfig, /href: '\/freertos\/'/);
   assert.match(articlesLib, /value === 'freertos'/);
 });
+
