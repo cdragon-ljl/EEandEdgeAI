@@ -14,6 +14,14 @@ FreeRTOS 面试中最容易失真的问题，往往不是 API 原型，而是“
 
 本文仍固定使用 **FreeRTOS-Kernel V11.3.0**，commit `9b777ae5c5b8e9e456065a00294d1e5f5f9facf5`。下面的问题不重复罗列 API，而是从工程现象反推源码路径。每个答案都区分公共内核与 portable 层，结论可以直接回到上游代码复核。
 
+## 回答源码问题时先建立证据链
+
+一个可靠回答至少要分清五件事，但不需要机械地按五个小标题复述。首先确认调用上下文：普通任务、ISR、Idle 还是 Timer daemon 能做的事情不同；然后确认数据对象是否已经改变，例如 Queue 消息数或 Event Group bits；接着确认等待任务从哪条 event/delayed list 被移除、进入 ready 还是 pending-ready；再看是否产生 yield 请求以及 port 是否完成切换；最后才讨论应用为什么仍没有得到期望结果。
+
+例如“ISR send Queue 成功，高优先级任务为什么没运行”不能只答“需要 `portYIELD_FROM_ISR`”。完整证据链应是：`uxMessagesWaiting` 已增加，说明数据提交成功；等待节点是否被移除取决于 queue lock；任务可能先进入 `xPendingReadyList`；`pxHigherPriorityTaskWoken` 只表达需要切换；ISR 尾部 port 宏才把请求变成 PendSV 或架构对应 trap。任何一环没有证据，都只能算猜测。
+
+面试回答还应主动说出配置条件。`configUSE_PREEMPTION`、`configUSE_TIME_SLICING`、`INCLUDE_vTaskSuspend`、`configUSE_TIMERS` 和 heap 实现都会改变“通常结论”的成立范围。源码能力由条件编译组成，脱离配置说“永远、一定、立即”通常是危险信号。
+
 ## 从任务状态解释调度现象
 
 ### 高优先级任务已经就绪，为什么没有立即运行？
@@ -43,6 +51,14 @@ Queue 代码不能假设具体处理器如何退出中断，因此真正触发�
 [`xTaskDelayUntil()`](https://github.com/FreeRTOS/FreeRTOS-Kernel/blob/V11.3.0/tasks.c#L2377-L2467) 则把 `*pxPreviousWakeTime + xTimeIncrement` 作为下一个绝对节拍，并在每次调用后更新 `*pxPreviousWakeTime`。只要本轮没有错过目标时刻，计算耗时不会被加到下一周期。源码没有用简单的 `xTimeToWake > xConstTickCount` 判断，因为 Tick 会回绕；它同时比较上次唤醒值、当前值和目标值，分别覆盖当前 Tick 已回绕、尚未回绕两种情况。
 
 这也解释了两个常见误判。第一，`xTaskDelayUntil()` 不能补偿严重超期：若任务执行已经越过目标时刻，本次不阻塞，只把时间基准推进一个周期，应用必须决定是追赶、丢帧还是重新同步。第二，传入的 `pxPreviousWakeTime` 必须保存跨循环状态，通常在进入循环前由 `xTaskGetTickCount()` 初始化；若每轮都重新赋当前 Tick，它会退化为相对延时。
+
+### portMAX_DELAY 是否一定表示永远等待？
+
+不能只看参数名字。Queue、Semaphore 等阻塞 API 最终把 timeout 交给任务 delayed/suspended 逻辑；当 `INCLUDE_vTaskSuspend == 1` 且调用路径允许无限等待时，`portMAX_DELAY` 会把任务放进 `xSuspendedTaskList`，不参与 Tick timeout。若配置或 API 路径不满足该条件，它仍可能只是 `TickType_t` 能表示的最大有限延时。
+
+位宽也会改变这个有限值：16 位 Tick 下 `portMAX_DELAY` 远小于 32 位 Tick。回答工程问题时应同时给出 `configUSE_16_BIT_TICKS`、`INCLUDE_vTaskSuspend` 和具体 API，而不是把 `portMAX_DELAY` 当成跨配置的数学无穷大。
+
+调试“本应永久等待却醒了”时，先查看任务状态节点究竟在 `xSuspendedTaskList` 还是 delayed list；若在 delayed list，再检查其 `xItemValue` 和 Tick 回绕。链表归属比源代码中的宏名字更直接地证明内核采用了哪种语义。
 
 ### 任务调用 vTaskDelete(NULL) 后，为什么内存没有立刻回到 heap？
 
@@ -95,6 +111,14 @@ Machine timer interrupt 到来时，`mepc` 指向被中断、尚需继续执行�
 
 FreeRTOS 的继承还应按其实际实现理解，而不是套用任意 RTOS 的协议。holder 持有多个 mutex 时，`xTaskPriorityDisinherit()` 只有在 `uxMutexesHeld` 降到零后才恢复 base priority，避免释放一个 mutex 就过早降级；等待者超时则由 `vTaskPriorityDisinheritAfterTimeout()` 根据仍在等待的最高优先级做有限调整。它缓解经典反转，但不等同于完整 priority ceiling protocol，复杂锁依赖仍需缩短临界资源持有时间并避免嵌套。
 
+### 一个任务持有多个 mutex 时，释放其中一个为什么不马上降级？
+
+FreeRTOS TCB 只记录 `uxMutexesHeld` 总数，没有保存一张“每个 mutex 分别从哪个等待者继承了什么优先级”的完整依赖图。高优先级任务等待 M1 后，holder 被提升；holder 如果同时持有 M2，释放 M1 时仍可能有其他 mutex 需要它尽快完成，所以 `xTaskPriorityDisinherit()` 只在持有计数降到零后完全恢复 base priority。
+
+这是一种保守且实现成本较低的策略。优点是不会过早降低 holder，缺点是 boost 可能持续到最后一个无关 mutex 也释放。等待者 timeout 时，`vTaskPriorityDisinheritAfterTimeout()` 会参考仍在等待的最高优先级做有限调整，但仍不是 priority ceiling 或完整传递继承协议。
+
+常见错误答案是“释放导致继承的那个 mutex 就恢复原优先级”。这句话要求内核保存比实际 TCB 更多的依赖信息。正确回答应指出 `uxBasePriority`、当前 `uxPriority`、`uxMutexesHeld` 和各 mutex holder/waiter list 才是可验证证据，并补充应用应统一锁顺序、避免长时间嵌套持锁。
+
 ### ISR 已经把数据写入 Queue，接收任务为什么还可能晚一点才醒？
 
 `xQueueGenericSendFromISR()` 的数据路径和唤醒路径并不是不可分割的原子动作。Queue 未满时，它可以在受 port 中断屏蔽保护的区间复制数据并增加 `uxMessagesWaiting`；但如果 Queue 的 `cTxLock` 不等于 `queueUNLOCKED`，函数不会直接操作 `xTasksWaitingToReceive`，而是增加 lock 计数。任务上下文稍后执行 `prvUnlockQueue()`，再按累计次数解除等待。
@@ -144,6 +168,20 @@ heap_4/heap_5 的 [`vPortGetHeapStats()`](https://github.com/FreeRTOS/FreeRTOS-K
 所有 timer callback 以及通过 `xTimerPendFunctionCall()` 延迟到任务上下文的函数，都在同一个 daemon task 中串行执行。某个 callback 做长计算、等待 mutex、执行阻塞 I/O，后面的 timer 到期处理和 command queue 消费都会被推迟。提高 `configTIMER_TASK_PRIORITY` 只能减少 daemon 等待 CPU 的时间，不能消除 callback 自身串行占用；优先级过高还会挤压真正需要运行的业务任务。
 
 正确设计是让 callback 只更新轻量状态或发送通知，把耗时工作交给普通任务。诊断延迟时记录预期 expiry tick、daemon 实际开始执行 tick、command queue 深度、callback 时长和 daemon 优先级。若 active list 中到期判断正确而 callback 晚，问题在 daemon 调度或前序 callback；若 start/reset 命令很晚才被消费，则应检查 command queue、调用时 block time 和 daemon 是否被阻塞，而不是先怀疑硬件 Tick 频率。
+
+## 如何识别常见错误答案
+
+常见错误答案通常有三种特征。第一种把资格当成执行结果，例如“高优先级任务 ready 后一定立即运行”；它忽略 scheduler suspend、抢占配置、ISR yield 和 portable 层。第二种把 API 返回成功当成整个业务完成，例如 Queue FromISR 返回 `pdPASS` 只证明数据已提交，不证明目标任务已经消费。第三种用一个指标替代对象不变量，例如总 free 很大不证明存在足够大的连续块，Event Group bit 为 1 也不证明事件只发生了一次。
+
+判断答案是否可靠，可以反问它能否指出具体对象和字段：任务在哪条 list，Queue 的 `uxMessagesWaiting` 与 lock 值是什么，notification state 是 waiting 还是 received，timer command 是否已经入队，largest free block 有多大。若答案只能重复 API 文档中的一句结论，却无法说明字段何时被谁修改，就还没有触及源码机制。
+
+### 现场排查顺序
+
+现场排查顺序应沿状态提交方向前进，而不是一次性打印所有内核变量。先确认调用上下文和 API 返回值，再确认对象数据是否改变；对象已改变后检查 waiter 是否离开事件链表；waiter 已解除后检查 ready/pending-ready；已经 ready 后检查 yield 请求和 port 异常；任务已经运行但业务仍异常，最后再检查应用数据所有权、缓冲生命周期和资源回收。
+
+内存问题则从实际链接的 `heap_n.c` 开始，记录申请大小加 header/对齐后的真实需求，再比较总 free、minimum-ever、largest block 和 free-block count。Timer 问题从 command queue 开始，随后检查 active/overflow list、到期 Tick、daemon 状态和前序 callback 时长。这样的顺序让每一步只在上一步成立后继续，能快速把问题限定在 API、公共内核、portable 层或应用层。
+
+面试中给出这套顺序，比背诵几十个结论更能证明真正理解源码：它说明你知道哪里是提交点、哪里只是唤醒机会、哪里才发生架构切换，也知道观察不到预期证据时应该退回哪一层。
 
 ## 把现场现象还原成源码路径
 
