@@ -14,6 +14,16 @@ RISC-V 没有一个等价于 Cortex-M PendSV 的固定最低优先级切换异�
 
 本篇固定使用 **FreeRTOS-Kernel V11.3.0**，commit `9b777ae5c5b8e9e456065a00294d1e5f5f9facf5`，源码目录为 `portable/GCC/RISC-V`。上游通用 port 运行在 Machine mode；具体 SoC 的中断控制器、timer 地址和附加寄存器由平台扩展提供，不在本文绑定。
 
+## 读汇编前先补齐 ABI 和 CSR 角色
+
+RISC-V 的 `x1/ra` 保存函数返回地址，`x2/sp` 是栈指针，`x10/a0` 既传第一个参数也传返回值；`x5-x7`、`x28-x31` 是临时寄存器，`x8-x9`、`x18-x27` 按 ABI 由被调用者保存。普通 C 函数只需遵守调用约定，但任务可能在任意指令处被 timer interrupt 打断，所以 port 不能只保存“某个函数按 ABI 应保存”的寄存器，而要保存恢复后继续执行所需的完整架构状态。
+
+`mepc`、`mstatus` 和 `mcause` 是 Machine mode CSR。`mepc` 记录 trap 返回位置，`mcause` 说明进入的是异常还是中断，`mstatus` 则包含 MIE/MPIE、MPP 以及可选扩展状态。它们不在通用寄存器数组中，却和通用寄存器同样属于任务能否正确恢复的条件。
+
+上游 port 用 `portContext.h` 的偏移宏把 frame 固定下来。以非 RV32E、暂不启用 FPU/VPU 的 RV32 为例，可以按逻辑区域阅读，而不必先背偏移数值。frame 最前面保存 `mepc` 或首次任务 PC，决定恢复后执行哪条指令；随后是 `portasmADDITIONAL_CONTEXT_SIZE` 个平台扩展槽，数量可以为零；再往后保存 `mstatus`、通用寄存器和每任务 critical nesting。每个区域的大小都参与 `portCONTEXT_SIZE` 计算。
+
+`portasmADDITIONAL_CONTEXT_SIZE` 会改变后续所有槽位位置，所以平台扩展不能只在保存宏中“顺手多压几个寄存器”。初始构造、内部保存和恢复必须使用同一尺寸与同一顺序；否则恢复出的 `mstatus` 可能实际来自某个通用寄存器槽，错误会在 `mret` 时才爆发。
+
 ## context frame 是 port 的核心 ABI
 
 公共内核只要求 TCB 第一个成员保存任务栈顶。RISC-V port 需要自行决定这个栈顶指向怎样的内存布局，并保证三个地方完全一致：
@@ -164,6 +174,12 @@ synchronous_exception:
 异步中断与当前指令没有因果关系，返回后应继续执行原 `mepc`。同步异常由当前指令触发，通用 handler 将返回地址推进 4 字节。FreeRTOS 的 `portYIELD()` 展开为 `ecall`，ecall 是 4 字节同步异常；如果不推进 mepc，恢复后会再次执行同一条 ecall，形成无限 trap。
 
 异常分派把 Machine environment call cause 11 解释为 yield，并调用 `vTaskSwitchContext()`。其他同步异常交给 `freertos_risc_v_application_exception_handler`。因为上游通用入口已经推进返回 PC，平台异常处理代码必须理解这份契约，不能再次重复调整。
+
+用具体地址看同步与异步分支更直观。假设任务在 `0x80001234` 执行 `ecall`，trap 读到的 `mepc` 指向这条 ecall。handler 把保存值加 4，恢复新任务或原任务时从 `0x80001238` 继续；若不加 4，任务会再次执行 ecall 并永久 yield。反过来，timer interrupt 可能在任务正要执行 `0x80001234` 时到来，原指令尚未完成，异步分支必须保存未经修改的 `mepc`，否则会静默跳过一条指令。
+
+保存通用现场后，handler 把 `sp` 切到 `xISRStackTop`，再调用 Tick 或应用中断处理函数。任务 frame 留在任务自己的栈上，ISR 的 C 调用使用独立中断栈；恢复宏最后从 `pxCurrentTCB->pxTopOfStack` 重新取得任务 sp。调试 trap 崩溃时要同时检查“保存后的任务 sp”和“当前 ISR sp”，只看 trap handler 内的 sp 会误把 ISR stack 当成任务栈。
+
+建议在 `freertos_risc_v_trap_handler` 入口记录 `mcause`、`mepc`、任务 sp 和 `xISRStackTop`。在 `processed_source` 前确认 `pxCurrentTCB` 是否变化，再核对目标 frame 中的 PC、mstatus 和 critical nesting。若加了平台寄存器扩展，最后比较 save/restore 两侧使用的 `portasmADDITIONAL_CONTEXT_SIZE` 和每个 slot 偏移；这比只检查汇编能否编译更能发现上下文错位。
 
 ## timer interrupt 与应用 interrupt 共用恢复出口
 

@@ -14,6 +14,32 @@ draft: false
 
 本篇固定使用 **FreeRTOS-Kernel V11.3.0**，commit `9b777ae5c5b8e9e456065a00294d1e5f5f9facf5`，源码目录为 `portable/GCC/ARM_CM4F`。只讨论架构和上游 port，不绑定具体 MCU、开发板、启动文件生成器或厂商库。
 
+## 先理解异常入口替软件做了什么
+
+在普通函数调用中，编译器按 ABI 决定调用者和被调用者分别保存哪些寄存器；在异常入口中，Cortex-M4 硬件会无条件先保存一组固定寄存器。FreeRTOS port 正是利用这个硬件动作，把完整任务现场拆成“硬件自动帧”和“软件补充帧”。如果不知道这一点，看到 PendSV 只保存 R4-R11 时会误以为 R0-R3 被遗漏。
+
+任务通常在 Thread mode 使用 PSP，异常 handler 在 Handler mode 使用 MSP。PSP 属于当前任务，MSP 供 SVC、PendSV、SysTick 等异常处理代码使用。这样 PendSV 在切换任务栈时，自己的 C/汇编调用过程仍有一条独立 MSP，不会把临时数据写进某个任务的 PSP。
+
+假设旧任务进入异常前 `PSP = 0x20001000`，并且没有浮点扩展帧，也没有额外的 8 字节对齐填充。异常硬件依次压入 8 个 32 位字，PSP 变为 `0x20000FE0`：
+
+```text
+高地址 0x20001000  <- 异常前 PSP
+       xPSR
+       PC
+       LR
+       R12
+       R3
+       R2
+       R1
+低地址 R0          <- 异常后 PSP = 0x20000FE0
+```
+
+PendSV 随后执行 `stmdb r0!, {r4-r11, r14}`，再向低地址保存 9 个字：R4-R11 和作为 R14 使用的 EXC_RETURN。新的软件栈顶为 `0x20000FBC`，这个值写入旧 TCB 的第一个字段。以后恢复该任务时，port 从 `0x20000FBC` 先取软件帧，执行异常返回后，硬件再从 `0x20000FE0` 取硬件帧，PSP 最终回到 `0x20001000`。
+
+常见基本帧使用 `EXC_RETURN = 0xFFFFFFFD`：返回 Thread mode、使用 PSP、没有浮点扩展帧。它不是任务函数的 LR，而是一张给处理器异常返回逻辑读取的“返回说明书”。`pxPortInitialiseStack()` 把相同值放进新任务的伪造软件帧，所以首次启动和后续恢复能够共用同一条路径。
+
+若任务执行过浮点指令，EXC_RETURN bit 4 会反映扩展帧存在。硬件负责 S0-S15、FPSCR 等低位浮点现场，PendSV 根据 bit 4 再保存 S16-S31。没有浮点现场的任务不走这段分支，这就是 lazy stacking 能降低普通任务切换开销的前提，而不是“打开 FPU 后所有任务每次都保存全部浮点寄存器”。
+
 ## 一个任务现场由硬件帧和软件帧共同组成
 
 Cortex-M 异常入口会自动把 R0-R3、R12、LR、PC 和 xPSR 压入当前线程栈；异常返回时，硬件再自动弹出这些寄存器。R4-R11 属于被调用者保存寄存器，硬件异常入口不负责它们，FreeRTOS 必须自行保存。
@@ -176,5 +202,9 @@ Cortex-M 的数值优先级越小，紧急度越高。`configMAX_SYSCALL_INTERRU
 [`vPortValidateInterruptPriority()`](https://github.com/FreeRTOS/FreeRTOS-Kernel/blob/V11.3.0/portable/GCC/ARM_CM4F/port.c#L835-L901) 在启用 `configASSERT` 时读取当前中断号和 NVIC 优先级，检查调用 API 的 ISR 是否落在允许范围，并检查 PRIGROUP 没有把本应作为抢占优先级的位分配给 sub-priority。
 
 这里最容易犯的错误是把库函数里的“逻辑优先级”直接填进硬件寄存器，或忘记 FreeRTOS 配置值已经位于实现的高位优先级字段。可靠的验证不是背一个数值，而是读取启动时 port 探测出的优先级位数、当前 IRQ priority、BASEPRI 和 PRIGROUP，确认三者使用同一种编码。
+
+把 `configPRIO_BITS = 4`、`configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY = 5` 代入常见 CMSIS 配置，写入 BASEPRI 的硬件编码通常是 `5 << 4 = 0x50`。逻辑优先级 3 的 IRQ 紧急度更高，不会被 BASEPRI=0x50 屏蔽，因此不能调用 Queue/Semaphore 的 FromISR API；逻辑优先级 6 的 IRQ 会在内核临界区被延迟，但可以调用这些 API。具体项目仍要以 port 的移位宏和 NVIC 实际实现位数为准。
+
+调试切换时可在 `xPortPendSVHandler` 的 `str r0, [r2]` 前后停住：前一刻 `r2` 应是旧 TCB，`r0` 是旧任务保存后的 PSP；单步越过 `vTaskSwitchContext()` 后，`pxCurrentTCB` 应变成新 TCB。再检查新 TCB 第一个字是否指向一份结构完整的软件帧。若 `bx r14` 后 HardFault，优先核对 EXC_RETURN、xPSR 的 Thumb bit、PC 奇偶性和 PSP 对齐，而不是先修改调度器链表。
 
 Cortex-M4 port 的完整契约由这些步骤闭合：任务创建时构造兼容异常返回的初始帧；SVC 用该帧启动首任务；SysTick 只推进时间并 pend PendSV；PendSV 保存旧软件帧、调用公共选择函数、恢复新软件帧；硬件异常入口和返回负责低位寄存器帧。公共内核从未直接操作 PSP、EXC_RETURN 或 BASEPRI，但 port 必须让这些架构状态始终与 `pxCurrentTCB->pxTopOfStack` 对应。
