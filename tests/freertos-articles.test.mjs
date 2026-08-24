@@ -322,6 +322,32 @@ test('interview article derives engineering answers from concrete kernel paths',
   assert.doesNotMatch(body, /\*\*(场景|源码依据|详细回答|回答检查)\*\*/);
   assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据|停止条件)：/m);
 });
+test('refined FreeRTOS series gives beginners concrete source walkthroughs', () => {
+  const framework = readFileSync(frameworkPath, 'utf8');
+  assert.match(framework, /使用过.*xTaskCreate.*Queue.*Semaphore/);
+  assert.match(framework, /贯穿场景/);
+
+  const contracts = [
+    [article1Path, /三个节点[\s\S]+10[\s\S]+20[\s\S]+pxIndex/],
+    [article2Path, /栈深度[\s\S]+StackType_t[\s\S]+不是字节[\s\S]+创建失败[\s\S]+回滚/],
+    [article3Path, /任务 A[\s\S]+任务 B[\s\S]+任务 C[\s\S]+configUSE_TIME_SLICING/],
+    [article4Path, /0x20001000[\s\S]+0xFFFFFFFD[\s\S]+BASEPRI/],
+    [article5Path, /portasmADDITIONAL_CONTEXT_SIZE[\s\S]+xISRStackTop[\s\S]+mepc/],
+    [article6Path, /4 个槽位[\s\S]+0x20002000[\s\S]+cTxLock/],
+    [article7Path, /低优先级任务 L[\s\S]+中优先级任务 M[\s\S]+高优先级任务 H[\s\S]+uxMutexesHeld/],
+    [article8Path, /通知状态机[\s\S]+taskNOT_WAITING_NOTIFICATION[\s\S]+eSetValueWithoutOverwrite/],
+    [article9Path, /长度为 8[\s\S]+xSpace[\s\S]+trigger level/],
+    [article10Path, /daemon 启动[\s\S]+configTIMER_QUEUE_LENGTH[\s\S]+xCommandTime/],
+    [article11Path, /heapSTRUCT_SIZE[\s\S]+1000[\s\S]+xSizeOfLargestFreeBlockInBytes/],
+    [article12Path, /常见错误答案[\s\S]+现场排查顺序/],
+  ];
+
+  for (const [path, contract] of contracts) {
+    const body = readFileSync(path, 'utf8').replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
+    assert.match(body, contract, `${path} is missing its beginner source walkthrough`);
+    assert.doesNotMatch(body, /^(入口条件|执行动作|核心状态变化|可观察证据|停止条件)：/m);
+  }
+});
 test('article prose allows long technical identifiers to wrap on narrow screens', () => {
   const globalCss = readFileSync('src/styles/global.css', 'utf8');
 
