@@ -220,6 +220,29 @@ if( xConstTickCount >= xNextTaskUnblockTime )
 
 解阻塞后是否立即切换由配置和优先级共同决定。打开抢占时，只有新就绪任务优先级高于当前任务，timeout 才直接要求切换；相同优先级轮转由后面的 time slicing 分支处理。`configUSE_PREEMPTION == 1` 且 `configUSE_TIME_SLICING == 1` 时，如果当前优先级 ready list 长度大于一，本次 Tick 也会请求切换。
 
+## 把任务 A、任务 B、任务 C 放进同一条时间线
+
+用三个任务把前面的链表连接起来：任务 A 优先级 3，每 10 Tick 运行一次；任务 B 优先级 2，阻塞等待 Queue；任务 C 优先级 1，空闲时持续处理后台工作。假设当前 Tick 为 100，A 正在运行，B 已经位于 Queue 的接收等待链表，C 位于 ready list。
+
+A 调用 `xTaskDelayUntil(&xLastWakeTime, 10)`，目标 Tick 为 110。内核把 A 的 `xStateListItem.xItemValue` 写成 110，插入当前 delayed list，再从优先级 3 的 ready list 移除。B 仍同时拥有两条索引：`xEventListItem` 在 Queue 的 `xTasksWaitingToReceive`，`xStateListItem` 在 delayed list 表达它的 timeout。此时最高可运行任务只剩 C，所以 `vTaskSwitchContext()` 选择 C。
+
+Tick 104 时，ISR 向 Queue 发送数据。Queue 路径先把 B 的事件节点从对象等待链表移除，再把状态节点从 delayed list 移除。若 scheduler 没有 suspended，B 直接进入优先级 2 ready list；`pxHigherPriorityTaskWoken` 变为 `pdTRUE`，ISR 退出前请求切换，B 抢占 C。B 真正运行后仍要重新检查并接收 Queue 数据，因为“被唤醒”只表示等待条件可能成立，不授予数据所有权。
+
+Tick 到 110 时，`xTaskIncrementTick()` 查看 delayed list 头部，发现 A 到期。它移除 A 的状态节点并放回优先级 3 ready list，更新最高优先级记录，返回需要切换。A 再次成为运行任务。整个过程中没有代码把 TCB 的状态枚举从 Blocked 改成 Ready；所谓状态变化就是节点从 delayed/event list 被移回 `pxReadyTasksLists[3]`。
+
+```mermaid
+flowchart LR
+    A1[A running at Tick 100] -->|delay until 110| AD[A in delayed list]
+    B1[B waiting Queue and timeout] -->|ISR sends at 104| BR[B ready at priority 2]
+    C1[C ready at priority 1] -->|A blocks| CR[C running]
+    CR -->|B wakes| BR
+    AD -->|Tick reaches 110| AR[A ready at priority 3]
+```
+
+如果 A 的优先级队列中还有另一个 ready 任务 A2，是否在每个 Tick 轮转取决于 `configUSE_PREEMPTION` 和 `configUSE_TIME_SLICING`。抢占与时间片都打开时，`xTaskIncrementTick()` 看到当前优先级 ready list 中节点数大于 1，会请求切换；关闭 `configUSE_TIME_SLICING` 后，Tick 不再因为同优先级多任务主动轮转，但任务阻塞、显式 yield 或更高优先级唤醒仍可触发选择。不能把“FreeRTOS 同优先级一定轮转”写成脱离配置的结论。
+
+调试这条时间线时，至少同时观察 `xTickCount`、`pxCurrentTCB`、`uxTopReadyPriority`、`pxReadyTasksLists[1..3]`、`pxDelayedTaskList` 和 Queue 的两条等待链表。单看当前任务名称只能看到结果，看这些链表才知道任务为何有资格或没有资格被选中。
+
 ## scheduler suspended 不等于关闭中断
 
 `vTaskSuspendAll()` 阻止任务切换和任务链表的完整搬迁，但它不承诺关闭全部中断。ISR 仍可能让等待对象的任务满足条件。为了不在 scheduler suspended 期间直接改写 ready list，内核把任务的 `xEventListItem` 临时插入 `xPendingReadyList`，并保留它的状态节点供恢复阶段处理。

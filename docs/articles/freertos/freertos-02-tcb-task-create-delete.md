@@ -114,6 +114,44 @@ sequenceDiagram
 
 无论哪一块分配失败，已经取得的另一块都要立即释放，半成品不会进入初始化函数。两块都成功后，如果静态和动态创建可以同时存在，TCB 会记录 `tskDYNAMICALLY_ALLOCATED_STACK_AND_TCB`；静态路径则记录 `tskSTATICALLY_ALLOCATED_STACK_AND_TCB`。这个标记直到删除时才真正发挥作用。
 
+## 用一个任务把参数、内存和 TCB 对上
+
+假设应用创建一个优先级为 3 的采集任务：
+
+```c
+TaskHandle_t xSensorTask;
+BaseType_t xResult = xTaskCreate(
+    vSensorTask,
+    "sensor",
+    256,
+    &xSensorContext,
+    3,
+    &xSensorTask );
+```
+
+初学者最容易误解的是第三个参数。`uxStackDepth = 256` 的单位是 `StackType_t`，不是字节。以常见的 32 位 port 为例，`sizeof(StackType_t) == 4`，动态路径实际申请 `256 * 4 = 1024` 字节；换到不同位宽或自定义 port 时必须重新以类型大小计算。`configMINIMAL_STACK_SIZE` 也使用相同单位，所以不能把某个工程中的 256 直接理解成通用的 256 字节。
+
+创建开始时，`vSensorTask` 还不是“任务”，它只是函数地址。内核先取得一块 `TCB_t` 和一块栈，把名字、优先级、参数、两个链表节点和初始寄存器帧写进去，最后才加入 ready list。可以把这段过程理解成普通对象构造中的“先完成私有初始化，再发布给并发读者”：一旦 `xStateListItem` 进入 `pxReadyTasksLists[3]`，调度器随时可能恢复它，之后再补字段就已经太晚。
+
+创建失败必须沿已经完成的步骤回滚。以向下增长栈的常见 port 为例，`prvCreateTask()` 先申请栈，再申请 TCB：
+
+```text
+申请 1024 字节 stack 失败
+  -> 没有 TCB，也没有可回收的半成品
+
+stack 成功、TCB 失败
+  -> vPortFreeStack(stack)
+  -> 返回 NULL
+
+stack 和 TCB 都成功
+  -> prvInitialiseNewTask()
+  -> prvAddNewTaskToReadyList()
+```
+
+因此 `xTaskCreate()` 返回 `errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY` 时，不会有一个“创建到一半”的任务留在 ready list。若自定义 `pvPortMallocStack()` 或 allocator，必须保持对应的 `vPortFreeStack()` 语义，否则失败分支首先暴露的不是调度错误，而是内存泄漏。
+
+静态创建只改变内存来源。`StaticTask_t` 和 `StackType_t[256]` 必须比任务活得更久，不能是创建函数的局部变量；内核不会复制它们。调试静态任务时，`ucStaticallyAllocated` 应记录 TCB 和 stack 均由应用拥有，删除后这两块地址仍然存在，但已经不再代表一个可调度对象。
+
 ## prvInitialiseNewTask 把内存变成可恢复的任务
 
 `prvInitialiseNewTask()` 的职责不是把整个 TCB 清零。内存清零发生在创建路径中；初始化函数根据配置和传入参数建立任务必须满足的语义。
@@ -229,5 +267,9 @@ xDeleteTCBInIdleTask = pdTRUE;
 - TCB 与栈都静态提供：两块内存都不释放。
 
 这也是为什么 `ucStaticallyAllocated` 不是“是否静态”的布尔值，而是能区分三种所有权组合的枚举标记。
+
+调试任务生命周期时，可以在 `prvAddNewTaskToReadyList()` 和 `prvDeleteTCB()` 各设一个断点。创建断点处检查 `pxNewTCB->uxPriority == 3`、`pcTaskName == "sensor"`、两个 list item 的 owner 都是 TCB，并确认状态节点尚未或刚刚进入 `pxReadyTasksLists[3]`。自删除后则先看 TCB 是否进入 `xTasksWaitingTermination`，再让 Idle 运行并观察 `uxDeletedTasksWaitingCleanUp` 减一。若计数一直增加，优先检查 Idle 是否长期得不到 CPU，而不是先认定 heap 实现泄漏。
+
+这组观察还区分了“任务已经不可调度”和“任务内存已经释放”：状态节点从 ready/event list 移除时前者已经成立；Idle 调用 `prvDeleteTCB()` 后，动态 TCB 和栈才真正归还 allocator。两者之间存在有意设计的时间差。
 
 从创建到删除，真正保持一致的不是某个 API 返回值，而是对象发布与撤销的顺序：内存先于字段，字段先于初始上下文，完整 TCB 先于 ready list；删除时先撤销链表成员身份，当前任务先切离自己的栈，最后才按所有权释放内存。只要顺序被破坏，即使 TCB 每个字段看上去都正确，系统仍会在并发调度或回收阶段失败。
