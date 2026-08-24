@@ -84,6 +84,27 @@ if( uxSemaphoreCount > 0U )
 
 count 为零且允许等待时，函数 suspend scheduler、lock queue、重新确认仍为空。对象确实为 mutex 时，在把当前任务加入等待链表之前调用 `xTaskPriorityInherit(xMutexHolder)`。顺序很重要：holder 优先级先提升，等待者才阻塞并让出 CPU，调度器随后有机会尽快运行 holder 释放资源。
 
+先放入三个任务观察经典优先级反转。低优先级任务 L 的优先级为 1，它取得 mutex 后开始更新共享设备；中优先级任务 M 的优先级为 2，只做与设备无关的计算；高优先级任务 H 的优先级为 3，随后也要取得同一 mutex。
+
+```mermaid
+sequenceDiagram
+    participant L as 低优先级任务 L
+    participant M as 中优先级任务 M
+    participant H as 高优先级任务 H
+    L->>L: take mutex, uxMutexesHeld=1
+    H->>H: take mutex, 发现 holder=L
+    H->>L: xTaskPriorityInherit 将 L 提升到 3
+    L->>L: 以优先级 3 完成临界资源操作
+    L->>H: give mutex, 唤醒 H
+    L->>L: uxMutexesHeld=0 后恢复基础优先级 1
+```
+
+没有继承时，H 阻塞后 M 可以一直抢占 L，导致 H 等待一个比自己优先级更低、还拿不到 CPU 的任务。继承发生时，`xTaskPriorityInherit()` 保留 L 的 `uxBasePriority == 1`，把当前 `uxPriority` 提升到 3；如果 L 正在 ready list，还必须从优先级 1 链表移到优先级 3 链表。M 因为优先级 2，不能再阻止 L 尽快释放 mutex。
+
+继承不是把 H 的时间片交给 L，也不会让 H 继续运行。H 的状态节点仍在 delayed/event list 中；只是 holder L 获得足够高的调度资格。L give 时 Queue 恢复 token、清空 `xMutexHolder`、减少 `uxMutexesHeld`，再解除 H 的事件等待。只有当 L 已不再持有任何 mutex 时，`xTaskPriorityDisinherit()` 才能完全恢复基础优先级。
+
+多个 mutex 是 FreeRTOS 简化继承模型最需要说明的边界。若 L 同时持有 M1 和 M2，H 等待 M1，即使 L 先释放 M1，只要 `uxMutexesHeld` 仍非零，L 可能继续保持提升后的优先级，直到最后一个 mutex 释放。这会延长 boost，但避免在缺少完整依赖信息时过早降级。它不是 priority ceiling，也不检测死锁；应用仍需统一锁顺序并缩短持锁路径。
+
 ## priority inheritance 会修改 TCB，也可能搬迁 ready list
 
 [`xTaskPriorityInherit()`](https://github.com/FreeRTOS/FreeRTOS-Kernel/blob/V11.3.0/tasks.c#L6648-L6748) 比较 holder 当前优先级与等待任务 `pxCurrentTCB->uxPriority`。holder 更低时，目标是把 holder 临时提升到等待者优先级。
@@ -173,7 +194,11 @@ else
 
 这说明 FreeRTOS priority inheritance 解决的是典型的有界优先级反转，不是完整的 priority ceiling/protection 协议。嵌套多个 mutex、复杂锁顺序和长期 holder 仍需在应用架构中避免。
 
-## recursive mutex 只把同一 owner 的嵌套次数包在外层
+## Binary semaphore 的 count 也可能是 0 或 1，却没有 `xMutexHolder` 和任务所有权。ISR 可以 give，另一个任务可以 take，内核无法也不应该推断“谁必须尽快运行来释放它”。因此用 binary semaphore 保护共享资源不会触发上述继承；反过来，用 mutex 做 ISR 到任务通知则违反 holder 只属于任务上下文的模型。
+
+现场调试时，先在 mutex 对象中查看 `u.xSemaphore.xMutexHolder`，再看 holder TCB 的 `uxBasePriority`、`uxPriority`、`uxMutexesHeld` 和所在 ready list。若 H 已进入 `xTasksWaitingToReceive` 而 holder 优先级没有提升，检查对象是否真由 mutex 创建 API 产生，而不是一个长度为 1 的普通 semaphore。若 holder 永久保持高优先级，则检查是否还有另一个 mutex 未释放，而不要强行改写 `uxPriority`。
+
+recursive mutex 只把同一 owner 的嵌套次数包在外层
 
 [`xQueueTakeMutexRecursive()`](https://github.com/FreeRTOS/FreeRTOS-Kernel/blob/V11.3.0/queue.c#L816-L867) 先检查当前任务是否已经是 holder。是则直接增加 `uxRecursiveCallCount`，不再次消费 token；不是则调用普通 `xQueueSemaphoreTake()`，成功后把递归计数从零增加到一。
 

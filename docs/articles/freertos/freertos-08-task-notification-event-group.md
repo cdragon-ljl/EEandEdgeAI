@@ -29,6 +29,25 @@ Notification 不分配 Queue_t，不维护独立事件链表。等待 notificati
 
 这也是 notification 快速的根本原因：找到目标 TCB 后，只需在一个短临界区中修改 value/state，并在目标确实处于 waiting 时移动一条状态节点。
 
+## 先把 notification 看成 TCB 内的一台通知状态机
+
+每个 notification slot 不只有一个 `ulNotifiedValue`，还有 `ucNotifyState`。状态在 `taskNOT_WAITING_NOTIFICATION`、`taskWAITING_NOTIFICATION` 和 `taskNOTIFICATION_RECEIVED` 之间转换：任务准备阻塞时进入 waiting；发送者提交通知后进入 received；任务消费并离开 wait/take 后回到 not-waiting。value 保存数据，state 解决“数据恰好在检查与阻塞之间到达”的竞态，两者不能混为一个整数。
+
+```mermaid
+stateDiagram-v2
+    [*] --> NotWaiting
+    NotWaiting --> Received: notify arrives
+    NotWaiting --> Waiting: task checks then waits
+    Waiting --> Received: notify arrives and task becomes ready
+    Received --> NotWaiting: wait or take consumes state
+```
+
+`eNotifyAction` 决定 value 如何提交。`eNoAction` 只改变状态；`eSetBits` 对 value 做按位或；`eIncrement` 加一；`eSetValueWithOverwrite` 无条件写新值；`eSetValueWithoutOverwrite` 在旧状态已经是 `taskNOTIFICATION_RECEIVED` 时返回 `pdFAIL`，避免覆盖尚未消费的单个值。这个失败不是内存不足，调用者必须决定重试、丢弃还是改用 Queue。
+
+例如驱动任务等待一次采样完成，ISR 用 `eSetValueWithoutOverwrite` 写入缓冲区序号 7。若任务尚未消费序号 6，第二次发送会失败；改成 overwrite 会保留最新序号 7 但丢掉 6；改成 increment 只能保留“发生两次”，不能携带两个不同 payload。API 选择最终来自数据语义，而不是“notification 比 Queue 快”这一句性能结论。
+
+`xTaskNotifyWait()` 在临界区内先清 entry bits、检查 state，再把 state 设为 waiting；真正加入 delayed list 发生在后续调度保护中。发送若恰好落在两个阶段之间，会把 state 改成 received，使任务不会沉睡到 timeout。阅读 wait 源码时应沿 state 变化判断竞态是否闭合，而不是只看 `ulNotifiedValue` 最终是多少。
+
 ## xTaskGenericNotify 先提交 value/state，再决定是否唤醒
 
 [`xTaskGenericNotify()`](https://github.com/FreeRTOS/FreeRTOS-Kernel/blob/V11.3.0/tasks.c#L7916-L8033) 在 critical section 中保存原 state，把新 state 设为 `taskNOTIFICATION_RECEIVED`，再按 `eNotifyAction` 更新 value：
@@ -233,6 +252,14 @@ pxEventBits->uxEventBits &= ~uxBitsToClear;
 遍历前保存 `pxNext`，因为当前 item 可能在 `vTaskRemoveFromUnorderedEventList()` 中离开 event list 并进入 ready/pending ready；删除后再读 `pxListItem->pxNext` 会跟到另一个容器。
 
 扫描全部 waiter 的执行时间随等待任务数增长，这也是普通 `xEventGroupSetBits()` 不能直接放进 ISR 的原因。
+
+用 Event Group 等待网络状态可以看到共享条件与计数事件的区别。任务 A 等待 `CONNECTED | GOT_IP` 全部成立并要求 clear-on-exit，任务 B 只等待 `CONNECTED` 且不清位。set bits 扫描 waiter list 时，两者都基于同一份更新后快照判断；A 满足后请求清除的 bits 会在扫描结束后统一处理，避免先服务 A 就改变 B 的判断输入。
+
+等待条件被编码进 event-list item value 的高位控制位，低位才是应用事件 bits。可用位数因此取决于 `TickType_t` 宽度，应用不能把 `eventEVENT_BITS_CONTROL_BYTES` 占用的高位当作普通事件。调试时若看到等待节点 value 很大，不要误判为异常 Tick，它可能同时编码 wait-all、clear-on-exit 和目标 bits。
+
+`xEventGroupSetBitsFromISR()` 通过 `xTimerPendFunctionCallFromISR()` 把实际扫描交给 Timer daemon，因为唤醒多少任务是无界的。这里有两个会丢失“这次请求”的显式失败点：`configUSE_TIMERS/INCLUDE_xTimerPendFunctionCall` 必须打开，且 Timer command queue 必须有空槽。FromISR 返回 `pdFAIL` 时 callback 没有入队，不能仍假设 bits 稍后会被设置。
+
+观察这条路径时，同时查看 Event Group 当前 bits、等待链表、Timer command queue 消息数和 daemon 任务状态。bits 没变化且命令队列满，是提交失败；bits 已变化但任务没 ready，才继续检查等待条件编码与 clear 行为。
 
 ## Event Group FromISR 把无界扫描转交 Timer daemon
 

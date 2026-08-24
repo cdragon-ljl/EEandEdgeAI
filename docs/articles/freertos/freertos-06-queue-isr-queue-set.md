@@ -53,6 +53,30 @@ typedef struct QueueDefinition
 
 Queue 的状态因此不能只靠环形指针判断。覆盖写入时消息数可能不变；scheduler suspended 时数据数已经改变，事件链表却还没有同步唤醒；Queue Set 打开时新数据还要向另一个 queue 发布成员句柄。
 
+## 用一个 4 个槽位的 Queue 手算指针移动
+
+假设调用 `xQueueCreate(4, sizeof(uint32_t))`。动态创建路径为 `Queue_t` 加 16 字节数据区准备一块连续内存，再由 `prvInitialiseNewQueue()` 初始化对象。为便于手算，假设数据区 `pcHead = 0x20002000`，那么 4 个槽位起始地址依次为 `0x20002000`、`0x20002004`、`0x20002008`、`0x2000200C`，`pcTail = 0x20002010`。
+
+初始化后 `pcWriteTo == pcHead`，而 `pcReadFrom` 被放到最后一个槽位 `0x2000200C`。这是因为 receive 在复制前先让读指针前进一个 item；第一次接收正好从最后一槽回绕到头部。依次发送 11、22、33 后，内存和指针关系为：
+
+```text
+地址          数据
+0x20002000    11   <- 下一次 receive 先到这里
+0x20002004    22
+0x20002008    33
+0x2000200C    --
+
+pcWriteTo = 0x2000200C
+pcReadFrom = 0x2000200C
+uxMessagesWaiting = 3
+```
+
+第一次 receive 先把 `pcReadFrom` 增加到 `0x20002010`，发现到达 `pcTail` 后回绕到 `pcHead`，再复制出 11。消息数减为 2，但旧字节 11 不会被清零；Queue 的有效性由消息数和指针决定，不由数据区是否还残留旧值决定。调试时看到槽位里有数据，不能据此判断 Queue 非空。
+
+当发送第四个 item 后，`uxMessagesWaiting == uxLength == 4`。第五次非阻塞发送立即返回 `errQUEUE_FULL`；允许等待时才进入 scheduler suspend、queue lock 和事件链表路径。这个具体例子也说明 Queue 的容量没有像 Stream Buffer 那样故意空出一个字节：满与空由独立的 `uxMessagesWaiting` 区分。
+
+创建阶段还要检查乘法和总大小溢出。`uxQueueLength * uxItemSize` 必须能够用 `size_t` 表示，随后还要加上 `sizeof(Queue_t)`；失败时 API 返回 NULL，不能假设“长度很小所以永远成功”。静态创建则由调用者提供 `StaticQueue_t` 和至少 16 字节且生命周期足够长的数据区。
+
 ## 发送快速路径在一个短 critical section 内完成
 
 [`xQueueGenericSend()`](https://github.com/FreeRTOS/FreeRTOS-Kernel/blob/V11.3.0/queue.c#L949-L1164) 使用无限循环统一处理立即成功、等待后重试和 timeout。每一轮先进入短 critical section，重新读取实时队列状态：
@@ -202,5 +226,27 @@ return xReturn;
 ```
 
 返回句柄不等于返回真实数据。调用者还必须对该成员执行 `xQueueReceive()` 或 semaphore take，消费与通知对应的 item/token。Queue Set 解决的是“多个对象里谁可读”，不是把多个数据源合并成一条共享 payload queue。
+
+把“检查队列已满”和“任务真正进入等待链表”画开，就能看到 queue lock 的必要性：
+
+```mermaid
+sequenceDiagram
+    participant T as 发送任务
+    participant Q as Queue
+    participant I as ISR
+    T->>Q: 临界区检查，发现已满
+    T->>T: 退出临界区并 suspend scheduler
+    T->>Q: lock Queue，再次检查
+    I->>Q: ISR receive，数据状态立即改变
+    I->>Q: cRxLock 累计一次事件
+    T->>Q: unlock 时结算等待发送者
+    T->>T: resume scheduler 并重新尝试
+```
+
+如果没有“锁后重查”，ISR 可能恰好在第一次检查之后腾出空间，任务却仍把自己挂进等待链表并睡到 timeout；如果锁 Queue 时完全禁止 ISR 修改数据，又会把中断延迟拉长。FreeRTOS 的折中是让 ISR 继续提交数据指针和计数，只把任务链表操作累计到 `cTxLock/cRxLock`，由 `prvUnlockQueue()` 在 scheduler suspended 的受控窗口结算。
+
+Queue Set 的容量也可以按事件数量手算。一个长度 4 的数据 Queue 和一个最大计数 3 的 counting semaphore 同时加入 set，最坏情况下会产生 4 + 3 = 7 个尚未消费的成员通知，所以 set 长度至少为 7。`xQueueSelectFromSet()` 取走一个成员句柄后，调用者必须立刻从该成员接收数据或 take token；只取句柄不消费成员，会让 set 通知和成员实际可消费数量逐渐失配。
+
+调试 Queue 并发问题时，先记录 `uxMessagesWaiting`、`pcWriteTo`、`u.xQueue.pcReadFrom` 和两条等待链表，再看 `cTxLock/cRxLock`。若数据数已经变化但任务没 ready，问题通常在 lock 结算或 pending-ready；若 `pxHigherPriorityTaskWoken` 已经为真但任务仍未运行，则继续检查 ISR 尾部是否执行 port yield。不要把这三类问题都归结为“Queue 丢数据”。
 
 Queue 的完整并发协议由三层组成：短 critical section 原子提交数据状态，scheduler suspended 窗口安全修改任务等待关系，queue lock 把 ISR 期间无法立即处理的唤醒累计到 unlock。只看环形缓冲代码无法解释为什么不丢唤醒；只看事件链表又无法解释为什么任务恢复后必须重试条件。两部分必须放在同一条 send/receive 循环里理解。
