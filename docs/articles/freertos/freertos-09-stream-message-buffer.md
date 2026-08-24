@@ -41,6 +41,36 @@ typedef struct StreamBufferDef_t
 
 对象只保存一个 `xTaskWaitingToReceive` 和一个 `xTaskWaitingToSend`，没有 Queue 那样的多任务事件链表。源码在登记 waiter 时使用 `configASSERT(handle == NULL)`，这正是 single-reader/single-writer 契约的直接体现。
 
+## 用长度为 8 的环手算可用空间和回绕
+
+Stream Buffer 用 `head == tail` 表示空，因此始终保留一个空字节。假设内部 `xLength` 为 8，可存的用户数据最多是 7 字节。可用空间 `xSpace` 的源码计算等价于：tail 在 head 前面或重合时，先把一个环长加到 tail，再减去 head，最后减去保留字节 1。
+
+```c
+xSpace = xTail;
+if( xTail <= xHead )
+{
+    xSpace += xLength;
+}
+xSpace -= xHead;
+return xSpace - 1U;
+```
+
+设 `xHead = 6`、`xTail = 2`，缓冲中已有位置 2、3、4、5 四个字节。于是 `xSpace = 2 + 8 - 6 - 1 = 3`。writer 写入三个字节 X、Y、Z 时，先在位置 6、7 写 X/Y，再回绕到位置 0 写 Z，完整复制后一次性把 head 提交为 1：
+
+```text
+index:  0 1 2 3 4 5 6 7
+value:  Z . a b c d X Y
+        ^H ^T
+
+xHead = 1, xTail = 2, buffer full, xSpace = 0
+```
+
+这里先复制、后提交 head 很重要。reader 只根据已提交 head 计算可读量；即使 writer 的 memcpy 被中断，reader 也不会看到一半新数据。单 writer 契约保证没有第二个执行者同时从同一个旧 head 计算并覆盖 X/Y/Z。
+
+普通 Stream Buffer 请求发送 5 字节时，此刻最多写 3 字节并返回 3；剩余 2 字节由调用者下次发送。Message Buffer 则要先加 `sbBYTES_TO_STORE_MESSAGE_LENGTH` 长度头，只有“长度头 + 5 字节 payload”全部放得下才提交，否则等待或返回 0。所谓消息原子性来自空间判断和 head 一次提交，不是 memcpy 本身不可中断。
+
+如果 trigger level 为 4，写入后缓冲中累计字节达到 4 才通知阻塞 reader；reader 已在运行时仍可读取当前任意可用字节。trigger level 控制的是何时值得唤醒任务，不把字节流自动切成 4 字节消息。
+
 ## 环形复制分成两段，但 head/tail 只在完整操作后提交
 
 [`prvWriteBytesToBuffer()`](https://github.com/FreeRTOS/FreeRTOS-Kernel/blob/V11.3.0/stream_buffer.c#L1479-L1523) 先计算 head 到缓冲尾部可连续写入的长度：
@@ -211,5 +241,9 @@ Stream 模式没有长度头，receive 直接读取 `min(xBufferLengthBytes, xBy
 头尾索引分属两侧、waiter 只有一个、notification 直接指向唯一任务，这些设计共同换取了比 Queue 更小的对象和更短路径。代价是内核不仲裁多个 writer 或多个 reader。
 
 如果应用确实需要多 writer，可以在所有 send 外使用同一 mutex/critical discipline；多 reader 同理。只保护某一次 memcpy 不够，因为空间检查、等待登记、timeout 重试和 head/tail 提交必须由同一个串行化范围覆盖。
+
+多 writer 场景不能只在 `memcpy` 外加锁。空间计算、登记 `xTaskWaitingToSend`、notification wait、timeout 重试和最终 head 提交必须处于同一串行化协议中；否则 writer A 计算出 3 字节空间后阻塞，writer B 可能用同一空间先提交，A 恢复后仍按旧结果写入。官方 single-writer/single-reader 限制正是为了让 head 和 tail 各只有一个修改者。
+
+调试时同时观察 `xHead`、`xTail`、`xLength`、两个 waiter handle、`ucFlags` 和 notification state。若数据已达到 trigger level 而 reader 未运行，检查 `xTaskWaitingToReceive` 是否已登记以及 completed callback 是否被替换；若 Message Buffer 返回 0 且 tail 不变，先调用 next-message-length API 核对用户接收缓冲是否足够，而不是把它当作空缓冲。
 
 Stream Buffer 与 Message Buffer 的源码差异最终只有两点：是否允许部分写入，以及是否在 payload 前保存长度头。环形复制、notification waiter 和 completed 回调都共享同一实现。理解 head/tail 的提交时机，就能解释消息为什么不会半写、缓冲不足为什么不丢消息，以及 trigger level 为什么只影响唤醒而不改变数据边界。

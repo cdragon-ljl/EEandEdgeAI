@@ -14,6 +14,16 @@ draft: false
 
 本篇固定使用 **FreeRTOS-Kernel V11.3.0**，commit `9b777ae5c5b8e9e456065a00294d1e5f5f9facf5`。只讨论内核 daemon、命令和 Tick 语义，不绑定具体硬件定时器。
 
+## daemon 启动前，内核先准备命令 Queue 和两条时间链表
+
+软件定时器 API 可以在 scheduler 启动前创建 timer，但真正执行 callback 的 `prvTimerTask` 由 `xTimerCreateTimerTask()` 创建。初始化路径先建立 current/overflow 两条 active timer list，再创建长度为 `configTIMER_QUEUE_LENGTH` 的 command queue。所有 start、reset、change-period、stop、delete 和 pended function 都竞争这条 queue。
+
+这解释了一个常见误区：`xTimerStart()` 成功不表示 timer 已经进入 active list，只表示 start 命令成功进入 queue。scheduler 运行后 daemon 消费命令，才根据命令携带的时间计算到期点。若 queue 已满且 block time 为 0，API 返回 `pdFAIL`；FromISR 版本同样只能立即失败，调用者不能丢掉返回值。
+
+假设任务在 Tick 100 对周期 20 的 timer 调用 start，消息中的 `xCommandTime = 100`。daemon 因更高优先级任务繁忙，到 Tick 105 才处理命令，首次到期仍应是 `100 + 20 = 120`，而不是处理时刻加 20 得到 125。这样 command queue 延迟不会悄悄改变应用发出 start/reset 的时间语义。
+
+若当前 Tick 为 `0xFFFFFFF8`，周期为 20，计算出的到期 Tick 为 12，数值看似小于当前 Tick。`prvInsertTimerInActiveList()` 结合 `xCommandTime`、当前 Tick 和到期值判断这是真正的回绕，把 timer 放进 overflow list；Tick 回到 0 后两条 list 交换，它才成为当前周期 timer。只比较两个无符号数大小无法区分“已经过期”和“跨回绕后到期”。
+
 ## Timer_t 保存配置和链表节点，运行状态由 daemon 独占
 
 [`timers.c`](https://github.com/FreeRTOS/FreeRTOS-Kernel/blob/V11.3.0/timers.c#L75-L118) 的 timer 对象包含：
@@ -171,6 +181,12 @@ Start/reset 把 active 标志置位，用“命令时间 + period”计算 expir
 Stop 只清 active 标志，旧 list item 已在 switch 前移除。Change period 更新 period，以 daemon 当前时间为新起点插回 list。Delete 在动态对象上调用 `vPortFree()`，静态 timer 则只清状态，不释放应用存储。
 
 负数 message ID 不表示 timer command，而是 `xTimerPendFunctionCall` 请求。Daemon 从 union 中取得 callback 和两个参数直接调用；Event Group FromISR 的 set/clear 正是通过这条 deferred function 路径把无界扫描移出 ISR。
+
+Auto-reload timer 到期后按上一次到期点加 period，而不是按 callback 执行结束时刻重排。若 daemon 晚了多个周期，`prvReloadTimer()` 可能发现下一个到期点仍在过去，并连续执行 callback 追赶。这样保持长期相位，却也意味着一个慢 callback 会制造更多待执行 callback，进一步阻塞同一 daemon。
+
+所有 timer callback 和 `xTimerPendFunctionCall()` 提交的函数都串行运行在 daemon task。callback 中等待 mutex、执行阻塞 I/O 或长计算，会同时推迟其他 timer、Event Group FromISR deferred set 和后续 command 消费。提高 `configTIMER_TASK_PRIORITY` 不能消除串行阻塞，只会让这个阻塞者更容易抢占业务任务。
+
+调试 timer 延迟时记录 command queue 消息数、`xCommandTime`、当前 Tick、`pxCurrentTimerList/pxOverflowTimerList`、timer 的 list item value 和 daemon task 状态。命令未入队、命令已入队未消费、timer 已在 list 未到期、到期后被前一个 callback 阻塞，是四种不同问题，不能只看 callback 最终有没有执行。
 
 ## Tick 回绕时先处理旧周期剩余 timer，再交换 lists
 

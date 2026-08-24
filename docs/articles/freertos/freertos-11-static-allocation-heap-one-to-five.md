@@ -34,6 +34,22 @@ Task、Queue、Semaphore、Event Group、Timer 和 Stream Buffer 都同时提供
 
 这张表只描述 V11.3.0 文件实际导出的能力，不代表所有 allocator 的实时性能。
 
+## 一次 pvPortMalloc 请求实际占用多少字节
+
+以 32 位指针、`portBYTE_ALIGNMENT = 8` 的常见 heap_4 配置为例，`BlockLink_t` 包含 next 指针和 size，原始大小通常为 8 字节；源码把它向上对齐得到 `xHeapStructSize = 8`。应用请求 1000 字节时，allocator 先加块头得到 1008，已经满足 8 字节对齐，因此 allocated block 总大小是 1008，返回给应用的 payload 仍从 header 后开始，容量为 1000。
+
+若请求 1001 字节，先加 header 得到 1009，再向上对齐为 1016。由此可见 `xPortGetFreeHeapSize()` 的下降量通常大于应用请求值，差额来自 header 和对齐，不等于泄漏。`heapMINIMUM_BLOCK_SIZE` 通常是两个 header 大小；选中块分裂后的 remainder 必须大于这个阈值，否则过小尾巴会留在 allocated block 中。
+
+假设当前只有一个 4096 字节 free block。请求 1000 后，heap_4 取出它，前 1008 字节成为 allocated block，余下 3088 字节构造新 `BlockLink_t` 并按地址插回 free list：
+
+```text
+分配前: [ free 4096 ]
+分配后: [ header | payload 1000 ][ free 3088 ]
+                   total 1008
+```
+
+随后再分配 1000，布局变为两个 1008 字节 allocated block 加一个 2080 字节 free block。先释放第一个块时，它和尾部 free block之间仍隔着第二个 allocated block，不能合并；再释放第二个块，地址有序插入会先和前块、再和后块合并，最终恢复一块 4096 字节区域。合并依赖物理地址连续，不是总 free 数相等就能完成。
+
 ## heap_1 是只能前进的对齐 bump allocator
 
 [`heap_1.c`](https://github.com/FreeRTOS/FreeRTOS-Kernel/blob/V11.3.0/portable/MemMang/heap_1.c#L79-L140) 只有一个 `xNextFreeByte`。每次申请先对齐大小，再判断剩余容量：
@@ -182,5 +198,11 @@ FreeRTOS 工程通常只链接一个 `heap_n.c`，因为五个文件导出同名
 各实现可观测能力不同：heap_1/2 只有总 free；heap_3 没有统一 FreeRTOS 统计；heap_4/5 才提供 minimum-ever 和完整 HeapStats。将只在 heap_4/5 存在的 `vPortGetHeapStats()` 写成通用接口，会在其他实现链接失败。
 
 即使有 HeapStats，也不能用 minimum-ever 代替当前最大连续块。Minimum-ever 只记录历史最低总空闲，largest block 才直接关联一次大申请是否可能成功。长期稳定性分析应同时记录当前 free、minimum-ever、largest block、block count、malloc/free 失败和对象生命周期。
+
+这组块变化也能解释碎片。若 4 KiB heap 中交替分配多个长寿命 256 字节对象和短寿命 256 字节对象，再只释放短寿命对象，总 free 可能不少，却被长寿命对象切成许多小块。申请 1000 字节时，判断依据是 `xSizeOfLargestFreeBlockInBytes`，不是总 free。`vPortGetHeapStats()` 的 free-block count 持续增加而 largest block 持续下降，是外部碎片比单一 minimum-ever 指标更直接的证据。
+
+静态对象则绕过 `pvPortMalloc()`，但没有绕过生命周期。应用提供的 `StaticTask_t`、stack、StaticQueue_t 和 storage 必须保持有效，删除后也要确保没有任务、ISR 或 daemon command 再引用旧 handle 才能复用。`ucStaticallyAllocated` 只告诉内核哪些部分不能 free，不替应用证明复用时机安全。
+
+选择实现时先画对象生命周期：启动后永不删除可考虑 heap_1；尺寸反复变化且需要通用释放通常选 heap_4；跨多个不连续 RAM region 才需要 heap_5；heap_3 的实时性和统计完全取决于 libc。固定尺寸高频对象若对确定性要求严格，应用级 memory pool 可能比在五个通用实现里继续比较更合适。
 
 内存管理的选择最终取决于生命周期，而不是“哪个 heap 最先进”。永不删除可以用最简单 bump；固定尺寸高频对象可能更适合应用专用 pool；需要通用动态释放时 heap_4/5 提供合并；已有成熟 libc allocator 时 heap_3 只是适配层。无论选择哪一个，静态/动态对象所有权和实际链接实现必须在删除路径上保持一致。

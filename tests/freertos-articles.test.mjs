@@ -338,7 +338,7 @@ test('refined FreeRTOS series gives beginners concrete source walkthroughs', () 
     [article8Path, /通知状态机[\s\S]+taskNOT_WAITING_NOTIFICATION[\s\S]+eSetValueWithoutOverwrite/],
     [article9Path, /长度为 8[\s\S]+xSpace[\s\S]+trigger level/],
     [article10Path, /daemon 启动[\s\S]+configTIMER_QUEUE_LENGTH[\s\S]+xCommandTime/],
-    [article11Path, /heapSTRUCT_SIZE[\s\S]+1000[\s\S]+xSizeOfLargestFreeBlockInBytes/],
+    [article11Path, /xHeapStructSize[\s\S]+1000[\s\S]+xSizeOfLargestFreeBlockInBytes/],
     [article12Path, /常见错误答案[\s\S]+现场排查顺序/],
   ];
 
