@@ -15,6 +15,7 @@ const covers = {
   usb: [1919, 820],
   pcie: [1919, 820],
   'video-audio': [1920, 819],
+  'deep-learning': [1672, 941],
 };
 
 function readWebpDimensions(path) {

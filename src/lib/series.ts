@@ -1,4 +1,4 @@
-export type SeriesId = 'cuda' | 'ee-system' | 'freertos' | 'rknn' | 'riscv' | 'fpga' | 'zephyr' | 'bsp' | 'usb' | 'pcie' | 'video-audio';
+export type SeriesId = 'cuda' | 'ee-system' | 'freertos' | 'rknn' | 'riscv' | 'fpga' | 'zephyr' | 'bsp' | 'usb' | 'pcie' | 'video-audio' | 'deep-learning';
 
 export interface SeriesMeta {
   id: SeriesId;
@@ -127,6 +127,16 @@ export const SERIES: Record<SeriesId, SeriesMeta> = {
     label: '多媒体系统',
     cover: { src: '/covers/video-audio.webp', width: 1920, height: 819, alt: '音视频开发实战系列封面' },
   },
+  'deep-learning': {
+    id: 'deep-learning',
+    title: '神经网络与深度学习',
+    shortTitle: 'Deep Learning',
+    description: '从神经网络基础、CNN、RNN 与 Transformer，到视觉、生成、强化学习和 ARM 边缘部署。',
+    accent: 'indigo',
+    href: '/deep-learning/',
+    label: '模型与智能',
+    cover: { src: '/covers/deep-learning.webp', width: 1672, height: 941, alt: '神经网络与深度学习系列封面' },
+  },
 };
 
-export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'freertos', 'rknn', 'riscv', 'fpga', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio'];
+export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'freertos', 'rknn', 'riscv', 'fpga', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio', 'deep-learning'];
