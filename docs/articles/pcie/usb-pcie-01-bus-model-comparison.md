@@ -7,235 +7,68 @@ order: 13
 tags: ["USB", "PCIe", "Linux Driver"]
 draft: false
 ---
-USB 和 PCIe 都是嵌入式 Linux、智能硬件、AI 加速和高速外设开发中常见的总线。但它们的设计思想完全不同。
+USB 和 PCIe 都由主机侧建立拓扑、发现设备并绑定驱动，但它们解决的问题不同。USB 面向可插拔外设和标准 Class，以 Host 调度 endpoint 传输；PCIe 面向内存语义的高速互连，以 Root Complex 路由 TLP、BAR、DMA 和消息中断。
 
-USB 更偏外设接入、即插即用和标准类设备；PCIe 更偏高速互联、资源映射、DMA 和复杂设备控制。理解二者的差异，有助于我们在学习驱动开发时建立清晰的能力边界。
+本篇不重复两条主线细节，而是比较同一个工程问题在两种总线中由什么对象和协议承担。
 
-## 一、USB 和 PCIe 的工程定位
+## Host 与 Root Complex 都是根，但控制粒度不同
 
-USB 的典型场景是：
+USB Host 控制总线时间。Device 不能任意发送事务，Host Controller 根据 control/bulk/interrupt/isochronous endpoint 调度 token。Hub 扩展端口，Device 是树叶。
 
-- 键盘鼠标
-- U 盘
-- USB 摄像头
-- USB 转串口
-- USB 声卡
-- 开发板 gadget
-
-PCIe 的典型场景是：
-
-- SSD
-- 网卡
-- GPU
-- NPU/AI 加速卡
-- FPGA
-- 高速采集卡
-
-可以简单理解：
-
-- USB 解决“外设怎么方便接入”
-- PCIe 解决“高速设备怎么高效互联”
-
-## 二、拓扑结构对比
-
-USB 是 Host 主导的树形拓扑，中间可以有 Hub。
-
-PCIe 是 Root Complex 主导的点对点拓扑，中间可以有 Switch。
+PCIe Root Complex 连接 CPU/内存与 fabric。Link 进入 L0 后，Endpoint 可以作为 requester 发 Memory Read/Write、MSI 等 TLP，Switch 按地址/BDF 路由。RC 不为每个 DMA packet轮询 endpoint。
 
 ```mermaid
 flowchart LR
     subgraph USB
-    U1[Host] --> U2[Hub]
-    U2 --> U3[Device A]
-    U2 --> U4[Device B]
+      UH[Host] --> HUB[Hub]
+      HUB --> UD[Device]
     end
-
     subgraph PCIe
-    P1[Root Complex] --> P2[Switch]
-    P2 --> P3[Endpoint A]
-    P2 --> P4[Endpoint B]
+      RC[Root Complex] --> SW[Switch]
+      SW --> EP[Endpoint]
     end
 ```
 
-两者都由主机侧组织系统，但 USB 更强调设备即插即用，PCIe 更强调资源分配和高速通路。
+两者都支持 hotplug，但 USB 从设计上普遍假设频繁插拔；PCIe hotplug 需要 slot controller、power、PERST#、attention 与 OS 协同，很多嵌入式链路实际固定连接。
 
-## 三、设备识别方式对比
+## 枚举输入：描述符与配置空间
 
-USB 通过描述符识别设备：
+USB Device 通过 EP0 `GET_DESCRIPTOR` 返回变长描述符树，Host 分配 USB address、选择 Configuration，并为 Interface 注册驱动对象。设备功能由 Device/Interface/Endpoint/Class descriptor 表达。
 
-- Device Descriptor
-- Configuration Descriptor
-- Interface Descriptor
-- Endpoint Descriptor
+PCIe function 的 Configuration Space 可由 BDF 访问，包含 VID/DID/Class、BAR 和 Capability。RC/PCI core 递归 bridge、分配 bus number 与 resource，再为 `pci_dev` 匹配驱动。
 
-PCIe 通过配置空间识别设备：
+USB 描述符由 Device 固件在控制传输中返回，可能短包/STALL；PCIe 配置空间由硬件/Endpoint Controller 响应 Configuration TLP。两者都会因格式错误无法绑定，但故障证据完全不同。
 
-- Vendor ID
-- Device ID
-- Class Code
-- BAR
-- Capabilities
+## 数据通道：Endpoint/URB 与 BAR/DMA Queue
 
-这决定了两类驱动的第一步完全不同。
+USB endpoint 是由描述符声明的协议通道。Host driver 构造 URB 交给 usbcore/HCD，控制器按总线调度完成后回调。即使是 USB Device 向 Host 发数据，也要等 Host IN token。
 
-## 四、资源模型对比
+PCIe BAR 是 Host 到设备的 MMIO 窗口，DMA 是 Endpoint 到内存的主动 transaction。高吞吐驱动常用 descriptor ring、doorbell、completion queue 和 MSI-X；设备在获得 DMA 地址后可主动读写。
 
-USB 的核心资源是接口和端点。
+因此 USB “interrupt endpoint”不是 CPU interrupt；PCIe MSI/MSI-X 才是设备通过 Memory Write 触发 IRQ。USB URB buffer 与 PCIe DMA buffer都需要异步生命周期，但 ownership 的调度者不同。
 
-PCIe 的核心资源是 BAR、中断和 DMA。
+## 资源模型：带宽调度与地址空间
 
-| 维度 | USB | PCIe |
-|---|---|---|
-| 识别信息 | 描述符 | 配置空间 |
-| 数据通道 | Endpoint | DMA / MMIO |
-| 控制接口 | Control Transfer | MMIO Register |
-| 中断机制 | Interrupt Transfer 不是 CPU 中断 | INTx / MSI / MSI-X |
-| 典型数据模型 | URB | Descriptor Ring / DMA |
+USB periodic endpoint 受 frame/microframe 带宽、interval 和 max packet约束，Hub/TT 和 Host Controller 参与调度。Bulk 使用剩余带宽，追求可靠但无固定延迟。
 
-## 五、驱动生命周期对比
+PCIe 主要分配 bus number、BAR/bridge window、MSI vector 和 DMA IOVA。性能受 Link width/speed、MPS/MRRS、credit、outstanding 和内存系统影响。它不把每个 endpoint 带宽写成 Host 周期表。
 
-USB 驱动：
+USB 配置错误常见 endpoint/altsetting带宽不足；PCIe 资源错误常见 BAR aperture、MSI vector、DMA mask/IOMMU mapping。
 
-1. 设备插入
-2. 枚举描述符
-3. 匹配 interface
-4. 调用 probe
-5. 解析 endpoint
-6. 提交 URB
-7. disconnect 清理
+## 错误与恢复的基本单位不同
 
-PCIe 驱动：
+USB 可在单个 URB 上报告 STALL、short packet、protocol error，也可 reset endpoint/device；拔出后 interface disconnect、在途 URB 被 shutdown/cancel。
 
-1. 设备上电
-2. 链路训练
-3. 枚举配置空间
-4. 分配 BAR
-5. 匹配 pci_driver
-6. probe 映射资源
-7. 配置 DMA 和中断
-8. remove 清理
+PCIe 通过 Completion Status、AER、Link state、IOMMU fault 和设备 queue status报告。恢复可能是 queue reset、FLR、hot reset、secondary bus reset 或 slot power cycle。
 
-## 六、数据传输模型对比
+USB 类协议常有自己的 reset（如 MSC BOT reset）；PCIe driver 也有设备自定义 reset。总线可靠不替代设备协议恢复。
 
-USB 驱动通常围绕 URB 组织传输；PCIe 驱动通常围绕 DMA ring 和 MMIO doorbell 组织传输。
+## 选择总线看设备行为，不只看峰值带宽
 
-USB 更像“把一个个传输请求提交给总线调度”；PCIe 更像“主机和设备共享队列，设备直接 DMA 搬数据”。
+需要低成本外接、线缆供电、标准 HID/MSC/UVC/UAC、跨 OS 即插即用，USB 更合适。需要低延迟 MMIO、大量主动 DMA、多队列和高带宽板内连接，PCIe 更合适。
 
-## 七、调试工具对比
+MCU 作为 Device/Host 常使用 USB，因为控制器和协议栈资源可控；NPU/FPGA/高速 NIC/SSD 常使用 PCIe。某些设备同时提供 USB 控制/兼容接口和 PCIe 高速数据接口，驱动要定义一致的固件与 reset 协议。
 
-USB 常用：
+## 小结
 
-```bash
-lsusb
-lsusb -v
-lsusb -t
-usb-devices
-usbmon
-dmesg -w
-```
-
-PCIe 常用：
-
-```bash
-lspci
-lspci -vv
-lspci -xxx
-setpci
-cat /proc/interrupts
-dmesg -w
-```
-
-## 八、学习路线建议
-
-如果你从 Linux 驱动入门，USB 更适合先建立“枚举、匹配、端点、传输”的概念；如果你目标是 GPU/NPU/FPGA/高速网卡/SSD 驱动，PCIe、DMA 和 IOMMU 必须深入掌握。
-
-## 九、小结
-
-USB 和 PCIe 都是总线，但它们关注点不同：
-
-- USB：描述符、接口、端点、URB、类驱动、gadget
-- PCIe：配置空间、BAR、MMIO、中断、DMA、IOMMU
-
-二者放在一起学，能帮助我们建立更完整的 Linux 驱动总线视角。
-
-> 🏷️ USB / PCIe / 总线模型 / Linux驱动 / DMA / URB
-
----
-
-## 初学者扩展讲解
-
-
-## 用一条主线区分 USB 和 PCIe
-
-初学者经常把 USB 和 PCIe 都理解成“外设接口”，但在驱动开发里，它们的关注点完全不同。USB 是 Host 主导的外设接入体系，强调描述符、接口、端点和 URB；PCIe 是高速互连体系，强调配置空间、BAR、MMIO、中断、DMA 和 IOMMU。
-
-可以用一个类比理解：USB 更像“外设主动报上自己的功能菜单”，系统读取描述符以后决定让哪个类驱动或厂商驱动接管；PCIe 更像“设备挂在高速总线上，系统给它分配地址窗口和中断资源”，驱动通过寄存器和 DMA 队列与设备协作。
-
-## 为什么两者调试方法差异很大
-
-USB 的第一问题通常是“设备有没有枚举、描述符是否正确、接口有没有绑定驱动、URB 有没有完成”。所以 USB 工具围绕 `lsusb`、`lsusb -v`、`lsusb -t` 和 `usbmon` 展开。你要看的重点是 VID/PID、class/subclass/protocol、endpoint 地址、传输类型、最大包长和 URB 状态。
-
-PCIe 的第一问题通常是“链路有没有起来、配置空间能不能读、BAR 有没有分配、中断有没有触发、DMA 地址是否正确”。所以 PCIe 工具围绕 `lspci`、`lspci -vv`、`setpci`、`/proc/interrupts`、IOMMU 日志和驱动 trace 展开。你要看的重点是链路速率、链路宽度、BAR 地址、MSI/MSI-X、Bus Master、DMA mask 和 IOMMU fault。
-
-## 从驱动入口看差异
-
-USB 驱动的入口常常是 `struct usb_driver`，匹配表是 `struct usb_device_id`，`probe()` 参数是 `struct usb_interface *`。这说明 Linux 往往把 USB 设备的某个接口交给驱动管理，而不是永远把整个设备交给一个驱动。
-
-PCIe 驱动的入口通常是 `struct pci_driver`，匹配表是 `struct pci_device_id`，`probe()` 参数是 `struct pci_dev *`。驱动拿到的是一个 PCIe function，然后申请 BAR、映射 MMIO、设置 DMA 能力、申请中断并初始化设备。
-
-## 从数据通路看差异
-
-USB 数据通路以 URB 为核心。驱动构造 URB，指定 endpoint、buffer、长度和回调，提交给 USB core。USB core 再交给 Host Controller Driver，最后由硬件按 USB 协议调度传输。完成后，驱动在回调中处理结果。
-
-PCIe 数据通路通常以 DMA ring 或 descriptor queue 为核心。驱动分配 DMA buffer 和描述符，把 DMA 地址写入设备寄存器或队列，设备通过 PCIe Memory Transaction 直接访问内存，完成后通过 MSI/MSI-X 通知 CPU。驱动再在中断或轮询路径中回收完成项。
-
-## 初学者如何安排学习顺序
-
-建议先学 USB，再学 PCIe。USB 的描述符和端点模型更容易通过真实设备观察，插拔设备就能看到枚举过程；PCIe 涉及链路训练、配置空间、DMA 和 IOMMU，对硬件平台和内核基础要求更高。但如果目标是 NPU/GPU/网卡/NVMe/采集卡这类高速设备驱动，PCIe 必须深入掌握。
-
-学习时不要只看文章。USB 至少实际观察一次 U 盘、USB 串口或 USB 摄像头；PCIe 至少实际观察一次 NVMe 或网卡的 `lspci -vv` 输出。把命令输出和文章概念对应起来，学习效果会明显提升。
-
-
-## 面向初学者的阅读方法
-
-刚开始学习这类驱动文章时，最容易犯的错误，是把每一个名词都当成孤立知识点去背。实际工程里，驱动不是由名词堆起来的，而是一条从硬件连接、总线枚举、内核匹配、资源申请、数据传输到用户态验证的完整链路。读这一篇时，建议先抓住三件事：第一，这个机制解决什么问题；第二，Linux 内核用什么对象表达它；第三，出现故障时应该从哪一层开始查。
-
-例如看到“枚举”，不要只记住它叫 enumeration，而要理解为：系统需要先发现设备、识别设备能力、给设备分配地址或资源，然后才可能让具体驱动接管。看到“驱动匹配”，也不要只背 `probe()`，而要继续追问：是谁触发 `probe()`？匹配表里放了什么？设备还没有出现时驱动会不会执行？驱动执行以后第一步应该申请什么资源？这些问题连起来，才是真正能在板子上排错的知识。
-
-## 从硬件到软件的完整路径
-
-一条外设链路通常可以分成五层。第一层是硬件层，包括供电、时钟、复位、信号线、连接器和外设本身。第二层是总线层，也就是 USB、PCIe、I2C、SPI 这类协议如何发现设备、传输数据。第三层是内核框架层，Linux 会把设备抽象成 `struct device`、总线对象、驱动对象和资源对象。第四层是具体驱动层，驱动负责把通用框架和具体芯片寄存器、端点、队列、描述符连接起来。第五层是用户态验证层，包括命令行工具、测试程序、日志和性能统计。
-
-初学者排错时不要一上来就怀疑驱动代码。设备没有被系统看到时，驱动代码通常还没有执行；驱动没有绑定时，可能是匹配表或描述符问题；驱动绑定了但不能传输时，才更可能进入 buffer、DMA、中断、同步和协议细节。按照这个顺序排查，可以避免在错误层面浪费时间。
-
-## 建议准备的实验环境
-
-学习 USB/PCIe 驱动，最好准备一台 Linux 主机、一块支持外设扩展的开发板，以及至少一个真实设备。USB 方向可以从 U 盘、USB 串口、USB 摄像头、USB 网卡开始；PCIe 方向可以从 NVMe、PCIe 网卡、PCIe 转串口卡、FPGA PCIe Endpoint 或开发板自带 PCIe 插槽开始。没有 PCIe 硬件时，也可以先通过 `lspci` 观察 PC 上已有设备，理解配置空间、BAR 和驱动绑定。
-
-每次实验都建议记录四类信息：硬件连接照片或说明、内核版本和设备树/配置、关键命令输出、问题现象和解决过程。驱动学习的进步往往不是来自“看懂一段代码”，而是来自反复把现象、日志、源码和硬件状态对应起来。
-
-## 常用观察命令
-
-无论是 USB 还是 PCIe，都建议养成先看系统状态的习惯：
-
-```bash
-uname -a
-dmesg -w
-lsmod
-cat /proc/interrupts
-cat /proc/iomem
-```
-
-`uname -a` 用来确认内核版本；`dmesg -w` 用来实时观察设备插拔、枚举和驱动 probe 日志；`lsmod` 用来看模块是否加载；`/proc/interrupts` 用来看中断是否触发；`/proc/iomem` 可以帮助理解 MMIO 资源分配。不要小看这些基础命令，很多现场问题并不是复杂 bug，而是设备没枚举、驱动没加载、资源没分配或中断没到。
-
-## 初学者最容易混淆的点
-
-第一，不要把“用户态能看到设备节点”等同于“驱动完全正常”。设备节点只说明某个驱动创建了接口，真正的数据通路还要看读写、ioctl、mmap、poll、DMA 和中断是否正常。
-
-第二，不要把“驱动 probe 成功”等同于“硬件已经工作”。probe 成功通常只代表资源申请和初始化基本完成，后续传输仍可能因为时钟、复位、buffer、协议状态或固件问题失败。
-
-第三，不要把“命令没有报错”等同于“性能达标”。高速设备还要统计吞吐、延迟、CPU 占用、内存拷贝次数、DMA 是否真正生效，以及异常恢复是否可靠。
-
-## 推荐的验证闭环
-
-一篇驱动文章学完以后，不建议只停留在阅读层面。至少做一个小闭环：先用命令确认设备存在，再找到它绑定的驱动，然后观察内核日志，再做一次最小读写或传输测试，最后故意制造一个小错误，例如拔掉设备、改错匹配 ID、禁用模块或调整 buffer 数量，观察系统如何报错。只有经历过“正常路径”和“异常路径”，才能真正理解驱动框架为什么这样设计。
+USB Host 与 PCIe Root Complex 都建立主机侧拓扑，但 USB 用描述符、Interface、Endpoint 和 URB 实现 Host 调度的外设接入；PCIe 用配置空间、BAR、TLP、DMA 和 MSI-X 实现内存语义高速互连。比较两者时应围绕枚举、资源、数据所有权、hotplug 和错误恢复，而不是只用“USB 慢、PCIe 快”概括。
