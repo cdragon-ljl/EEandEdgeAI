@@ -221,7 +221,7 @@ test('usb articles include contiguous published frontmatter', () => {
   assert.ok(existsSync(usbDir), 'USB article directory must exist');
   const files = readdirSync(usbDir).filter((file) => file.endsWith('.md'));
 
-  assert.equal(files.length, 9);
+  assert.equal(files.length, 10);
 
   for (const [index, file] of files.sort().entries()) {
     const markdown = readFileSync(join(usbDir, file), 'utf8');
