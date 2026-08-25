@@ -270,3 +270,110 @@ test('fpga framework is a draft planning artifact', () => {
   assert.match(markdown, /^series: fpga$/m);
   assert.match(markdown, /^draft: true$/m);
 });
+
+test('RKNN C++ extension provides the approved six-article sequence', () => {
+  const rknnDir = 'docs/articles/rknn';
+  const frameworkPath = join(rknnDir, 'rknn-cpp-engineering-framework.md');
+
+  assert.ok(existsSync(frameworkPath), 'RKNN C++ framework must exist');
+  const framework = readFileSync(frameworkPath, 'utf8');
+  assert.match(framework, /^series: rknn$/m);
+  assert.match(framework, /^draft: true$/m);
+
+  const articles = [
+    ['rknn-11-cpp-inference-service-skeleton.md', 11],
+    ['rknn-12-cpp-raii-smart-pointer-ownership.md', 12],
+    ['rknn-13-cpp-image-tensor-memory-data-path.md', 13],
+    ['rknn-14-cpp-deployment-api-design.md', 14],
+    ['rknn-15-cpp-concurrent-inference-pipeline.md', 15],
+    ['rknn-16-cpp-profiling-testing-production-skeleton.md', 16],
+  ];
+
+  for (const [file, order] of articles) {
+    const articlePath = join(rknnDir, file);
+    assert.ok(existsSync(articlePath), `missing RKNN C++ article: ${file}`);
+    const markdown = readFileSync(articlePath, 'utf8');
+
+    assert.match(markdown, /^---\r?\n[\s\S]+?\r?\n---\r?\n/);
+    assert.match(markdown, /^series: rknn$/m);
+    assert.match(markdown, new RegExp(`^order: ${order}$`, 'm'));
+    assert.match(markdown, /^draft: false$/m);
+    assert.ok(markdown.split(/\r?\n/).length >= 120, `${file} must be a substantive article`);
+    assert.ok((markdown.match(/^```mermaid$/gm) ?? []).length >= 2, `${file} must include at least two Mermaid diagrams`);
+  }
+});
+
+test('RKNN C++ extension teaches C++ language mechanisms instead of deployment workflow', () => {
+  const rknnDir = 'docs/articles/rknn';
+  const expectations = [
+    ['rknn-11-cpp-inference-service-skeleton.md', 'C++ 对象模型：构造、析构、RAII 与生命周期', /构造函数|析构函数/, /RAII/],
+    ['rknn-12-cpp-raii-smart-pointer-ownership.md', 'C++ 内存管理：new/delete、智能指针与所有权', /std::unique_ptr/, /std::shared_ptr/],
+    ['rknn-13-cpp-image-tensor-memory-data-path.md', 'C++ 值类别与移动语义：拷贝控制、右值与完美转发', /右值/, /std::move/],
+    ['rknn-14-cpp-deployment-api-design.md', 'C++ 泛型编程：模板、类型推导、Lambda 与回调', /模板/, /Lambda/],
+    ['rknn-15-cpp-concurrent-inference-pipeline.md', 'C++ 多线程基础：std::thread、互斥、条件变量与锁', /std::thread/, /条件变量/],
+    ['rknn-16-cpp-profiling-testing-production-skeleton.md', 'C++ 并发进阶：atomic、内存序、生产者消费者与线程池', /std::atomic/, /内存序/],
+  ];
+
+  for (const [file, title, firstConcept, secondConcept] of expectations) {
+    const markdown = readFileSync(join(rknnDir, file), 'utf8');
+    const order = Number(file.match(/^rknn-(\d+)/)?.[1]);
+    assert.ok(markdown.includes(`title: "RKNN 端侧部署实战 · 第${order}期：${title}"`));
+    assert.match(markdown, firstConcept);
+    assert.match(markdown, secondConcept);
+  }
+});
+
+test('RKNN C++ object-model article covers the full lifetime knowledge map', () => {
+  const markdown = readFileSync('docs/articles/rknn/rknn-11-cpp-inference-service-skeleton.md', 'utf8');
+  const concepts = [
+    '对象与存储', '静态存储期', '线程存储期', '自动存储期', '动态存储期',
+    '零初始化', '默认初始化', '值初始化', '直接初始化', '列表初始化', '聚合初始化',
+    '成员初始化列表', '委托构造', '部分构造', '构造函数异常',
+    '虚析构函数', '纯虚析构函数', '对象切片', 'RAII', 'placement new',
+    'std::launder', '三法则', '五法则', '零法则',
+  ];
+
+  for (const concept of concepts) {
+    assert.ok(markdown.includes(concept), `object-model article must explain: ${concept}`);
+  }
+});
+
+test('RKNN C++ memory article covers allocation, ownership, and allocator knowledge map', () => {
+  const markdown = readFileSync('docs/articles/rknn/rknn-12-cpp-raii-smart-pointer-ownership.md', 'utf8');
+  const concepts = [
+    'new 表达式', 'operator new', 'placement new', '对齐', 'std::align',
+    'std::allocator', 'std::pmr', 'monotonic_buffer_resource', 'polymorphic_allocator',
+    '裸指针', 'std::unique_ptr', 'std::shared_ptr', 'std::weak_ptr', '自定义 deleter',
+    'make_unique', 'make_shared', 'aliasing constructor', '所有权环', 'enable_shared_from_this',
+    '悬空指针', 'double free', '内存泄漏', '三法则', '五法则', '零法则',
+  ];
+  for (const concept of concepts) {
+    assert.ok(markdown.includes(concept), `memory article must explain: ${concept}`);
+  }
+});
+
+test('RKNN C++ value-category article covers value, reference, and move knowledge map', () => {
+  const markdown = readFileSync('docs/articles/rknn/rknn-13-cpp-image-tensor-memory-data-path.md', 'utf8');
+  const concepts = [
+    'glvalue', 'lvalue', 'xvalue', 'prvalue', 'rvalue', 'materialization',
+    '左值引用', '右值引用', 'const 左值引用', '引用折叠', '转发引用',
+    '重载决议', 'std::move', 'std::forward', '移动构造函数', '移动赋值运算符',
+    '复制省略', 'guaranteed copy elision', '命名返回值优化', 'noexcept',
+    '完美转发', '悬空引用', 'move_if_noexcept',
+  ];
+  for (const concept of concepts) {
+    assert.ok(markdown.includes(concept), `value-category article must explain: ${concept}`);
+  }
+});
+
+test('RKNN C++ template, threading, and atomic articles cover their full knowledge maps', () => {
+  const expectations = [
+    ['rknn-14-cpp-deployment-api-design.md', ['模板实例化', '两阶段查找', '依赖名', 'typename', 'template 关键字', '显式特化', '偏特化', 'SFINAE', 'std::enable_if', 'std::void_t', 'type traits', 'std::decay', 'Lambda', '泛型 Lambda', 'std::function', '类型擦除']],
+    ['rknn-15-cpp-concurrent-inference-pipeline.md', ['数据竞争', 'happens-before', 'joinable', 'detach', 'recursive_mutex', 'timed_mutex', 'shared_mutex', 'lock_guard', 'unique_lock', 'scoped_lock', 'adopt_lock', 'defer_lock', '条件变量', '虚假唤醒', 'notify_one', 'notify_all', 'std::once_flag', 'std::call_once', 'promise', 'future', 'packaged_task', 'async', '死锁', 'livelock']],
+    ['rknn-16-cpp-profiling-testing-production-skeleton.md', ['std::atomic', 'is_lock_free', 'compare_exchange_weak', 'compare_exchange_strong', '内存序', 'memory_order_relaxed', 'memory_order_consume', 'memory_order_acquire', 'memory_order_release', 'memory_order_acq_rel', 'memory_order_seq_cst', 'synchronizes-with', 'fence', 'false sharing', 'hardware_destructive_interference_size', '生产者消费者', '线程池']],
+  ];
+  for (const [file, concepts] of expectations) {
+    const markdown = readFileSync(join('docs/articles/rknn', file), 'utf8');
+    for (const concept of concepts) assert.ok(markdown.includes(concept), `${file} must explain: ${concept}`);
+  }
+});
