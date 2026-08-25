@@ -7,301 +7,80 @@ order: 9
 tags: ["PCIe", "Linux Driver"]
 draft: false
 ---
-PCIe 驱动能跑起来只是第一步。真正的工程难点在于：高负载下是否稳定、吞吐是否达标、延迟是否可控、异常场景是否能恢复。
+PCIe 性能不是 `Gen × lane` 一个数字。有效吞吐还受到编码、TLP header、Max Payload Size、Max Read Request、credit、outstanding 数、DMA ring、中断、CPU/NUMA 和内存带宽影响；稳定性则由 AER、timeout、reset 和长期资源一致性决定。
 
-这一讲聚焦 PCIe 性能与稳定性优化。
+本篇给出可复用的测量模型，不虚构某块硬件的 benchmark，重点说明每个指标对应哪一层。
 
-## 一、为什么 PCIe 性能优化很重要
+## 先确认实际链路，不用插槽规格代替
 
-PCIe 常用于高带宽设备：
+```bash
+lspci -s BDF -vv | grep -E 'LnkCap|LnkSta'
+```
 
-- 网卡
-- SSD
-- FPGA
-- 图像采集卡
-- AI 加速器
+`LnkCap` 是设备能力，`LnkSta` 是本次协商结果。目标 Gen4 x4 若实际为 Gen3 x1，任何 ring 调优都无法补回物理带宽。降速/降宽应检查拓扑、Switch、插槽 bifurcation、信号、equalization 和 AER。
 
-这些设备往往不满足于“能传数据”，还要求：
+理论 line rate 还要扣除编码与协议开销。小 TLP 的 header/LCRC 比例更高，所以大量几十字节请求远低于大 payload 的效率。
 
-- 高吞吐
-- 低延迟
-- 低 CPU 占用
-- 长时间稳定运行
-- 异常后可恢复
+## Max_Payload_Size 决定写 TLP 的最大数据段
 
-## 二、性能瓶颈通常在哪里
+MPS 由链路路径上设备能力和系统配置共同决定，Device Control 中的当前值可能低于 Device Capability 上限。更大 MPS 减少 header 开销，但增加单包占用与错误重放成本，并要求整个路径支持。
 
-PCIe 性能问题不一定在链路本身，常见瓶颈包括：
+设备 DMA write 4096 字节，在 MPS 256 时至少拆成多个 TLP。驱动通常不直接逐包控制，但硬件 queue/burst 设计与 MPS 会影响吞吐。不要随意通过 setpci 修改生产系统 MPS，错误配置可能破坏拓扑兼容性。
 
-- DMA buffer 太小
-- 中断过于频繁
-- 描述符环设计不合理
-- cache 同步开销大
-- IOMMU 映射频繁
-- CPU 处理线程跟不上
-- 设备内部队列深度不足
-- 内存带宽不足
+## Max_Read_Request 和 outstanding 决定读延迟隐藏能力
 
-## 三、吞吐优化的核心思路
+Memory Read Request 受 Max_Read_Request（MRRS）限制，Completion 还受 RC/bridge 的 completion boundary、MPS 和 credit 影响。单个同步 read 的往返延迟较高，高吞吐设备需要多个 outstanding tag 并行，让链路在等待某个 Completion 时继续工作。
 
-### 1. 批量处理
+MRRS 过小增加请求数量，过大可能占用 credit/内部 buffer 并影响公平性。设备设计应测量 outstanding 深度、Completion latency 和 tag 利用率，而不是只增大 MRRS。
 
-不要每个小包都触发一次完整处理流程。可以通过批量描述符、批量回收、批量提交减少开销。
+## Ring 深度、批处理和 doorbell 决定软件能否喂满硬件
 
-### 2. 增大队列深度
+Ring 太浅会在一次调度延迟内耗尽，设备等待 producer；过深会增加排队延迟并掩盖拥塞。通过 producer/consumer high watermark 和 queue idle time选择深度。
 
-合理增加 descriptor ring 深度，可以提升流水线能力。
+批量填写 descriptor 后一次 `dma_wmb()` 和 doorbell，可减少 MMIO 与 barrier 开销。Completion 也可按 budget 批量回收。每个请求都写 doorbell、每个 completion 都触发 IRQ，会把 CPU 和 PCIe 小事务开销放大。
 
-### 3. 减少中断频率
+吞吐与延迟需要分别测量：中断合并/批量通常提高吞吐但增加尾延迟。至少报告平均、P99、queue depth 和 batch 参数，不能只给最高瞬时带宽。
 
-高吞吐设备通常会做中断聚合，避免 CPU 被中断打爆。
+## MSI-X、affinity 与 NUMA 要按队列布置
 
-### 4. 避免不必要拷贝
-
-能 DMA 直达就不要 CPU 中转。多媒体和 AI 场景尤其要关注零拷贝。
-
-## 四、延迟优化和吞吐优化不总是一回事
-
-吞吐优化常常倾向于批量处理，而延迟优化倾向于更快响应。
-
-例如：
-
-- 中断聚合可以提高吞吐，但可能增加单包延迟
-- 大 buffer 可以减少调度开销，但会增加排队时间
-- 深队列可以提升吞吐，但可能掩盖拥塞
-
-所以优化前必须明确目标：是要低延迟，还是要高吞吐。
-
-## 五、中断优化
-
-MSI-X 可以让不同队列使用不同中断向量，配合 CPU 亲和性减少锁竞争。
-
-可以观察：
+多队列设备让每个 queue 使用 MSI-X vector，并将 IRQ、处理线程和 buffer 绑到同一 NUMA node/CPU，可降低跨核 cache 和远端内存访问。
 
 ```bash
 cat /proc/interrupts
-cat /proc/irq/<irq>/smp_affinity
+cat /sys/bus/pci/devices/BDF/numa_node
+numactl --hardware
 ```
 
-对于高吞吐设备，常见优化包括：
+irqbalance 可能重新分配 affinity，手工 hint 与系统策略要协调。所有 vector 都落到 CPU0 会形成单核瓶颈；盲目分散又会增加共享状态锁竞争。
 
-- 多队列
-- 中断亲和性绑定
-- 中断聚合
-- NAPI 类似思想
-- bottom half 批量处理
+## DMA mapping、IOMMU 和 cache 可能成为软件瓶颈
 
-## 六、DMA 优化
+每个小 buffer 单独 map/unmap 会产生 IOMMU 页表和 IOTLB invalidation；长期 pool、scatter-gather 合并和合理大页可减少成本。SWIOTLB bounce 会额外复制，应通过日志确认。
 
-DMA 优化重点包括：
+零拷贝只有在所有权清晰时才成立。把用户页长期 pin 或 mmap coherent buffer可能降低复制，却增加内存回收、cache 和安全复杂度。性能优化必须同时记录 CPU 占用、内存带宽和 pinned memory。
 
-- 使用合适大小的 buffer
-- 避免频繁 map/unmap
-- 合理选择 coherent 和 streaming DMA
-- 控制 cache 同步开销
-- 正确设置 DMA mask
-- 避免跨 NUMA 或远端内存访问
+## AER 与设备计数器是稳定性的一部分
 
-在嵌入式 SoC 上，还要关注 DDR 带宽和 IOMMU/SMMU 开销。
-
-## 七、稳定性优化
-
-PCIe 设备驱动要长期跑，必须处理异常：
-
-- DMA 超时
-- 中断丢失
-- 链路异常
-- 设备复位
-- 内存不足
-- 用户态异常退出
-
-一个成熟驱动不能只依赖“正常路径”。
-
-## 八、错误恢复机制
-
-建议设计：
-
-- watchdog 检查设备状态
-- DMA 超时检测
-- 队列卡死恢复
-- 设备软复位
-- 中断失效检测
-- 关键状态日志
-
-## 九、如何做性能 profiling
-
-常用工具：
+Advanced Error Reporting（AER）区分 Correctable、Uncorrectable Non-Fatal 和 Fatal。Correctable Error 频率持续增长可能预示链路质量问题，即使业务尚未失败；Fatal/Surprise Down 需要 reset/recovery。
 
 ```bash
-perf top
-perf record
-ftrace
-cat /proc/interrupts
-dmesg -w
+lspci -s BDF -vv | grep -A20 'Advanced Error'
+dmesg | grep -i aer
 ```
 
-你要统计：
+设备驱动还应维护 submitted/completed/timeout/reset、IRQ、ring full、DMA mapping failure 和数据校验错误。压力结束后 producer/consumer、mapping 和 request 数必须收敛，不能只因数据还在流动就认为稳定。
 
-- 中断频率
-- 每次处理耗时
-- DMA 完成间隔
-- 用户态读取速度
-- CPU 占用
-- 数据丢失率
+## 一套可复现的 profiling 顺序
 
-## 十、一个性能分析流程
+1. 固定硬件、固件、内核、CPU governor 和拓扑；
+2. 记录 LnkSta、MPS、MRRS、NUMA 和 IOMMU；
+3. 测量 payload size、queue depth、outstanding、batch、IRQ moderation；
+4. 同时记录吞吐、P99 延迟、CPU、IRQ、内存带宽和错误计数；
+5. 每次只改变一个参数；
+6. 做长时间、冷热 reset、错误注入与并发退出测试。
 
-```mermaid
-flowchart TD
-    A[吞吐不达标] --> B[看链路速率和宽度]
-    B --> C[看 DMA buffer 和 ring 深度]
-    C --> D[看中断频率]
-    D --> E[看 CPU 处理耗时]
-    E --> F[看内存带宽和拷贝]
-    F --> G[定位瓶颈并优化]
-```
+`perf`、ftrace/trace-cmd 和设备 counters 用于定位 CPU/调度；协议 analyzer/硬件 counters 用于 TLP/credit/link。没有分层指标时，调参只能得到偶然结果。
 
-## 十一、常见误区
+## 小结
 
-### 1. 只看 PCIe 理论带宽
-
-理论带宽不等于实际业务吞吐。
-
-### 2. 一味增大 buffer
-
-buffer 太大可能增加延迟和内存压力。
-
-### 3. 中断越多越实时
-
-过多中断会拖垮 CPU。
-
-### 4. 忽略错误恢复
-
-实验室能跑 10 秒，不代表产品能跑 7 天。
-
-## 十二、验证清单
-
-- 链路速率和宽度符合预期
-- DMA 长时间无错误
-- 中断频率可控
-- CPU 占用可接受
-- 高负载下无内存泄漏
-- 异常拔插或复位能恢复
-- 日志足够定位问题
-
-## 十三、小结
-
-PCIe 性能优化要围绕 DMA、队列、中断、CPU 和内存带宽展开。稳定性优化则要围绕超时、恢复、资源释放和长期压力测试展开。
-
-真正成熟的 PCIe 驱动，不只是“能跑”，而是在高负载和异常场景下依然可控。
-
-> 🏷️ PCIe性能 / DMA优化 / MSI-X / 中断聚合 / 稳定性 / profiling
-
----
-
-## 初学者扩展讲解
-
-
-## PCIe 学习中的关键主线
-
-PCIe 的核心主线可以概括为：链路训练、配置空间、资源分配、BAR 映射、中断通知、DMA 搬运。初学者不要一开始就陷入 TLP、DLLP 等协议细节，先把 Linux 驱动真正会接触到的对象搞清楚。
-
-设备上电后，Root Complex 会尝试和 Endpoint 建立链路，这个过程叫链路训练。链路训练成功以后，系统才能扫描配置空间。配置空间里有 Vendor ID、Device ID、Class Code、BAR、Capability 等信息。系统根据这些信息识别设备、分配 MMIO 地址空间、配置中断能力，然后内核 PCI 子系统根据匹配表调用具体驱动的 `probe()`。
-
-如果 `lspci` 看不到设备，通常说明问题还在驱动 probe 之前。此时要优先检查供电、PERST#、REFCLK、lane 连接、Root Complex 配置和设备树。很多初学者会在驱动代码里找半天，但设备根本没有枚举，驱动没有任何机会执行。
-
-## BAR 和 MMIO 要这样理解
-
-PCIe 设备内部有寄存器，但 CPU 不能直接凭空访问这些寄存器。BAR 可以理解为设备向系统声明的一扇窗口：设备说“我需要一段地址空间”，系统分配一个 CPU 可访问的物理地址范围，驱动再把这段范围映射成内核虚拟地址。之后驱动通过 `readl()`、`writel()` 读写这段地址，就相当于访问设备寄存器。
-
-典型流程是：
-
-```c
-pci_enable_device(pdev);
-pci_request_regions(pdev, "demo");
-bar = pci_iomap(pdev, 0, 0);
-value = readl(bar + REG_STATUS);
-writel(0x1, bar + REG_CTRL);
-```
-
-这里每一步都有意义。`pci_enable_device()` 使能设备；`pci_request_regions()` 申请 BAR 资源，避免多个驱动冲突；`pci_iomap()` 建立映射；`readl/writel` 才是真正访问寄存器。不要用普通指针直接访问 MMIO，也不要用 `memcpy` 随便操作寄存器区域。
-
-## DMA、IOMMU 和 cache 一致性
-
-PCIe 高速设备通常不会依赖 CPU 一字节一字节搬数据，而是使用 DMA。DMA 的意思是设备直接读写内存，CPU 只负责准备 buffer、告诉设备地址和长度、等待完成通知。
-
-这里有三个地址概念必须区分：CPU 虚拟地址、CPU 物理地址、设备看到的 DMA 地址。驱动不能把普通虚拟地址直接写给设备，而要通过 DMA API 获取设备可访问地址：
-
-```c
-void *cpu_addr;
-dma_addr_t dma_addr;
-
-cpu_addr = dma_alloc_coherent(&pdev->dev, size, &dma_addr, GFP_KERNEL);
-```
-
-`cpu_addr` 给 CPU 访问，`dma_addr` 给设备访问。如果平台启用了 IOMMU，`dma_addr` 可能是 IOVA，不等于真实物理地址。使用 DMA API 的好处是内核会帮你处理映射、权限和 cache 一致性问题。工程中很多“DMA 写了但 CPU 看不到”“偶发数据错误”“IOMMU fault”，本质都是地址、cache 或生命周期管理出错。
-
-## PCIe 排错的顺序
-
-PCIe 排错建议按下面顺序：
-
-```bash
-lspci
-lspci -vv
-lspci -xxx
-cat /proc/interrupts
-dmesg -w
-```
-
-`lspci` 看设备是否枚举；`lspci -vv` 看 BAR、链路速率、链路宽度、MSI/MSI-X 和驱动绑定；`lspci -xxx` 看配置空间原始内容；`/proc/interrupts` 看中断是否触发；`dmesg` 看驱动日志、AER 错误、IOMMU fault 和 DMA 报错。性能问题还要进一步看 `perf`、ftrace、队列深度、buffer 大小和 CPU 亲和性。
-
-## PCIe 驱动代码阅读建议
-
-阅读 PCIe 驱动时，先看 `pci_device_id` 匹配表，再看 `pci_driver` 结构体。进入 `probe()` 后，重点看是否调用 `pci_enable_device()`、`pci_request_regions()`、`pci_set_master()`、`dma_set_mask_and_coherent()`、`pci_iomap()` 和中断申请函数。随后再看驱动如何创建 DMA 描述符队列、如何启动硬件、如何在中断处理里回收完成项。
-
-一个成熟的 PCIe 驱动不只是能收发数据，还要处理热插拔、错误恢复、DMA 超时、中断丢失、设备复位、IOMMU fault 和长时间压力测试。初学时可以先跑通最小路径，但最终必须理解这些异常路径。
-
-
-## 面向初学者的阅读方法
-
-刚开始学习这类驱动文章时，最容易犯的错误，是把每一个名词都当成孤立知识点去背。实际工程里，驱动不是由名词堆起来的，而是一条从硬件连接、总线枚举、内核匹配、资源申请、数据传输到用户态验证的完整链路。读这一篇时，建议先抓住三件事：第一，这个机制解决什么问题；第二，Linux 内核用什么对象表达它；第三，出现故障时应该从哪一层开始查。
-
-例如看到“枚举”，不要只记住它叫 enumeration，而要理解为：系统需要先发现设备、识别设备能力、给设备分配地址或资源，然后才可能让具体驱动接管。看到“驱动匹配”，也不要只背 `probe()`，而要继续追问：是谁触发 `probe()`？匹配表里放了什么？设备还没有出现时驱动会不会执行？驱动执行以后第一步应该申请什么资源？这些问题连起来，才是真正能在板子上排错的知识。
-
-## 从硬件到软件的完整路径
-
-一条外设链路通常可以分成五层。第一层是硬件层，包括供电、时钟、复位、信号线、连接器和外设本身。第二层是总线层，也就是 USB、PCIe、I2C、SPI 这类协议如何发现设备、传输数据。第三层是内核框架层，Linux 会把设备抽象成 `struct device`、总线对象、驱动对象和资源对象。第四层是具体驱动层，驱动负责把通用框架和具体芯片寄存器、端点、队列、描述符连接起来。第五层是用户态验证层，包括命令行工具、测试程序、日志和性能统计。
-
-初学者排错时不要一上来就怀疑驱动代码。设备没有被系统看到时，驱动代码通常还没有执行；驱动没有绑定时，可能是匹配表或描述符问题；驱动绑定了但不能传输时，才更可能进入 buffer、DMA、中断、同步和协议细节。按照这个顺序排查，可以避免在错误层面浪费时间。
-
-## 建议准备的实验环境
-
-学习 USB/PCIe 驱动，最好准备一台 Linux 主机、一块支持外设扩展的开发板，以及至少一个真实设备。USB 方向可以从 U 盘、USB 串口、USB 摄像头、USB 网卡开始；PCIe 方向可以从 NVMe、PCIe 网卡、PCIe 转串口卡、FPGA PCIe Endpoint 或开发板自带 PCIe 插槽开始。没有 PCIe 硬件时，也可以先通过 `lspci` 观察 PC 上已有设备，理解配置空间、BAR 和驱动绑定。
-
-每次实验都建议记录四类信息：硬件连接照片或说明、内核版本和设备树/配置、关键命令输出、问题现象和解决过程。驱动学习的进步往往不是来自“看懂一段代码”，而是来自反复把现象、日志、源码和硬件状态对应起来。
-
-## 常用观察命令
-
-无论是 USB 还是 PCIe，都建议养成先看系统状态的习惯：
-
-```bash
-uname -a
-dmesg -w
-lsmod
-cat /proc/interrupts
-cat /proc/iomem
-```
-
-`uname -a` 用来确认内核版本；`dmesg -w` 用来实时观察设备插拔、枚举和驱动 probe 日志；`lsmod` 用来看模块是否加载；`/proc/interrupts` 用来看中断是否触发；`/proc/iomem` 可以帮助理解 MMIO 资源分配。不要小看这些基础命令，很多现场问题并不是复杂 bug，而是设备没枚举、驱动没加载、资源没分配或中断没到。
-
-## 初学者最容易混淆的点
-
-第一，不要把“用户态能看到设备节点”等同于“驱动完全正常”。设备节点只说明某个驱动创建了接口，真正的数据通路还要看读写、ioctl、mmap、poll、DMA 和中断是否正常。
-
-第二，不要把“驱动 probe 成功”等同于“硬件已经工作”。probe 成功通常只代表资源申请和初始化基本完成，后续传输仍可能因为时钟、复位、buffer、协议状态或固件问题失败。
-
-第三，不要把“命令没有报错”等同于“性能达标”。高速设备还要统计吞吐、延迟、CPU 占用、内存拷贝次数、DMA 是否真正生效，以及异常恢复是否可靠。
-
-## 推荐的验证闭环
-
-一篇驱动文章学完以后，不建议只停留在阅读层面。至少做一个小闭环：先用命令确认设备存在，再找到它绑定的驱动，然后观察内核日志，再做一次最小读写或传输测试，最后故意制造一个小错误，例如拔掉设备、改错匹配 ID、禁用模块或调整 buffer 数量，观察系统如何报错。只有经历过“正常路径”和“异常路径”，才能真正理解驱动框架为什么这样设计。
+PCIe 性能由实际 Link、MPS/MRRS、TLP/credit、outstanding、ring、doorbell、MSI-X、NUMA、DMA/IOMMU 和内存系统共同决定。稳定性还必须观察 AER、timeout、reset 和资源收敛。下一篇将把这些指标放进故障证据链，从 PERST#/REFCLK 一路排到 IOMMU fault。
