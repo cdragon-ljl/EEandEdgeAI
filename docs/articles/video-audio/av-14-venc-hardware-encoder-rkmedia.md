@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · 音视频开发实战 #14 · VENC 硬编：把 YUV 变成 H.264 码流"
+title: "嵌入式知识体系 · 音视频开发实战 #16 · VENC 硬编：把 YUV 变成 H.264 码流"
 description: "编码原理懂了，现在上真家伙：**VENC（Video Encoder）硬件编码单元**。RV1126 的 VENC 支持 H.264/H.265 硬件编码，4K30 都能扛，几乎不占 CPU。这一篇把 RKMedia VENC 接口讲透：**创建编码器、配置编码参数与码率控制、绑定 VPSS 送帧、回调拿码流、处理 SPS/PPS/IDR**，最后用 FFm"
 pubDate: "2026-08-14"
 series: video-audio
-order: 14
+order: 16
 tags: ["Video & Audio", "Embedded Multimedia"]
 draft: false
 ---

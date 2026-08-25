@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · 音视频开发实战 #11 · 音频采集：从麦克风到 WAV 文件"
+title: "嵌入式知识体系 · 音视频开发实战 #13 · 音频采集：从麦克风到 WAV 文件"
 description: "视频链路已经通了，现在把音频补上。双向语音（对讲）、语音唤醒、声纹识别、环境监听——这些产品都从\"把麦克风的声音读进内存\"开始。这一篇讲透音频采集的完整路径：**声音数字化 → ALSA/tinyalsa 接口 → 环形缓冲 → 电平检测 → 存 WAV**，每一步都有可照抄代码，并附常见问题排查。"
 pubDate: "2026-08-14"
 series: video-audio
-order: 11
+order: 13
 tags: ["Video & Audio", "Embedded Multimedia"]
 draft: false
 ---

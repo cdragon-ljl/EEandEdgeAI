@@ -190,7 +190,7 @@ test('video-audio articles include required frontmatter', () => {
   const videoAudioDir = 'docs/articles/video-audio';
   const files = readdirSync(videoAudioDir).filter((file) => file.endsWith('.md'));
 
-  assert.equal(files.length, 24);
+  assert.equal(files.length, 26);
 
   for (const file of files) {
     const markdown = readFileSync(join(videoAudioDir, file), 'utf8');
@@ -376,4 +376,35 @@ test('RKNN C++ template, threading, and atomic articles cover their full knowled
     const markdown = readFileSync(join('docs/articles/rknn', file), 'utf8');
     for (const concept of concepts) assert.ok(markdown.includes(concept), `${file} must explain: ${concept}`);
   }
+});
+
+test('video-audio orders driver frameworks before application APIs', () => {
+  const dir = 'docs/articles/video-audio';
+  const expected = [
+    ['av-01-av-overview-sampling-to-streaming.md', 1], ['av-02-rv1126-imx415-platform-overview.md', 2], ['av-03-image-basics-yuv-raw-bandwidth.md', 3], ['av-04-v4l2-media-controller-driver-framework.md', 4],
+    ['av-05-sensor-driver-dts-lighting-up-camera.md', 5], ['av-06-rkmedia-vi-mipi-csi-capture.md', 6], ['av-07-isp-pipeline-video-3a-ae-awb-af.md', 7], ['av-08-3a-tuning-practice-scenarios-iq.md', 8], ['av-09-vpss-scaler-crop-multichannel.md', 9], ['av-10-pixel-processing-rgb-yuv-scaler.md', 10],
+    ['av-04-audio-basics-toolchain-first-command.md', 11], ['av-12-alsa-asoc-driver-framework.md', 12], ['av-11-audio-capture-ringbuffer-level-wav.md', 13], ['av-12-audio-3a-aec-ans-agc.md', 14], ['av-13-video-encoding-h264-h265-principles.md', 15], ['av-14-venc-hardware-encoder-rkmedia.md', 16], ['av-15-ffmpeg-cli-deep-dive-filters-transcode.md', 17], ['av-16-ffmpeg-libav-c-api-pipeline.md', 18], ['av-17-audio-encoding-mux-avsync.md', 19], ['av-18-rtp-rtcp-basics-jitter-buffer.md', 20], ['av-19-rtsp-streaming-practice.md', 21], ['av-20-gstreamer-core-pipeline-basics.md', 22], ['av-21-gstreamer-advanced-appsrc-mpp-lowlatency.md', 23], ['av-22-avsync-minimal-player.md', 24], ['av-23-pipeline-engineering-threads-zerocopy.md', 25], ['av-24-final-project-smart-camera.md', 26],
+  ];
+  assert.equal(readdirSync(dir).filter((file) => file.endsWith('.md')).length, 26);
+  for (const [file, order] of expected) {
+    const markdown = readFileSync(join(dir, file), 'utf8');
+    assert.match(markdown, new RegExp(`^order: ${order}$`, 'm'));
+    assert.match(markdown, /^series: video-audio$/m);
+  }
+});
+
+test('V4L2 framework article covers the kernel driver model in depth', () => {
+  const markdown = readFileSync('docs/articles/video-audio/av-04-v4l2-media-controller-driver-framework.md', 'utf8');
+  const concepts = ['v4l2_device_register', 'video_register_device', 'v4l2_fh', 'v4l2_file_operations', 'v4l2_ioctl_ops', 'v4l2_subdev', 'media_entity_pads_init', 'media_create_pad_link', 'async notifier', 'V4L2_SUBDEV_FORMAT_TRY', 'V4L2_SUBDEV_FORMAT_ACTIVE', 'V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE', 'vb2_queue', 'queue_setup', 'buf_prepare', 'buf_queue', 'start_streaming', 'stop_streaming', 'vb2_buffer_done', 'vb2_dma_contig_memops', 'v4l2_ctrl_handler', 'VIDIOC_QUERYCAP', 'VIDIOC_ENUM_FMT', 'VIDIOC_S_FMT', 'VIDIOC_REQBUFS', 'VIDIOC_QBUF', 'VIDIOC_STREAMON', 'VIDIOC_DQBUF', 'runtime PM'];
+  assert.ok(markdown.split(/\r?\n/).length >= 350, 'V4L2 article must be long-form');
+  assert.ok((markdown.match(/^```mermaid$/gm) ?? []).length >= 5, 'V4L2 article must include at least five diagrams');
+  for (const concept of concepts) assert.ok(markdown.includes(concept), `V4L2 article must explain: ${concept}`);
+});
+
+test('ALSA and ASoC framework article covers the kernel driver model in depth', () => {
+  const markdown = readFileSync('docs/articles/video-audio/av-12-alsa-asoc-driver-framework.md', 'utf8');
+  const concepts = ['snd_card_new', 'snd_pcm_new', 'snd_pcm_substream', 'snd_pcm_runtime', 'snd_pcm_hardware', 'snd_pcm_ops', 'snd_pcm_period_elapsed', 'snd_soc_component_driver', 'snd_soc_dai_driver', 'snd_soc_card', 'snd_soc_dai_link', 'snd_soc_register_component', 'devm_snd_soc_register_card', 'snd_dmaengine_pcm_register', 'hw_params', 'set_fmt', 'set_sysclk', 'SND_SOC_DAIFMT_I2S', 'SND_SOC_DAIFMT_CBS_CFS', 'TDM slot', 'DAPM widget', 'DAPM route', 'SOC_SINGLE_TLV', 'regmap', 'runtime PM', 'DPCM', 'underrun', 'overrun', 'xrun'];
+  assert.ok(markdown.split(/\r?\n/).length >= 350, 'ALSA/ASoC article must be long-form');
+  assert.ok((markdown.match(/^```mermaid$/gm) ?? []).length >= 5, 'ALSA/ASoC article must include at least five diagrams');
+  for (const concept of concepts) assert.ok(markdown.includes(concept), `ALSA/ASoC article must explain: ${concept}`);
 });

@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · 音视频开发实战 #19 · RTSP 推流实战：从握手到拉流"
+title: "嵌入式知识体系 · 音视频开发实战 #21 · RTSP 推流实战：从握手到拉流"
 description: "RTP 解决了\"媒体数据怎么运\"，但还差一个\"怎么开始、怎么结束、怎么协商\"的问题——播放器怎么知道看哪路流、用什么编码、走 TCP 还是 UDP？这就是 **RTSP（Real Time Streaming Protocol，实时流协议）** 的职责：**控制信令**。这一篇把 RTSP 讲透：**会话流程（OPTIONS/DESCRIBE/SETUP/P"
 pubDate: "2026-08-14"
 series: video-audio
-order: 19
+order: 21
 tags: ["Video & Audio", "Embedded Multimedia"]
 draft: false
 ---

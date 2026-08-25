@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · 音视频开发实战 #15 · FFmpeg 命令行深度篇：从滤镜链到推流"
+title: "嵌入式知识体系 · 音视频开发实战 #17 · FFmpeg 命令行深度篇：从滤镜链到推流"
 description: "前几篇把视频编码和硬编链路走通了，但你手上拿到的往往是一堆裸流（.h264）、一段原始 YUV、或者一个想转成 mp4 的素材。处理这些\"多媒体琐事\"，FFmpeg 是行业标准工具：转码、裁剪、缩放、加滤镜、截图、推流，一条命令全搞定。这一篇把 FFmpeg 命令行的核心能力讲透：**命令结构、流选择、滤镜链、转码与流拷贝、截图与 GIF、推流、ffprob"
 pubDate: "2026-08-14"
 series: video-audio
-order: 15
+order: 17
 tags: ["Video & Audio", "Embedded Multimedia"]
 draft: false
 ---

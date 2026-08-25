@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · 音视频开发实战 #21 · GStreamer 高级篇：appsrc/appsink 对接自研管线与 RK MPP 硬编"
+title: "嵌入式知识体系 · 音视频开发实战 #23 · GStreamer 高级篇：appsrc/appsink 对接自研管线与 RK MPP 硬编"
 description: "命令行 pipeline 只是 GStreamer 的门面。真实产品里，**GStreamer 必须和你的自研代码对接**：摄像头帧是 RKMedia VI 回调拿到的、NPU 推理结果要叠加到画面、播放端要拿到解码后的帧做 OSD——这些\"外部数据进出 GStreamer\"的接口就是 **appsrc（应用当数据源）** 和 **appsink（应用当数据"
 pubDate: "2026-08-14"
 series: video-audio
-order: 21
+order: 23
 tags: ["Video & Audio", "Embedded Multimedia"]
 draft: false
 ---

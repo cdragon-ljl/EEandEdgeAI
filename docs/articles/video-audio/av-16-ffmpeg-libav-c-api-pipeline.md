@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · 音视频开发实战 #16 · FFmpeg libav* C API：手写一条可运行的转码管线"
+title: "嵌入式知识体系 · 音视频开发实战 #18 · FFmpeg libav* C API：手写一条可运行的转码管线"
 description: "命令行的 FFmpeg 好用，但产品里你往往要**在 C 代码里嵌入转码/解封装/编码能力**：把板端裸流封装成 mp4、把摄像头帧编码后送出去、做 RTSP 客户端解流。这时候就要直接调用 FFmpeg 的库——`libavformat`（封装/解封装）、`libavcodec`（编解码）、`libavfilter`（滤镜）、`libavutil`（工具）"
 pubDate: "2026-08-14"
 series: video-audio
-order: 16
+order: 18
 tags: ["Video & Audio", "Embedded Multimedia"]
 draft: false
 ---

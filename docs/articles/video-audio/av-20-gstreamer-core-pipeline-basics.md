@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · 音视频开发实战 #20 · GStreamer 核心篇：pipeline 是积木，element 是积木块"
+title: "嵌入式知识体系 · 音视频开发实战 #22 · GStreamer 核心篇：pipeline 是积木，element 是积木块"
 description: "FFmpeg 是\"一条命令/一套库解决一切\"的瑞士军刀，但在**需要灵活组合、实时交互、长期运行**的多媒体系统里，GStreamer 是另一条主流路线：它是**基于插件的多媒体框架**，把功能拆成一个个 element（元素），用 pipeline（管道）像积木一样拼起来。这一篇把 GStreamer 核心概念讲透：**element/pad/pipeli"
 pubDate: "2026-08-14"
 series: video-audio
-order: 20
+order: 22
 tags: ["Video & Audio", "Embedded Multimedia"]
 draft: false
 ---

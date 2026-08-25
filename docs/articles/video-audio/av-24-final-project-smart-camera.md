@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · 音视频开发实战 #24 · 综合项目：智能摄像头——从像素到推流的全链路闭环"
+title: "嵌入式知识体系 · 音视频开发实战 #26 · 综合项目：智能摄像头——从像素到推流的全链路闭环"
 description: "这是本系列最后一篇。前面 23 篇分别打通了采集、ISP/3A、像素处理、编码、封装、传输、同步、工程化——现在把它们**全部串起来**，做一个真正可产品化的综合项目：**智能摄像头**。IMX415 采集 → ISP/3A 出画质 → NPU 推理（复用 RKNN 系列能力）→ OSD 叠加 → VENC 编码 → RTSP 推流 + 双向语音（音频 3A"
 pubDate: "2026-08-14"
 series: video-audio
-order: 24
+order: 26
 tags: ["Video & Audio", "Embedded Multimedia"]
 draft: false
 ---

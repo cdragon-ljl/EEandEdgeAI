@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · 音视频开发实战 #18 · RTP/RTCP：实时传输的血液与心跳"
+title: "嵌入式知识体系 · 音视频开发实战 #20 · RTP/RTCP：实时传输的血液与心跳"
 description: "视频编好码、封装成流，下一步就是把它送到网络上。局域网内直接 UDP 裸推也能看，但**跨网络、有抖动、有丢包**时，裸 UDP 很快会花屏、卡顿。真正的流媒体系统用 **RTP（实时传输协议）** 承载媒体数据，用 **RTCP** 反馈质量。这一篇把 RTP/RTCP 讲透：**RTP 头结构、负载格式、时间戳、序列号、RTCP 反馈、抖动与丢包、Wir"
 pubDate: "2026-08-14"
 series: video-audio
-order: 18
+order: 20
 tags: ["Video & Audio", "Embedded Multimedia"]
 draft: false
 ---

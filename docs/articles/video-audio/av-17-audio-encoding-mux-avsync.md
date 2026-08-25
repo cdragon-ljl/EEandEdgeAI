@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · 音视频开发实战 #17 · 音频编码与封装：AAC/Opus、ADTS/MP4 与 PTS/DTS"
+title: "嵌入式知识体系 · 音视频开发实战 #19 · 音频编码与封装：AAC/Opus、ADTS/MP4 与 PTS/DTS"
 description: "前几篇把视频的编码与封装讲透了，但一套完整的 IPC/对讲产品里，**音频和视频必须同步**：画面里的人开口说话，声音不能慢半拍。这一篇把音频的压缩编码（AAC/Opus）、容器封装（ADTS/MP4）、以及**音视频同步的核心机制 PTS/DTS/时间基**讲透，并给出可照抄的 FFmpeg 双轨实验（命令 + C API 片段），让你真正理解\"声画同步\""
 pubDate: "2026-08-14"
 series: video-audio
-order: 17
+order: 19
 tags: ["Video & Audio", "Embedded Multimedia"]
 draft: false
 ---
