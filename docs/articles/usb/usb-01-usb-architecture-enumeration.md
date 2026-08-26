@@ -7,89 +7,426 @@ order: 1
 tags: ["USB", "Linux Driver"]
 draft: false
 ---
-USB 驱动开发的第一道门槛不是某个 API，而是理解一个事实：**USB 总线上的每一次事务都由 Host 安排，Device 只能在被询问或被调度时响应。** Linux 能自动识别 U 盘、摄像头和串口，并不是设备“主动上报了自己”，而是 Host 控制器、hub 驱动和 usbcore 共同完成了一套严格的枚举状态机。
+USB 是嵌入式 Linux 中最常见、也最值得系统学习的一类外设总线。U 盘、摄像头、USB 转串口、网卡、键盘、鼠标、采集卡，很多工程现场都会遇到它。对驱动开发来说，USB 不是“插上能用”这么简单，而是一套完整的体系：总线拓扑、角色分工、描述符、枚举、传输类型、驱动匹配、热插拔，缺一块都容易出问题。
 
-本篇从设备插入开始，沿 EP0 控制传输追到 Linux 创建 `usb_device`、解析描述符、选择配置并注册 `usb_interface`。后续文章中的驱动匹配、URB 和类驱动都建立在这条链路之上。
+这篇先把 USB 的底层地图搭起来。只要把架构和枚举流程吃透，后面再学 Linux USB 驱动框架、URB、描述符、gadget 和问题排查，就会顺很多。
 
-## Host、Device 与 Hub 组成一棵被轮询的树
+## 一、USB 到底是什么
 
-USB 拓扑是一棵树。Root Hub 位于 Host 控制器之上，外部 Hub 继续扩展下游端口，普通 Device 处在叶子节点。Host 维护总线时间、设备地址和传输调度；Hub 负责端口供电、连接变化、复位与速率协商；Device 暴露描述符和 endpoint，并响应 Host 发起的 token。
+USB 的全称是 Universal Serial Bus，中文常叫“通用串行总线”。它表面上是一根线，实际上是一整套协议体系：
 
-这与“设备拉一根中断线通知 CPU”的总线不同。USB 所谓 interrupt transfer 仍由 Host 周期轮询 endpoint，只是调度延迟有上界。设备插入时，Hub 通过端口状态变化让 Host 知道连接发生，后续所有描述符读取和地址分配仍由 Host 发起。
+- 规定谁来发起通信
+- 规定设备如何被识别
+- 规定数据怎么收发
+- 规定设备如何描述自己
+- 规定驱动如何接管设备
 
-低速、全速、高速设备使用不同的电气检测与时序，高速设备还会在复位阶段进行 chirp 握手。Linux 驱动通常不直接处理这些位级细节，但 `lsusb -t` 显示的速率和父端口关系，正是 Host 控制器枚举结果的可见投影。
+USB 的最大特点有三个：
 
-## Device、Configuration、Interface 与 Endpoint 各自回答不同问题
+1. **主机主导**：所有通信都由 Host 发起
+2. **即插即用**：设备插上后会自动被发现和识别
+3. **层次清晰**：Device / Configuration / Interface / Endpoint 层次分明
 
-USB 设备不是一个扁平对象。Device 表示一台物理设备和它的地址；Configuration 表示一整套可选工作配置；Interface 表示一个可独立绑定驱动的功能；Endpoint 才是实际数据通道。
+这也是 USB 和串口、I2C、SPI 这些总线最不同的地方。USB 不是“打开设备文件就直接传数据”，它先要完成一整套枚举流程。
 
-复合设备最能说明这层关系。一台摄像头可能包含 VideoControl、VideoStreaming 和 AudioStreaming 等 interface。Linux 为整台设备创建一个 `struct usb_device`，再为每个 interface 创建 `struct usb_interface`。不同 interface 可以分别绑定 `uvcvideo`、音频或厂商驱动，而设备地址和 EP0 仍由同一个 `usb_device` 共享。
+## 二、USB 系统里的四个核心角色
 
-Endpoint 地址由方向位和端点号组成。IN/OUT 永远从 Host 视角命名：IN 是 Device 到 Host，OUT 是 Host 到 Device。Endpoint 0 双向存在并承担控制传输；其他 endpoint 的类型、最大包长和轮询间隔来自描述符。
+### 1. Host
 
-```mermaid
-flowchart TB
-    H[Host Controller] --> RH[Root Hub]
-    RH --> D[usb_device address 5]
-    D --> C[Configuration 1]
-    C --> I0[Interface 0 CDC control]
-    C --> I1[Interface 1 CDC data]
-    I0 --> EP0[EP0 control]
-    I0 --> EPI[Interrupt IN]
-    I1 --> EPO[Bulk OUT]
-    I1 --> EPIN[Bulk IN]
+Host 是主机，通常是 PC、工控机，或者带 USB Host 控制器的 Linux 开发板。
+
+Host 的职责包括：
+
+- 检测设备插入和拔出
+- 复位端口
+- 发起枚举
+- 读取描述符
+- 分配地址
+- 绑定驱动
+- 调度传输
+
+可以把 Host 理解成 USB 世界里的“总指挥”。
+
+### 2. Device
+
+Device 是外设，例如：
+
+- U 盘
+- USB 摄像头
+- USB 转串口芯片
+- USB 网卡
+- 采集卡
+
+Device 的任务是：
+
+- 响应 Host 的请求
+- 提供自己的描述信息
+- 提供端点
+- 接收和发送数据
+
+### 3. Hub
+
+Hub 是 USB 集线器，把一个上游端口扩展成多个下游端口。
+
+它不只是“接口扩展器”，还负责端口供电、连接状态检测和复位协同。
+
+### 4. Gadget
+
+Gadget 是 USB 设备侧功能的统称。Linux 开发板可以通过 gadget 伪装成：
+
+- 串口
+- 网卡
+- 存储设备
+- 自定义 USB 功能设备
+
+这条线在嵌入式工程里非常实用，因为它能让板子直接通过 USB 和 PC 建立通信，不依赖额外外设。
+
+## 三、USB 设备为什么不是一个“扁平对象”
+
+USB 设备的组织结构是分层的，而不是一个简单的“插入一个设备就完事”。这套分层决定了驱动的设计方式。
+
+### 1. Device
+
+最外层实体。一个 USB 外设插上以后，Host 先把它看成一个设备。
+
+### 2. Configuration
+
+一个设备可以有一个或多个配置。配置描述了设备在某种工作模式下有哪些功能组合。
+
+例如一个复合设备，可能既有串口功能，也有网络功能，不同配置可以暴露不同能力。
+
+### 3. Interface
+
+接口是功能单元。很多 USB 驱动实际接管的就是接口，而不是整个设备。
+
+例如：
+
+- 摄像头可能有视频接口和控制接口
+- 复合设备可能有多个功能接口
+- 一个设备可能包含多个逻辑子功能
+
+### 4. Endpoint
+
+端点是真正的数据通道。Host 和 Device 的数据交换，就是通过端点完成的。
+
+常见方向：
+
+- **IN**：设备向主机发数据
+- **OUT**：主机向设备发数据
+- **Control Endpoint**：控制端点，所有设备都必须有，默认是 0 号端点
+
+你可以把端点理解成“设备内部开出来的几个通信窗口”。
+
+## 四、USB 的四种传输方式
+
+USB 之所以适合各种外设，是因为它支持不同特性的传输方式。
+
+### 1. Control Transfer
+
+控制传输用于初始化、配置和管理。
+
+特点：
+
+- 所有设备都必须支持
+- 用于读取描述符、设置地址、设置配置
+- 数据量小，但语义清晰、可靠
+
+### 2. Bulk Transfer
+
+批量传输适合大数据量场景，例如 U 盘。
+
+特点：
+
+- 适合高吞吐
+- 保证数据正确性
+- 不保证固定时延
+
+### 3. Interrupt Transfer
+
+中断传输适合小数据、低延迟、周期性的场景。
+
+常见设备：
+
+- 键盘
+- 鼠标
+- 部分控制类外设
+
+### 4. Isochronous Transfer
+
+等时传输适合音视频这类对实时性要求高、但允许少量丢包的场景。
+
+常见设备：
+
+- USB 摄像头
+- USB 声卡
+
+它更强调持续性和时序，而不是重传可靠性。
+
+## 五、USB 插上后发生了什么
+
+这是 USB 最关键的过程：**枚举**。
+
+枚举的作用是：让 Host 认识设备、了解设备能力、分配地址、选择配置，并最终决定由哪个驱动接管。
+
+### 枚举的大致步骤
+
+1. 设备插入，Host 检测到电气连接
+2. Host 复位端口
+3. 设备进入默认地址状态
+4. Host 读取设备描述符的一部分
+5. Host 分配一个唯一地址
+6. Host 读取完整设备描述符
+7. Host 读取配置描述符
+8. Host 选择一个配置
+9. Host 绑定合适的驱动
+10. 设备进入正常工作状态
+
+### 为什么这一步重要
+
+因为 USB 驱动不是靠你手工指定设备类型，而是靠描述符和 ID 匹配。
+
+也就是说：
+
+- 设备先告诉系统“我是什么”
+- 系统再决定“谁来驱动我”
+
+这就是 USB 高度标准化的地方。
+
+### EP0 上真正发生的是三阶段控制传输
+
+枚举步骤背后都是 Endpoint 0 控制传输。每次请求先发送 8 字节 Setup packet，包含方向/类型/接收者、`bRequest`、`wValue`、`wIndex` 和 `wLength`；随后是可选 Data 阶段，最后用反方向零长度 Status 阶段确认完成。
+
+`GET_DESCRIPTOR` 用 `wValue` 高字节表示描述符类型、低字节表示索引。Host 首次只取 Device Descriptor 前 8 字节，是为了先得到 EP0 最大包长。`SET_ADDRESS` 的特殊点是 Device 必须等 Status 阶段结束后再切换到新地址，否则 Host 的状态包仍发往地址 0，而设备已经不再响应。
+
+Linux hub 线程检测端口变化、去抖和 reset 后创建 `usb_device`。`usb_new_device()` 继续读取设备/配置描述符、建立字符串和配置对象并注册整台设备；`usb_set_configuration()` 选择配置并创建各 `usb_interface`，driver core 随后才匹配 interface driver。于是可以按状态区分问题：
+
+```text
+没有 connect 日志        -> VBUS / role / PHY / port
+GET_DESCRIPTOR 失败       -> EP0 / 信号 / 固件描述符
+SET_ADDRESS 后消失        -> 地址切换或状态阶段
+lsusb 有设备但无驱动      -> interface / id_table / class
+驱动已绑定但功能失败      -> endpoint / URB / class 协议
 ```
 
-## EP0 控制传输是枚举的语言
+这条 Linux 对象链说明“枚举成功”不是一个模糊结果，而是从地址 0 到 `usb_device`、再到已配置 `usb_interface` 的连续发布过程。
 
-控制传输由 Setup、可选 Data、Status 三个阶段组成。Setup packet 固定 8 字节，包含 `bmRequestType`、`bRequest`、`wValue`、`wIndex` 和 `wLength`。方向、请求类型和接收者都编码在 `bmRequestType` 中。
+## 六、枚举过程中最重要的几类描述符
 
-标准请求 `GET_DESCRIPTOR` 用 `wValue` 的高字节指定描述符类型、低字节指定索引；`SET_ADDRESS` 把新地址放在 `wValue`；`SET_CONFIGURATION` 选择配置值。Status 阶段方向与 Data 阶段相反，用零长度包确认请求已经完成。
+这一篇先不逐字段展开，只建立整体理解。
 
-地址 0 是默认地址。新设备复位后只能在地址 0 响应 EP0，因此 Host 必须串行完成地址分配。Device 在收到 `SET_ADDRESS` 的 Setup 后不能立刻切换地址，而要等 Status 阶段成功结束；否则 Host 发出的状态包和 Device 使用的地址会错开。
+### 1. Device Descriptor
 
-## 枚举不是一组命令，而是一条状态迁移
+描述设备的基础身份信息，例如：
 
-典型枚举主线如下：
+- USB 版本
+- Vendor ID
+- Product ID
+- 设备类信息
+- 最大包长
 
-```mermaid
-sequenceDiagram
-    participant Hub
-    participant Core as Linux usbcore
-    participant Dev as USB Device EP0
-    Hub->>Core: port connect change
-    Core->>Hub: debounce and port reset
-    Core->>Dev: GET_DESCRIPTOR first bytes at address 0
-    Dev-->>Core: EP0 max packet size
-    Core->>Dev: SET_ADDRESS
-    Dev-->>Core: status stage then use new address
-    Core->>Dev: GET_DESCRIPTOR device full
-    Core->>Dev: GET_DESCRIPTOR configuration tree
-    Core->>Dev: SET_CONFIGURATION
-    Core->>Core: create interfaces and match drivers
-```
+### 2. Configuration Descriptor
 
-第一次只读取 Device Descriptor 前几个字节，是为了先得到 EP0 最大包长。Host 控制器必须用正确包长继续控制传输。分配地址后，usbcore 读取完整 Device Descriptor、配置头和 `wTotalLength` 指定的整棵配置描述符，再决定配置。
+描述设备的配置模式，包括：
 
-在 Linux 中，Hub 线程处理端口变化并分配 `usb_device`。`usb_new_device()` 继续完成设备级描述符读取、字符串和配置解析、授权与设备注册。选定配置后，`usb_set_configuration()` 为各 interface 建立对象并注册到 driver core，USB interface driver 才有机会匹配并进入 `probe()`。
+- 有多少接口
+- 总功耗
+- 配置值
 
-因此 `lsusb` 已能看到 VID/PID，但功能驱动没有绑定，说明设备级枚举已经完成，问题更可能位于 interface 描述符、匹配表或模块；如果连 Device Descriptor 都读不稳，驱动 `probe()` 根本不会执行。
+### 3. Interface Descriptor
 
-## 枚举失败要按最后一个成功状态定位
+描述某个功能接口，例如视频接口、存储接口、串口接口。
 
-反复出现 `device descriptor read/64, error -71`，通常说明控制传输协议或信号完整性失败；地址分配后消失可能涉及电气、EP0 包长或 Device 固件切址时机；配置读取失败则应检查 `wTotalLength`、各 `bLength` 和实际返回字节数。
+### 4. Endpoint Descriptor
 
-建议同时观察：
+描述某个接口下的端点，以及端点方向、类型、最大包长等。
+
+### 5. String Descriptor
+
+描述字符串信息，例如厂商名、产品名、序列号。
+
+## 七、Linux 里怎么看 USB 枚举
+
+学 USB 不能只看概念，必须能在系统里把它“看见”。
+
+### 常用命令
 
 ```bash
-dmesg -w
+lsusb
+lsusb -v
 lsusb -t
-lsusb -v -d vid:pid
+dmesg -w
+usb-devices
 cat /sys/kernel/debug/usb/devices
 ```
 
-`dmesg` 给出失败阶段和 errno；`lsusb -t` 给出拓扑、速度与驱动；`lsusb -v` 让描述符层次可见；debugfs 设备表可以核对设备地址、配置和 interface。需要包级证据时再进入 usbmon，而不是在设备尚未获得地址时先分析类协议。
+### 重点观察什么
 
-## 小结
+- 设备是否被识别
+- Vendor ID / Product ID 是否正确
+- 接口和端点是否正常出现
+- 驱动是否绑定成功
+- 有没有超时、枚举失败、端点错误等日志
 
-USB 枚举的核心是 Host 通过 EP0 逐步把一个“地址 0 的未知响应者”变成 Linux 中已配置、可匹配 interface 驱动的对象。Device/Configuration/Interface/Endpoint 是不同层次，`GET_DESCRIPTOR`、`SET_ADDRESS` 和 `SET_CONFIGURATION` 是状态迁移的关键请求，`usb_new_device()` 则连接了总线枚举与 Linux driver core。下一篇将继续追踪 interface driver 如何匹配、probe，以及设备拔出时为何必须先阻止新的异步 I/O。
+### 一个常见现象
+
+插入 USB 设备后，`dmesg` 可能会看到类似：
+
+```text
+usb 1-1: new high-speed USB device number 4 using xhci_hcd
+usb 1-1: New USB device found, idVendor=xxxx, idProduct=yyyy
+usb 1-1: New USB device strings: Mfr=1, Product=2, SerialNumber=3
+usb 1-1: Product: xxx
+usb 1-1: Manufacturer: yyy
+```
+
+这说明设备完成了基本枚举。
+
+## 八、一个最小化的枚举理解模型
+
+可以把 USB 枚举理解成下面这个流程：
+
+```mermaid
+flowchart TD
+    A[插入 USB 设备] --> B[Host 检测到连接]
+    B --> C[端口复位]
+    C --> D[读取 Device Descriptor]
+    D --> E[分配地址]
+    E --> F[读取完整描述符]
+    F --> G[选择 Configuration]
+    G --> H[解析 Interface 和 Endpoint]
+    H --> I[匹配驱动]
+    I --> J[设备进入工作状态]
+```
+
+这张图虽然简单，但它是后面所有 USB 驱动理解的基础。
+
+## 九、实际硬件上怎么验证
+
+USB 不能只在纸面上学，必须在硬件上看见它。
+
+### 实验 1：插一个 U 盘
+
+观察：
+
+```bash
+lsusb
+lsblk
+dmesg -w
+```
+
+你会看到设备被识别成存储设备，并出现块设备节点。
+
+### 实验 2：插一个 USB 转串口芯片
+
+观察：
+
+```bash
+ls /dev/ttyUSB*
+dmesg -w
+```
+
+你会看到系统加载串口驱动，并生成字符设备节点。
+
+### 实验 3：插一个 USB 摄像头
+
+观察：
+
+```bash
+lsusb
+v4l2-ctl --list-devices
+dmesg -w
+```
+
+你会看到视频设备节点出现，后续可以进一步做采集测试。
+
+### 实验 4：让开发板做 gadget
+
+如果你的板子支持 USB Device 模式，可以尝试：
+
+- USB 串口 gadget
+- USB 网卡 gadget
+
+这一步特别适合嵌入式开发，因为它能让板子不依赖复杂外设就和 PC 建立稳定通信。
+
+## 十、USB 枚举失败通常看什么
+
+常见故障一般集中在以下几类：
+
+### 1. 供电问题
+
+设备根本没上电，或者电流不足。
+
+现象：
+
+- 插入后无反应
+- `dmesg` 没有新设备日志
+
+### 2. 线材或接口问题
+
+USB 线只接通了供电，数据线没通，或者接触不良。
+
+现象：
+
+- 能亮灯，但不能识别
+- 时好时坏
+
+### 3. 描述符异常
+
+设备返回的描述符不符合规范。
+
+现象：
+
+- 枚举到一半失败
+- `lsusb -v` 报错
+- 驱动无法绑定
+
+### 4. 驱动不匹配
+
+设备已经枚举成功，但没有合适驱动接管。
+
+现象：
+
+- 能看到设备 ID
+- 但功能不可用
+
+### 5. 带宽或传输问题
+
+比如摄像头、声卡这类高数据量设备，如果总线带宽不够，可能出现掉帧、卡顿、超时。
+
+## 十一、应该如何建立 USB 的学习脑图
+
+建议记住这条主线：
+
+**设备插入 → Host 检测 → 端口复位 → 读取描述符 → 分配地址 → 选择配置 → 绑定驱动 → 开始传输**
+
+这条链路就是 USB 的骨架。
+
+只要骨架清楚了，后面再学：
+
+- Linux USB 驱动框架
+- URB
+- endpoint
+- gadget
+- 类驱动
+- 调试排查
+
+都会顺很多。
+
+## 十二、小结
+
+这一讲先把 USB 的整体地图搭起来。
+
+你现在应该已经知道：
+
+- USB 是 Host 主导的总线
+- USB 设备有 Device / Configuration / Interface / Endpoint 的层次
+- 枚举是 USB 驱动世界的第一件大事
+- 描述符是系统认识设备的依据
+- Linux 里可以通过 `lsusb`、`dmesg`、`usb-devices` 观察枚举过程
+- 实际硬件实验对理解 USB 非常重要
+
+下一讲我们会进入 Linux USB 驱动框架，看看 `struct usb_driver`、`probe()`、`disconnect()`、`id_table` 这些核心接口到底怎么工作。
+
+> 🏷️ USB驱动 / 枚举 / 描述符 / 接口 / 端点 / Host / Gadget / Linux驱动
+
+---

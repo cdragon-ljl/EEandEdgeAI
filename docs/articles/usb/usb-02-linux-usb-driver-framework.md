@@ -7,109 +7,360 @@ order: 2
 tags: ["USB", "Linux Driver"]
 draft: false
 ---
-设备完成枚举后，Linux 还需要决定由哪个驱动管理每个 interface，并把 Host 控制器提供的传输能力转换成驱动可使用的 API。理解这条路径需要同时看四层：Host Controller Driver、usbcore、hub 驱动和 USB interface driver。
+上一讲我们把 USB 的整体架构和枚举流程搭起来了。这一讲进入真正的驱动开发核心：**Linux USB 驱动框架**。
 
-本篇不把 `probe()` 当作孤立入口，而是沿对象注册、匹配、私有状态和 disconnect 回收解释一个 Linux USB 驱动的完整生命周期。
+如果说上一讲解决的是“系统怎么认识一个 USB 设备”，这一讲解决的就是“内核怎么把这个设备交给正确的驱动，以及驱动怎么接管它”。USB 驱动不是简单的字符设备包装，也不是 platform 驱动那种“设备树节点对上就行”的模型，它的关键在于：**先匹配，再探测，再建立端点和传输通路**。
 
-## HCD、usbcore 与 hub 驱动分别负责什么
+## 一、USB 驱动的核心思路
 
-Host Controller Driver 把 xHCI、EHCI、DWC2 等硬件队列和寄存器适配为通用 HCD 接口。它向 usbcore 注册 root hub，并负责把 URB 转成控制器可执行的传输描述符。usbcore 管理 `usb_device`、`usb_interface`、配置、URB 和通用 API；hub 驱动监控端口状态、执行复位和枚举。
+USB 设备插入后，Linux 内核会先完成枚举，解析出设备的 Vendor ID、Product ID、类信息和接口信息，然后在已注册驱动中寻找匹配项。匹配成功后，内核才会调用驱动的 `probe()`。
 
-具体 USB interface driver 位于最上层。它不直接访问 Host 控制器寄存器，只取得已经解析好的 interface 和 endpoint，通过 URB 请求传输。这个分层让同一个 USB 串口驱动可以运行在 xHCI PC、EHCI SoC 或 DWC2 开发板上。
+所以 USB 驱动最核心的两个回调是：
 
-```mermaid
-flowchart TB
-    APP[User space] --> CLASS[USB interface or class driver]
-    CLASS --> CORE[usbcore URB and device model]
-    CORE --> HCD[Host Controller Driver]
-    HCD --> HC[USB controller hardware]
-    CORE --> HUB[hub driver]
-    HUB --> PORT[Root or external hub ports]
-```
+- `probe()`：设备绑定成功时调用
+- `disconnect()`：设备拔出或解绑时调用
 
-## `struct usb_driver` 描述的是 interface driver
+这两个回调构成了 USB 驱动最重要的生命周期。
 
-典型驱动注册对象如下：
+## 二、USB 驱动为什么和其他驱动不一样
+
+和 platform 驱动相比，USB 驱动的对象不是固定物理地址，而是一个被枚举出来的接口对象。和字符设备相比，USB 驱动不是天然就有 `open/read/write` 入口，它往往先通过内核 USB core 完成匹配，再决定如何把数据通路暴露给用户态。
+
+换句话说，USB 驱动开发要同时理解三层逻辑：
+
+1. **总线匹配**：怎么找到正确设备
+2. **接口解析**：怎么找到正确接口和端点
+3. **传输实现**：怎么把数据稳定传起来
+
+## 三、Linux USB 驱动的基本结构
+
+一个最小 USB 驱动通常围绕 `struct usb_driver` 定义：
 
 ```c
-static const struct usb_device_id demo_ids[] = {
+static const struct usb_device_id xxx_table[] = {
     { USB_DEVICE(0x1234, 0x5678) },
     { }
 };
-MODULE_DEVICE_TABLE(usb, demo_ids);
+MODULE_DEVICE_TABLE(usb, xxx_table);
 
-static struct usb_driver demo_driver = {
-    .name       = "demo_usb",
-    .id_table   = demo_ids,
-    .probe      = demo_probe,
-    .disconnect = demo_disconnect,
+static int xxx_probe(struct usb_interface *interface,
+                     const struct usb_device_id *id)
+{
+    return 0;
+}
+
+static void xxx_disconnect(struct usb_interface *interface)
+{
+}
+
+static struct usb_driver xxx_driver = {
+    .name       = "xxx_driver",
+    .probe      = xxx_probe,
+    .disconnect = xxx_disconnect,
+    .id_table   = xxx_table,
 };
 
-module_usb_driver(demo_driver);
+module_usb_driver(xxx_driver);
 ```
 
-`module_usb_driver()` 最终使用 `usb_register_driver()` 把 `struct usb_driver` 注册到 USB bus。driver core 对已存在和后续出现的 `usb_interface` 执行匹配。`USB_DEVICE()` 匹配设备 VID/PID，但传给 `probe()` 的对象仍是命中的 interface；使用 class/subclass/protocol 匹配时更能看出 interface 粒度。
+这段骨架背后有几个关键点：
 
-一个复合设备可能有多个 interface，其中只有一个命中当前 `id_table`。驱动不能假设 `interface 0` 或整台设备都归自己管理，应从 `intf->cur_altsetting` 取得当前 alternate setting 和 endpoint 描述符。
+- `id_table` 负责告诉内核“我能匹配谁”
+- `probe()` 负责“设备来了以后我怎么接管”
+- `disconnect()` 负责“设备走了以后我怎么收尾”
 
-## 从匹配到 probe 的对象关系
+## 四、id_table 是什么
 
-`probe(struct usb_interface *intf, const struct usb_device_id *id)` 被调用时，设备已经配置，interface 已注册，但驱动资源尚未建立。常见顺序是：
+`id_table` 可以理解为 USB 驱动的身份证匹配表。
 
-1. 通过 `interface_to_usbdev(intf)` 取得共享的 `usb_device`；
-2. 解析当前 alternate setting 和 endpoint；
-3. 分配私有对象、缓冲区和 URB；
-4. 必要时增加 `usb_device` 或 interface 引用；
-5. 注册字符设备、input、netdev 或其他上层接口；
-6. 用 `usb_set_intfdata()` 把私有对象绑定到 interface。
+### 1. 按 Vendor / Product 匹配
 
-失败必须按相反顺序撤销。没有注册成功的资源不能交给 disconnect 重复释放，已增加的引用必须 `usb_put_dev()`。使用 managed API 可以减少部分回滚代码，但异步 URB 和用户打开引用仍需要驱动明确管理。
-
-## disconnect 与 I/O 并发才是生命周期难点
-
-拔出设备后，usbcore 先阻止新的 driver binding，再调用 `disconnect()`。但是用户线程、workqueue 和 URB completion 可能仍持有私有对象。安全顺序通常是：
+最常见的写法是：
 
 ```c
-static void demo_disconnect(struct usb_interface *intf)
+{ USB_DEVICE(0x1234, 0x5678) }
+```
+
+这表示这个驱动只接管某个厂商的某个产品。
+
+这种方式适合：
+
+- 厂商专用设备
+- 调试板
+- 自定义 USB 外设
+- 私有协议设备
+
+### 2. 按类匹配
+
+USB 还有很多标准类驱动，例如 HID、Mass Storage、CDC、UVC。对于这类设备，驱动可以按类信息匹配，而不必只看某个固定 VID/PID。
+
+### 3. 为什么有些设备不用你自己写 id_table
+
+因为 Linux 内核已经提供了很多成熟的通用类驱动。比如 U 盘、键盘、鼠标、标准串口类设备，很多时候插上就能用，背后就是标准类规范和通用驱动在工作。
+
+## 五、probe() 里应该做什么
+
+`probe()` 是 USB 驱动真正的起点。设备被匹配成功后，内核会把控制权交给它。
+
+典型工作包括：
+
+1. 获取 `usb_device`
+2. 保存驱动私有数据
+3. 读取当前接口和 altsetting
+4. 遍历端点
+5. 判断端点类型和方向
+6. 初始化 URB 或其他传输资源
+7. 建立字符设备、netdev 或其他上层接口
+
+一个常见的起步模板如下：
+
+```c
+static int xxx_probe(struct usb_interface *interface,
+                     const struct usb_device_id *id)
 {
-    struct demo *dev = usb_get_intfdata(intf);
+    struct usb_device *udev = interface_to_usbdev(interface);
+    struct usb_host_interface *cur_altsetting = interface->cur_altsetting;
+    int i;
 
-    usb_set_intfdata(intf, NULL);
-    mutex_lock(&dev->io_lock);
-    dev->disconnected = true;
-    mutex_unlock(&dev->io_lock);
+    for (i = 0; i < cur_altsetting->desc.bNumEndpoints; i++) {
+        struct usb_endpoint_descriptor *ep;
 
-    usb_kill_anchored_urbs(&dev->submitted);
-    usb_deregister_dev(intf, &demo_class);
-    kref_put(&dev->kref, demo_delete);
+        ep = &cur_altsetting->endpoint[i].desc;
+        if (usb_endpoint_is_bulk_in(ep)) {
+            /* 记录 bulk in 端点 */
+        } else if (usb_endpoint_is_bulk_out(ep)) {
+            /* 记录 bulk out 端点 */
+        }
+    }
+
+    return 0;
 }
 ```
 
-`usb_kill_anchored_urbs()` 等待 completion 不再执行，避免回调访问已经释放的私有对象。`kref` 让设备拔出与最后一个文件描述符关闭可以任意先后发生：disconnect 撤销硬件能力，最后一个引用才释放内存。
+### probe() 最重要的原则
 
-仅在 disconnect 中 `kfree(dev)` 是典型 use-after-free。反过来，只设置 disconnected 而不取消 URB，会让控制器继续完成已提交请求。生命周期必须同时封住新入口、终止在途异步工作并等待外部引用归零。
+`probe()` 不是“打印一下设备名”就结束的地方，而是驱动生命周期里最关键的资源接管点。你在这里要决定：
 
-## 回调上下文与锁的选择
+- 这个设备是否真的可用
+- 端点是否符合预期
+- 资源是否能正确分配
+- 后续是否能稳定传输
 
-URB completion 通常运行在不能睡眠的上下文，不能直接获取会阻塞的 mutex 或调用用户拷贝。回调应更新短状态、唤醒 waitqueue、补充异步请求，耗时操作交给 workqueue 或用户线程。
+如果 `probe()` 出错，应该及时返回错误码，不要强行让设备进入半初始化状态。
 
-`probe()` 和 `disconnect()` 可以睡眠，但它们与 file operation、completion、runtime PM 仍会并发。一个实用划分是：mutex 保护用户态控制路径与断开状态，自旋锁保护 completion 可访问的短队列，`kref` 保护对象寿命，anchor 管理在途 URB 集合。锁的选择来自调用上下文，而不是数据结构名字。
+## 六、disconnect() 里应该做什么
 
-## 如何确认驱动为何没有绑定
+`disconnect()` 是设备拔出时的回调。这个阶段最重要的不是“再做点什么功能”，而是**彻底释放资源**。
 
-先观察 interface，而不是只看整台设备：
+通常要处理：
 
-```bash
-lsusb -t
-readlink /sys/bus/usb/devices/1-2:1.0/driver
-cat /sys/bus/usb/devices/1-2:1.0/modalias
-modinfo demo_usb
+- 取消未完成的 URB
+- 停止异步传输
+- 释放内存和私有结构体
+- 注销字符设备或其他上层接口
+- 清理引用计数
+
+### 为什么热插拔特别危险
+
+USB 设备是可以随时拔掉的。如果驱动里还有后台线程、workqueue、URB 完成回调或用户态引用没处理好，就很容易出现：
+
+- 野指针
+- 内核告警
+- 内存泄漏
+- 设备拔出后还继续访问旧对象
+
+所以 USB 驱动必须非常重视生命周期管理。
+
+## 七、接口 Interface 的意义
+
+很多初学者会把 USB 设备理解成“一个设备一个驱动”，但实际情况往往是：**USB 驱动绑定的是接口，不一定是整个设备**。
+
+这是因为很多设备本来就是复合设备：
+
+- 一个接口负责控制
+- 一个接口负责数据
+- 一个接口负责音频
+- 一个接口负责视频
+
+因此，在 `probe()` 中你接收到的通常是 `struct usb_interface *interface`，而不是一个“裸设备”。
+
+## 八、端点怎么找
+
+真正的数据收发靠端点。你需要在 `probe()` 中遍历接口里的端点，判断它们是什么类型。
+
+### 常见判断方法
+
+```c
+if (usb_endpoint_is_bulk_in(ep)) { }
+if (usb_endpoint_is_bulk_out(ep)) { }
+if (usb_endpoint_is_int_in(ep)) { }
+if (usb_endpoint_is_isoc_in(ep)) { }
 ```
 
-modalias 与模块别名不匹配，问题在 `id_table`；模块已加载但 driver symlink 不存在，需要看其他驱动是否抢先绑定、interface 是否授权、probe 是否返回错误。启用 dynamic debug 后，给 probe 的每个资源步骤记录错误码，比只打印“probe failed”更容易定位回滚位置。
+### 你要关注的几个维度
 
-Linux 官方 USB driver API 说明见 [USB support](https://docs.kernel.org/driver-api/usb/usb.html) 和 [Writing USB Device Drivers](https://docs.kernel.org/driver-api/usb/writing_usb_driver.html)。阅读实际驱动时，建议从 `struct usb_driver` 进入 probe，再沿 URB completion 和 disconnect 闭合对象寿命。
+- 方向：IN 还是 OUT
+- 类型：bulk / interrupt / isochronous / control
+- 最大包长：影响吞吐和缓冲区设计
+- 端点个数：决定是否能满足业务需求
 
-## 小结
+很多 USB 驱动问题，根本原因不是代码逻辑错了，而是端点类型理解错了。
 
-Linux USB Host 栈通过 HCD 适配控制器、usbcore 管理设备与 URB、hub 驱动负责端口和枚举、interface driver 实现具体功能。`struct usb_driver` 注册的是 interface 驱动，`usb_register_driver()` 让 driver core 执行匹配，真正的工程难点则是 probe 成功后的异步 I/O 与 disconnect 并发。下一篇将深入描述符，解释匹配和 endpoint 发现所依赖的字节结构。
+## 九、USB core 和驱动是怎么配合的
+
+Linux 的 USB 子系统里，USB core 负责底层总线管理和驱动匹配，具体驱动负责设备行为。
+
+USB core 做的事情包括：
+
+- 枚举
+- 解析设备对象
+- 组织 interface
+- 在驱动表中做匹配
+- 调用 `probe()` / `disconnect()`
+
+驱动做的事情包括：
+
+- 初始化设备逻辑
+- 选择端点
+- 提交 URB
+- 处理数据传输
+- 暴露上层接口
+
+可以把 USB core 理解成“交通规则”，驱动理解成“具体开车的人”。
+
+### 从 Host Controller 到 interface driver 的分层
+
+Host Controller Driver（xHCI/EHCI/DWC2 等）把硬件队列和寄存器适配为通用 HCD，向 usbcore 注册 root hub，并把 URB 转成控制器描述符；hub 驱动处理端口、复位和枚举；usbcore 管理 `usb_device`、`usb_interface` 与 URB；具体 `struct usb_driver` 只实现某个 interface 功能。
+
+```mermaid
+flowchart TB
+    CLASS[Interface or class driver] --> CORE[usbcore and URB]
+    CORE --> HCD[Host Controller Driver]
+    HCD --> HW[USB controller]
+    CORE --> HUB[hub driver]
+    HUB --> PORT[Root and external hub ports]
+```
+
+`module_usb_driver()` 最终调用 `usb_register_driver()`。注册后 driver core 对现有和后来出现的 interface 执行匹配。复合设备中，不同 interface 可以分别绑定 `uvcvideo`、`snd-usb-audio` 或厂商驱动，不能因为 VID/PID 相同就假设整台设备都属于一个 probe。
+
+### disconnect 必须与 completion 和用户引用一起设计
+
+拔出时 usbcore 调用 `disconnect()`，但已提交 URB completion、workqueue、阻塞 read 和已打开文件仍可能引用私有对象。可靠顺序是先清 `usb_set_intfdata()`、设置 disconnected 阻止新 I/O、撤销用户节点，再用 `usb_kill_anchored_urbs()` 等待在途请求退出，最后通过 `kref` 在最后一个 open 引用释放后销毁内存。
+
+仅在 disconnect 中 `kfree()` 会让 completion 或 file operation 访问已释放对象；只设置标志却不 kill URB，则 HCD 仍可能 DMA 和回调。`usb_get_dev()/usb_put_dev()` 保护 `usb_device` 引用，但不自动保护驱动自有 buffer 和状态。
+
+## 十、一个最小 USB 驱动的生命周期
+
+```mermaid
+flowchart LR
+    A[模块加载] --> B[注册 usb_driver]
+    B --> C[USB core 开始匹配]
+    C --> D[命中 id_table]
+    D --> E[调用 probe]
+    E --> F[初始化端点和资源]
+    F --> G[设备正常工作]
+    G --> H[设备拔出]
+    H --> I[调用 disconnect]
+    I --> J[释放资源]
+```
+
+这条主线一定要背下来。后面不管是 bulk 设备、HID、UVC，还是 gadget，核心生命周期都绕不开它。
+
+## 十一、实际硬件上怎么验证
+
+### 实验 1：观察现有 USB 设备
+
+```bash
+lsusb
+lsusb -t
+dmesg -w
+```
+
+重点看设备层级、驱动绑定和速率协商情况。
+
+### 实验 2：插 USB 转串口
+
+```bash
+ls /dev/ttyUSB*
+dmesg -w
+```
+
+观察系统是否加载串口驱动并创建设备节点。
+
+### 实验 3：插 USB 摄像头
+
+```bash
+v4l2-ctl --list-devices
+dmesg -w
+```
+
+观察视频类驱动是否接管成功。
+
+### 实验 4：在支持 gadget 的板子上测试
+
+尝试让开发板作为 USB Device 工作，验证：
+
+- 串口 gadget
+- 网卡 gadget
+- 自定义 gadget
+
+## 十二、调试 USB 驱动时看什么
+
+### 1. dmesg
+
+先看内核日志，确认 `probe()` 是否触发、端点是否正确、传输是否超时。
+
+### 2. lsusb -v
+
+看描述符细节，确认设备声明的能力是否与驱动预期一致。
+
+### 3. usbmon
+
+需要深入抓传输包时，用 usbmon 看控制请求、bulk 包和完成状态。
+
+### 4. /sys 和 debugfs
+
+很多 USB 总线信息都能从 sysfs 和 debugfs 进一步挖出来。
+
+## 十三、几个最容易踩的坑
+
+### 坑 1：只看 VID/PID，不看接口
+
+复合设备经常不是整个设备绑定，而是某个接口绑定。
+
+### 坑 2：端点类型判断错
+
+把 bulk 当 interrupt，或者 IN/OUT 弄反，后面必然出问题。
+
+### 坑 3：probe() 没做错误回滚
+
+前面申请了资源，后面失败了却没释放，容易泄漏。
+
+### 坑 4：热插拔没处理好
+
+设备拔出后还访问旧对象，这是 USB 驱动最常见的稳定性问题之一。
+
+### 坑 5：把 USB 当普通字符设备写
+
+USB 驱动不是简单的 `open/read/write`，它先要走匹配和传输模型。
+
+## 十四、把这一讲记成一句话
+
+USB 驱动的核心不是“写一个会收发的程序”，而是：
+
+**让 Linux 在设备插入后正确匹配它、接管它、找到端点、建立传输，并在拔出时安全释放。**
+
+## 十五、小结
+
+这一讲你应该掌握了：
+
+- `struct usb_driver` 的作用
+- `probe()` 和 `disconnect()` 的职责
+- `id_table` 的匹配逻辑
+- 接口和端点在驱动中的位置
+- USB core 和驱动的协作方式
+- 如何结合 `lsusb`、`dmesg`、`usb-devices` 做硬件验证
+
+下一讲我们会继续深入 USB 描述符，把 Device Descriptor、Configuration Descriptor、Interface Descriptor 和 Endpoint Descriptor 逐个讲清楚。
+
+---

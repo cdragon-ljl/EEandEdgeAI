@@ -7,97 +7,277 @@ order: 8
 tags: ["PCIe", "Linux Driver"]
 draft: false
 ---
-前面已经具备 BAR、MSI-X、DMA 和 IOMMU 基础。本篇用一台自定义 PCIe 采集设备串起完整驱动：BAR0 是控制面，DMA ring 是数据面，MSI-X 报告 completion，字符设备通过 ioctl 提交任务、poll 等待结果，并可选择 mmap payload buffer。
+前面已经讲过 PCIe 架构、配置空间、BAR、Linux PCI 驱动框架、中断、DMA 和 IOMMU。这一篇把这些知识串成一个最小 PCIe 设备驱动实践。
 
-重点是状态和所有权，而不是堆出一个不可运行的大代码文件。
+实践目标不是写一个完整网卡或加速器驱动，而是掌握 PCIe 驱动最核心的工程链路：**匹配设备 → 使能设备 → 映射 BAR → 读写寄存器 → 申请中断 → 配置 DMA → 安全释放**。
 
-## 先定义硬件与软件共享协议
+## 一、实践目标
 
-假设 BAR0 提供 CONTROL、STATUS、SQ_BASE、CQ_BASE、QUEUE_SIZE、SQ_TAIL、CQ_HEAD 和 DOORBELL。设备从 submission ring 读取 descriptor，把结果写到预映射 payload，再在 completion ring 写入 id/status/length 并触发 MSI-X。
+这一篇的目标是实现一个教学型 PCIe 驱动，假设设备具备：
 
-```c
-struct demo_desc {
-    __le64 dma_addr;
-    __le32 len;
-    __le16 id;
-    __le16 flags;
-};
+- 一个 BAR0 寄存器空间
+- 一个状态寄存器
+- 一个控制寄存器
+- 支持 MSI 中断
+- 支持一块 DMA buffer
 
-struct demo_cqe {
-    __le16 id;
-    __le16 status;
-    __le32 actual;
-};
-```
+通过这个例子，建立 PCIe 驱动的基本骨架。
 
-所有字段 endian、对齐和 ownership bit 必须写进硬件 ABI。没有协议文档时，驱动和 FPGA 各自“猜结构体布局”会产生最难定位的错误。
-
-## probe 发布资源的顺序
-
-probe 依次完成：enable/regions、DMA mask、bus master、BAR map、hardware reset、coherent SQ/CQ、payload pool、MSI-X/IRQ、软件队列、写硬件 base/size、unmask/start，最后注册 misc/char device。
-
-Reset 要在 ring 地址写入前确保旧 DMA 停止。若 function 刚经历热复位，设备可能保留 pending status；启动前 clear/mask，request IRQ 后再 unmask。
+## 二、驱动整体流程
 
 ```mermaid
-flowchart LR
-    P[probe resources] --> R[reset device]
-    R --> Q[allocate SQ CQ payload]
-    Q --> I[request MSI-X]
-    I --> H[program queue bases]
-    H --> S[start hardware]
-    S --> U[publish user interface]
+flowchart TD
+    A[设备被枚举] --> B[pci_driver 匹配]
+    B --> C[probe 调用]
+    C --> D[pci_enable_device]
+    D --> E[pci_request_regions]
+    E --> F[pci_iomap BAR]
+    F --> G[pci_set_master]
+    G --> H[申请中断和 DMA]
+    H --> I[设备工作]
+    I --> J[remove 释放]
 ```
 
-错误路径严格反向。用户接口从未注册时无需 deregister；IRQ 已申请但硬件未启动仍要 mask/clear；DMA ring 释放前必须证明设备停止 bus master访问。
+这条流程就是 PCIe 驱动实践的主线。
 
-## ioctl 提交任务要检查 ring 与 buffer 所有权
+## 三、驱动基本骨架
 
-用户传入 buffer index、length 和 command。驱动验证范围、设备状态和 ring space，取得 FREE request，准备 payload/mapping，填写 descriptor，执行 `dma_wmb()`，更新 software producer，再写 SQ tail/doorbell。
+```c
+#include <linux/module.h>
+#include <linux/pci.h>
+#include <linux/interrupt.h>
+#include <linux/dma-mapping.h>
 
-Ring full 时可以返回 `-EAGAIN` 或阻塞等待 completion，语义必须稳定。不能覆盖仍是 DEVICE_OWNED 的 descriptor，也不能让用户修改 ring 控制字段。
+#define VENDOR_ID 0x1234
+#define DEVICE_ID 0x5678
 
-每个 request 记录 id、buffer、DMA mapping、状态和完成结果。设备可能乱序完成，completion 按 id 找 request，不按“最早提交”猜测。
+struct demo_pci {
+    struct pci_dev *pdev;
+    void __iomem *bar0;
+    int irq;
+    void *dma_cpu;
+    dma_addr_t dma_handle;
+    size_t dma_size;
+};
 
-## IRQ 只确认 completion，重活交给可调度上下文
+static const struct pci_device_id demo_ids[] = {
+    { PCI_DEVICE(VENDOR_ID, DEVICE_ID) },
+    { }
+};
+MODULE_DEVICE_TABLE(pci, demo_ids);
+```
 
-MSI-X handler 读取 CQ producer/status，执行 `dma_rmb()` 后批量消费 cqe，更新 request 为 DONE，推进 CQ head 并 ack。随后 wake_up `poll_wait` 或安排 work。
+私有结构体里保存设备对象、BAR 映射、中断号和 DMA buffer 信息。
 
-Handler 应设置 budget，防止一次处理无界 completion。若队列持续活跃，可以采用 IRQ mask + threaded/NAPI 式轮询，处理到空后再 unmask，避免中断风暴。
+## 四、probe 初始化流程
 
-`poll()` 根据 completed queue、device dead 和 error 状态返回 `EPOLLIN/EPOLLERR/EPOLLHUP`。read/ioctl 获取结果并回收 request，使 buffer 重新 FREE。
+```c
+static int demo_probe(struct pci_dev *pdev,
+                      const struct pci_device_id *id)
+{
+    struct demo_pci *dev;
+    int ret;
 
-## mmap 只暴露适合用户拥有的区域
+    dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+    if (!dev)
+        return -ENOMEM;
 
-BAR 控制寄存器一般不直接 mmap 给无特权用户，否则可绕过驱动启动任意 DMA。更合理的是 mmap payload pool，ring 和 doorbell 仍由内核管理。
+    dev->pdev = pdev;
+    pci_set_drvdata(pdev, dev);
 
-Coherent buffer 可使用 `dma_mmap_coherent()`；其他页需按映射类型选择 API。VMA open/close 增加引用，remove 时标记 dead 并阻止新 fault/submit，等现有 mapping 生命周期结束。
+    ret = pci_enable_device(pdev);
+    if (ret)
+        return ret;
 
-用户 mmap 后的 cache/ownership 协议必须写入 ABI。CPU 写入 payload 后通过 ioctl 提交，由驱动做必要 sync/barrier；不能要求用户靠 `volatile` 保证 DMA 可见。
+    ret = pci_request_regions(pdev, "demo_pci");
+    if (ret)
+        goto err_disable;
 
-## timeout 与 reset 是一条受控状态迁移
+    dev->bar0 = pci_iomap(pdev, 0, 0);
+    if (!dev->bar0) {
+        ret = -ENOMEM;
+        goto err_regions;
+    }
 
-任务超时不能立即 free buffer。驱动先停止 queue/设备，mask IRQ，等待或确认 DMA quiescent，再把 in-flight request 标记失败、unmap/recycle。若硬件支持 per-request abort，可缩小影响；否则执行 function-level 或设备自定义 reset 并重建所有 queue。
+    pci_set_master(pdev);
+    return 0;
 
-Reset 期间新 ioctl 返回 busy，poll 唤醒 error。恢复后 ring generation/producer/consumer 全部重新同步，旧 completion 必须丢弃。设备反复 timeout 应触发 health 统计和上层错误，而不是无限 reset 隐藏问题。
+err_regions:
+    pci_release_regions(pdev);
+err_disable:
+    pci_disable_device(pdev);
+    return ret;
+}
+```
 
-## remove 关闭所有入口并等待并发收敛
+这个流程体现了资源申请和错误回滚的对称性。
 
-remove 先 deregister 用户入口/标记 dead，唤醒 waiters，停止 submit；随后 reset/stop DMA、mask IRQ、`synchronize_irq()`、cancel work；再 free IRQ/vector、ring/payload、BAR/regions，最后 disable device。
+## 五、寄存器读写
 
-Open file 和 VMA 使用引用计数延长私有对象，但硬件资源在 remove 后不可访问。file operation 检查 dead 并返回 `-ENODEV`，不能因为对象内存仍在就继续 MMIO。
+假设设备寄存器定义如下：
 
-## 验证驱动要覆盖状态而不只测吞吐
+```c
+#define REG_CTRL   0x00
+#define REG_STATUS 0x04
+#define REG_DMA_LO 0x08
+#define REG_DMA_HI 0x0c
+#define REG_LEN    0x10
+#define REG_DOORBELL 0x14
+```
 
-记录 submitted/completed/timeout/reset、ring high-watermark、IRQ count、DMA mapping failure 和 AER/IOMMU fault。测试正常提交、ring full、乱序完成、用户退出、并发 open、I/O 中拔卡、设备无响应和 reset 后恢复。
+驱动访问寄存器：
+
+```c
+writel(0x1, dev->bar0 + REG_CTRL);
+status = readl(dev->bar0 + REG_STATUS);
+```
+
+MMIO 访问一定要用 `readl/writel` 这类接口，不要当普通内存访问。
+
+## 六、配置 DMA buffer
+
+```c
+dev->dma_size = 4096;
+dev->dma_cpu = dma_alloc_coherent(&pdev->dev, dev->dma_size,
+                                  &dev->dma_handle, GFP_KERNEL);
+if (!dev->dma_cpu)
+    return -ENOMEM;
+```
+
+写 DMA 地址给设备：
+
+```c
+writel(lower_32_bits(dev->dma_handle), dev->bar0 + REG_DMA_LO);
+writel(upper_32_bits(dev->dma_handle), dev->bar0 + REG_DMA_HI);
+writel(dev->dma_size, dev->bar0 + REG_LEN);
+writel(1, dev->bar0 + REG_DOORBELL);
+```
+
+这里体现了 PCIe 驱动最典型的数据启动方式：准备 buffer，写地址，敲 doorbell。
+
+## 七、申请中断
+
+```c
+static irqreturn_t demo_irq(int irq, void *data)
+{
+    struct demo_pci *dev = data;
+    u32 status = readl(dev->bar0 + REG_STATUS);
+
+    if (!status)
+        return IRQ_NONE;
+
+    writel(status, dev->bar0 + REG_STATUS);
+    return IRQ_HANDLED;
+}
+```
+
+申请中断：
+
+```c
+ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI | PCI_IRQ_LEGACY);
+if (ret < 0)
+    return ret;
+
+dev->irq = pci_irq_vector(pdev, 0);
+ret = request_irq(dev->irq, demo_irq, 0, "demo_pci", dev);
+```
+
+真实设备里，中断处理一般只做快速确认和唤醒，复杂处理放到底半部。
+
+## 八、把完成事件交给用户态：ioctl、poll 与 mmap
+
+真实驱动需要把“提交”和“完成”变成稳定 ABI。ioctl 可以接收 command、buffer index、length，驱动验证参数和设备状态后填 DMA descriptor、执行 `dma_wmb()`、推进 producer 并写 doorbell。Ring 满时阻塞或返回 `-EAGAIN`，不能覆盖仍由设备拥有的槽位。
+
+中断处理读取 completion、更新 request 状态并 `wake_up_interruptible()`。`poll()` 根据完成队列、设备错误和拔出状态返回 `EPOLLIN/EPOLLERR/EPOLLHUP`；read/ioctl 再取结果并回收 buffer。IRQ 数增长但 poll 不醒时，应检查 completion id、waitqueue 条件和 wake 是否在状态提交之后。
+
+`mmap` 只应暴露适合用户拥有的 payload buffer。控制 BAR、doorbell 和 descriptor ownership 字段通常留在内核，否则用户可绕过验证启动任意 DMA。Coherent buffer 可用 `dma_mmap_coherent()`，VMA open/close 参与对象引用；remove 后禁止新 fault/submit，已有 mapping 只能访问被明确保留的内存，不能继续 MMIO。
+
+零拷贝不是简单调用 mmap。必须定义 CPU/设备/用户三方何时拥有 buffer、谁执行 cache sync/barrier、进程异常退出如何回收、reset 后旧 buffer 如何失效。
+
+## 九、timeout 与 reset 先停止 DMA，再回收内存
+
+DMA timeout 后不能立即 free buffer。驱动先阻止新提交、mask IRQ、停止或 abort queue，确认设备 quiescent，再 unmap/recycle in-flight request。若设备不再响应，可执行 Function Level Reset 或设备自定义 reset，并重建 BAR 内 queue base、producer/consumer 和 MSI-X 状态。
+
+Reset 期间 ioctl 返回 busy，poll 唤醒错误。每次 reset 增加 generation，迟到 completion 若携带旧 id/generation必须丢弃，不能误完成新请求。Remove 复用同一 stop 状态机：撤销用户入口、停止 DMA、同步 IRQ/work，最后释放 coherent memory、BAR 和 PCI resource。
+
+## 八、remove 清理流程
+
+```c
+static void demo_remove(struct pci_dev *pdev)
+{
+    struct demo_pci *dev = pci_get_drvdata(pdev);
+
+    free_irq(dev->irq, dev);
+    pci_free_irq_vectors(pdev);
+
+    if (dev->dma_cpu)
+        dma_free_coherent(&pdev->dev, dev->dma_size,
+                          dev->dma_cpu, dev->dma_handle);
+
+    if (dev->bar0)
+        pci_iounmap(pdev, dev->bar0);
+
+    pci_release_regions(pdev);
+    pci_disable_device(pdev);
+}
+```
+
+退出顺序要注意：先停止设备和 DMA，再释放中断和内存，最后释放 BAR 和设备资源。
+
+## 九、调试命令
 
 ```bash
-cat /proc/interrupts
-lspci -s BDF -vv
-trace-cmd record -e irq -e workqueue ./demo_test
+lspci -nn
+lspci -vv -s <bus:dev.fn>
+dmesg -w
+cat /proc/interrupts | grep demo
+ls /sys/bus/pci/devices/
 ```
 
-性能达标前先要求 producer/consumer、request state 和 mapping 数量在压力结束后回到一致状态。
+重点观察：
 
-## 小结
+- 设备是否被枚举
+- BAR 是否分配
+- 驱动是否 probe
+- 中断是否增长
+- DMA 是否完成
 
-完整 PCIe 驱动把 BAR 控制面、DMA 数据面、MSI-X completion 和用户生命周期组合成明确状态机。probe 按依赖发布，ioctl 通过 descriptor ownership 提交，IRQ/poll 回收，mmap 只暴露安全 payload，timeout/reset/remove 先停止 DMA 再释放。下一篇将讨论链路、payload、队列、中断和 NUMA 如何共同决定性能与稳定性。
+## 十、常见问题
+
+### 1. probe 没触发
+
+检查 Vendor ID / Device ID 是否匹配。
+
+### 2. BAR 映射失败
+
+检查资源是否被系统分配，`pci_request_regions()` 是否失败。
+
+### 3. DMA 不工作
+
+检查 `pci_set_master()`、DMA mask、DMA 地址和设备寄存器。
+
+### 4. 中断不来
+
+检查 MSI/MSI-X 是否启用、设备是否真的写了中断、状态位是否正确清除。
+
+## 十一、验证清单
+
+- `lspci` 能看到设备
+- `probe()` 正常触发
+- BAR0 映射成功
+- 寄存器读写有效
+- MSI/INTx 至少一种中断可用
+- DMA buffer 能被设备访问
+- 卸载驱动无资源泄漏
+
+## 十二、小结
+
+PCIe 驱动实践的核心不是孤立 API，而是一条完整链路：
+
+**枚举匹配 → BAR 映射 → MMIO 控制 → DMA 搬运 → 中断通知 → 安全释放**。
+
+掌握这条链路后，再看网卡、SSD、FPGA、NPU/GPU 加速器驱动，就有了基础框架。
+
+> 🏷️ PCIe驱动 / BAR / MMIO / DMA / MSI / Linux内核
+
+---
