@@ -11,7 +11,7 @@ MCU 上的 USB 与 Linux 使用同一套线缆、描述符和传输协议，但�
 
 本篇固定使用 [CherryUSB v1.6.1](https://github.com/cherry-embedded/CherryUSB/tree/v1.6.1)，commit `c9625ffa773ad10b8824d1b5361bca2ccc1f3d1e`。内容同时覆盖 Device 与 Host，重点解释 core、class、port 和 OSAL 的契约，不绑定某块开发板。
 
-## MCU USB IP 先决定角色、endpoint 和数据搬运能力
+## 一、MCU USB IP 先决定角色、endpoint 和数据搬运能力
 
 MCU USB 外设通常提供 Device、Host 或 OTG/dual-role 能力。Device 模式响应 Host 调度，管理 EP0 和若干 IN/OUT endpoint；Host 模式产生 SOF、端口 reset、地址和 token，并管理 channel/pipe；OTG 还要根据 ID/VBUS/Type-C 状态切换角色。
 
@@ -27,7 +27,7 @@ DCD/HCD 的异步 API返回成功后，buffer仍由 USB IP/DMA拥有。带 D-cac
 
 Setup packet、endpoint completion和 SOF 由 ISR上报。ISR 只提取硬件状态并调用 core event handler；Class文件系统、网络栈或长拷贝转到线程。把所有 class逻辑塞进 USB IRQ 会造成漏 SOF、NAK和其他实时中断抖动。
 
-## CherryUSB 用四层把协议和硬件分开
+## 二、CherryUSB 用四层把协议和硬件分开
 
 ```mermaid
 flowchart TB
@@ -50,7 +50,7 @@ Host Hub线程通过 OSAL message queue接收端口变化，执行 debounce/rese
 
 内存要区分协议对象、DMA descriptor和 payload。`usb_osal_malloc()` 适合普通对象，不保证 DMA属性；具体 DCD/HCD port应使用平台 DMA allocator或静态对齐区。Class demo能枚举不代表高速 DMA/cache路径正确。
 
-## DCD 移植把 Device core 接到 USB 中断
+## 三、DCD 移植把 Device core 接到 USB 中断
 
 公共 DCD 接口位于 [`common/usb_dc.h`](https://github.com/cherry-embedded/CherryUSB/blob/v1.6.1/common/usb_dc.h)。移植层实现 `usb_dc_init/deinit`、地址设置、endpoint open/close/stall，以及异步 `usbd_ep_start_write()`、`usbd_ep_start_read()`。
 
@@ -72,7 +72,7 @@ DCD 负责 packetization、FIFO/DMA 和硬件错误，core 负责 EP0 标准请�
 
 DCD 必须只在 transfer真正完成后调用 IN/OUT complete handler并报告准确 `nbytes`。短包、STALL、reset期间取消和 ZLP都属于 port契约；错误完成顺序会让 core误复用 buffer。
 
-## Device 最小 CDC ACM 由描述符、interface 和 endpoint 组成
+## 四、Device 最小 CDC ACM 由描述符、interface 和 endpoint 组成
 
 v1.6.1 的 CDC template 使用如下初始化顺序：
 
@@ -101,7 +101,7 @@ HID 需要 Report Descriptor与 endpoint report长度一致。应用发送 keybo
 
 复合设备按 descriptor interface顺序调用多个 `usbd_add_interface()` 和 endpoint。Endpoint地址/FIFO冲突应在初始化阶段 assert，而不是等 Host枚举到一半失败。
 
-## HCD 移植为 Host core 提供 root hub 和 URB
+## 五、HCD 移植为 Host core 提供 root hub 和 URB
 
 公共 HCD 接口位于 [`common/usb_hc.h`](https://github.com/cherry-embedded/CherryUSB/blob/v1.6.1/common/usb_hc.h)。移植层实现 `usb_hc_init/deinit`、frame number、root hub control、`usbh_submit_urb()` 和 `usbh_kill_urb()`。
 
@@ -123,13 +123,13 @@ int ret = usbh_initialize(busid, reg_base, usbh_event_handler);
 
 `usbh_submit_urb()` 的 timeout为 0 时常用于异步 completion，非零用于阻塞语义；port必须在 kill/timeout时保证 completion与硬件 descriptor收敛。Hub拔出后迟到 completion不得继续访问已释放 class/hport。
 
-## Host CDC、MSC、HID 示例从 class connect 取得对象
+## 六、Host CDC、MSC、HID 示例从 class connect 取得对象
 
 CherryUSB Host class driver通过 `CLASS_INFO_DEFINE` 注册匹配信息。CDC serial、MSC 和 HID 连接后，demo 的 event handler 可获得 class 对象并创建业务线程：串口线程执行收发，MSC 访问 block/filesystem，HID 解析 report。
 
 Host 侧必须为每个设备和 interface区分对象，Hub 拔出时停止业务线程/URB再释放 class。OSAL message queue 和 semaphore 负责把 ISR/HCD completion 交给线程，不能在中断里执行文件系统或长时间 class 处理。
 
-## 移植时按硬件、core、class 三层验证
+## 七、移植时按硬件、core、class 三层验证
 
 第一步只验证 USB IP 和 DCD/HCD：时钟、PHY、IRQ、FIFO、reset、SOF/port status 是否正确。Device 可先确认 EP0 reset/setup；Host 可先确认 root port connect/reset。
 
@@ -146,7 +146,7 @@ Host 侧必须为每个设备和 interface区分对象，Hub 拔出时停止业�
 
 官方配置模板见 [`cherryusb_config_template.h`](https://github.com/cherry-embedded/CherryUSB/blob/v1.6.1/cherryusb_config_template.h)，STM32 与 ESP32 示例分别见 [cherryusb_stm32](https://github.com/CherryUSB/cherryusb_stm32) 和 [cherryusb_esp32](https://github.com/CherryUSB/cherryusb_esp32)。移植应从与 USB IP 相同的 port 开始，而不是只按 MCU 品牌选择文件。
 
-## 从 EP0 到压力测试的分层验收
+## 八、从 EP0 到压力测试的分层验收
 
 Device 先测 reset/setup/descriptor/address/configuration，再测单个 CDC/HID endpoint，随后复合设备、长传输、短包/ZLP、suspend/resume、反复插拔和 cache/DMA压力。
 
@@ -154,6 +154,6 @@ Host 先测 root port connect/reset，再打印原始描述符与 class匹配，
 
 逻辑分析仪/USB analyzer能区分 MCU没有发包、Host没有调度和协议 STALL；内存 watchpoint/cache关闭对比可定位 DMA一致性。禁止日志后性能测试还要记录 CPU、IRQ、FIFO underrun/overrun和数据校验，不只看枚举成功。
 
-## 小结
+## 九、小结
 
 MCU USB 开发的关键是把协议状态、Class 逻辑和 USB IP 分层。CherryUSB v1.6.1 用 Device/Host core 实现公共协议，用 class 实现 CDC/MSC/HID 等功能，用 DCD/HCD 适配寄存器、FIFO、DMA 和 IRQ，用 OSAL 适配线程同步。`usbd_initialize` 和 `usbh_initialize` 是两条角色主线，可靠移植则必须从控制器事件一路验证到 core，再进入 class。

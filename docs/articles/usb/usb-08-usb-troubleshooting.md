@@ -11,7 +11,7 @@ USB 故障排查最浪费时间的方式，是看到“设备不能用”就同�
 
 本篇按证据层次组织工具和现象，所有命令都回答一个具体问题，不再附加通用排错清单。
 
-## 先冻结环境，避免比较不同系统
+## 一、先冻结环境，避免比较不同系统
 
 记录内核版本、控制器驱动、拓扑、设备 VID/PID 和复现动作：
 
@@ -25,13 +25,13 @@ journalctl -kf
 
 同一设备在 USB 2.0 Hub、USB 3.x 直连、不同线材或供电口下可能协商不同速度。先固定拓扑与线材，再比较日志；否则一次“修复”可能只是换了连接路径。
 
-## 第一层：供电、角色、PHY 与连接检测
+## 二、供电、角色、PHY 与连接检测
 
 插入后内核完全无日志，优先检查 VBUS、GND、D+/D- 或 SuperSpeed pair、连接器、供电电流、Host/Device 角色和 PHY。开发板还要核对 clock/reset/regulator、`dr_mode`、Type-C role switch 或 ID/VBUS 检测。
 
 Hub 端口能报告 connect 但 reset 失败，说明软件已经看到电气连接，问题缩小到信号质量、速度握手、Device 固件或 PHY。反复 connect/disconnect 常见于供电跌落、接触不良和 EMI，不应先修改 interface driver。
 
-## 第二层：EP0 枚举和描述符
+## 三、EP0 枚举和描述符
 
 `dmesg` 中常见错误要结合阶段解释：
 
@@ -66,7 +66,7 @@ Wireshark 选择 usbmon 接口或读取 pcap，可按 `usb.device_address`、`us
 
 `-ETIMEDOUT` 表示规定时间内没有完成，可能是 Device未响应、endpoint未准备、HCD/控制器卡住或取消等待；它不直接证明线材。与 `-EPROTO`、STALL、disconnect状态和最后一条总线 transaction一起判断。
 
-## 第三层：interface 匹配和 probe
+## 四、interface 匹配和 probe
 
 设备能被 `lsusb` 识别但没有功能节点，检查每个 interface 的 modalias 和 driver symlink：
 
@@ -85,7 +85,7 @@ echo 'module demo_usb +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
 
 日志应标出 endpoint 解析、buffer/URB 分配、上层节点注册和回滚的具体步骤，而不是只有一条失败信息。
 
-## 第四层：URB 是否进入 HCD 并正确完成
+## 五、URB 是否进入 HCD 并正确完成
 
 驱动绑定后传输超时，使用 usbmon/Wireshark 对照驱动日志。先确认请求方向、endpoint、长度和类型，再看 completion status 与 `actual_length`。
 
@@ -107,7 +107,7 @@ Dynamic debug 可按 module/file/function开启 `pr_debug()`，适合看 probe�
 
 KASAN 发现 use-after-free/out-of-bounds，lockdep 检查锁顺序，kmemleak检查拔插后对象；这些工具解释软件内存/并发，不替代 usbmon 的协议证据。
 
-## 第五层：Class 协议和用户接口
+## 六、Class 协议和用户接口
 
 `/dev/ttyACM0` 存在但不能通信，继续检查 CDC line coding、control line state 和 bulk 数据；U 盘出现但 I/O 失败，要区分 BOT/UAS transport、SCSI sense 和文件系统；摄像头掉帧要检查 UVC Probe/Commit、altsetting、iso packet status、带宽和 V4L2 buffer。
 
@@ -121,7 +121,7 @@ udevadm info /dev/ttyACM0
 
 用户节点只证明上层子系统注册成功，不证明数据路径、协议状态和性能正确。
 
-## HCD DMA、IOMMU 与 cache 是 Host 侧隐藏的数据层
+## 七、HCD DMA、IOMMU 与 cache 是 Host 侧隐藏的数据层
 
 Interface driver提交 URB 后，HCD 可能为 transfer buffer建立 DMA mapping、构造 xHCI/EHCI descriptor并访问 IOMMU。出现 IOMMU fault、event ring不更新或 payload旧数据时，问题可能在 Host Controller DMA/cache，而非外接 Device协议。
 
@@ -129,12 +129,12 @@ Interface driver提交 URB 后，HCD 可能为 transfer buffer建立 DMA mapping
 
 Runtime autosuspend 还会停止 controller/device链路。恢复后第一条 URB失败时检查 Host controller runtime PM、PHY clock和driver resume重提，而不只增加 timeout。
 
-## 拔出、休眠和恢复是独立测试场景
+## 八、拔出、休眠和恢复是独立测试场景
 
 热拔出压力测试要覆盖 I/O 进行中拔出、反复打开关闭、进程退出、suspend/resume 和 runtime PM。KASAN、lockdep 和 kmemleak 能发现引用与锁问题；`usb_kill_urb`/anchor、kref 和 disconnect 标志是审计重点。
 
 恢复后设备地址和 interface 对象可能重建，应用不能永久缓存 sysfs 路径或 minor。设备固件 remote wakeup、Host autosuspend 与 class driver PM 回调也必须形成闭环。
 
-## 小结
+## 九、小结
 
 USB 排错是一条从物理连接到 class 协议的证据链：无连接日志先查硬件/角色，EP0 失败看 setup 与描述符，枚举成功后看 interface 匹配，驱动绑定后看 URB，节点出现后再看 class 协议。usbmon、Wireshark、dynamic_debug 和 tracepoint 各自回答不同层次的问题。下一篇进入 Host 控制器和设备树，解释为何 root hub 都没有出现时上述上层工具无从发挥。

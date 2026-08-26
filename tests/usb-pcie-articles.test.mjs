@@ -60,6 +60,20 @@ test('USB and PCIe rewrites preserve publication contracts without appended temp
   }
 });
 
+
+test('USB articles use one numbered H2 heading style across the complete series', () => {
+  for (const [file] of articleContracts.usb) {
+    const markdown = readFileSync(join('docs/articles/usb', file), 'utf8');
+    const body = markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
+    const headings = [...body.matchAll(/^## (.+)$/gm)].map((match) => match[1]);
+
+    assert.ok(headings.length > 0, `${file} must have H2 headings`);
+    for (const heading of headings) {
+      assert.match(heading, /^[一二三四五六七八九十百]+、/, `${file} has an inconsistent H2 heading: ${heading}`);
+    }
+  }
+});
+
 const depthContracts = {
   'docs/articles/usb/usb-01-usb-architecture-enumeration.md': ['bmRequestType', 'wValue', 'hub_port_connect', 'usb_new_device', 'usb_set_configuration', 'bMaxPacketSize0', '-EPROTO', 'usbmon'],
   'docs/articles/usb/usb-02-linux-usb-driver-framework.md': ['usb_hcd', 'usbcore', 'usb_register_driver', 'usb_set_intfdata', 'usb_driver_claim_interface', 'usb_kill_anchored_urbs', 'kref', 'runtime PM'],

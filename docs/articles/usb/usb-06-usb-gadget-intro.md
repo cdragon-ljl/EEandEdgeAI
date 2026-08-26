@@ -11,13 +11,13 @@ Linux USB Host 驱动管理外接设备；Gadget 子系统让 Linux 自己成为
 
 本篇从 EP0 setup 请求进入，解释 UDC、`usb_gadget`、`usb_composite_driver`、`usb_configuration` 与 `usb_function` 的关系，并分别说明 ConfigFS 和 FunctionFS 的工程位置。
 
-## UDC 是 Device Controller 的硬件适配层
+## 一、UDC 是 Device Controller 的硬件适配层
 
 UDC 驱动把 DWC2、DWC3、ChipIdea 等 Device Controller 的寄存器、FIFO、DMA 和中断适配为 `usb_gadget_ops` 与 endpoint operations。它注册一个 `usb_gadget`，包含 EP0、可用 endpoint 列表、速度能力和控制器状态。
 
 上层 Gadget driver 不直接写控制器寄存器，而是通过 `usb_ep_enable()`、`usb_ep_queue()` 等操作 endpoint request。这个分层与 Host 侧 HCD/URB 类似，但总线角色相反：Gadget 等待 Host 发起 token 和 setup。
 
-## EP0 setup 把枚举请求分发给 composite 和 function
+## 二、EP0 setup 把枚举请求分发给 composite 和 function
 
 Host 发来的 8 字节 Setup packet 先由 UDC 中断接收，再交给 Gadget driver 的 setup 回调。Composite framework 处理标准 Device/Configuration 请求、描述符拼装和配置切换；class/vendor 请求再分发到命中的 `usb_function`。
 
@@ -33,7 +33,7 @@ Setup 回调若有 IN Data，要设置 `cdev->req->buf/length` 并 queue EP0；O
 
 `SET_CONFIGURATION` 会 enable 配置并调用 function `set_alt()`；`SET_INTERFACE` 切换 alternate setting 也进入 set_alt。Disable/unbind 要取消 endpoint request并恢复 function 私有状态，不能只 `usb_ep_disable()` 后释放仍在 completion 中使用的对象。
 
-## Composite 框架把复合设备拆成可组合 Function
+## 三、Composite 框架把复合设备拆成可组合 Function
 
 ```mermaid
 flowchart TB
@@ -51,7 +51,7 @@ flowchart TB
 
 Function 的 bind/set_alt/disable/unbind 构成自身生命周期。Endpoint 资源不是固定名字：`usb_ep_autoconfig()` 根据描述符需求从 UDC 可用 endpoint 中选择，实际硬件数量和方向能力可能限制可组合功能。
 
-## ConfigFS 把复合设备组装移到用户态配置
+## 四、ConfigFS 把复合设备组装移到用户态配置
 
 ConfigFS Gadget 允许不写新的内核 composite driver 就组装标准 function：
 
@@ -72,13 +72,13 @@ ls /sys/class/udc > UDC
 
 ConfigFS 适合标准 CDC/ECM/RNDIS/MSC/HID 等组合。不同 Host OS 对 VID/PID、字符串、IAD、OS descriptor 和 function 顺序有兼容性要求，Linux 上枚举成功不代表 Windows/macOS 必然使用期望驱动。
 
-## FunctionFS 让用户态实现自定义 USB Function
+## 五、FunctionFS 让用户态实现自定义 USB Function
 
 FunctionFS 由内核处理 EP0 基础和 endpoint 文件接口，用户进程提供 descriptors/strings、接收 setup 事件并通过 endpoint fd 收发数据。ADB 等场景可借此把协议逻辑留在用户态。
 
 FunctionFS 不是绕过 Gadget 生命周期。用户进程退出、descriptor 写入失败或 UDC unbind 都会影响整个 function；daemon 需要处理 ENABLE、DISABLE、SETUP、SUSPEND、RESUME 等事件，并确保 endpoint I/O 在 disable 后停止。
 
-## 数据路径围绕 `usb_request` 和 endpoint queue
+## 六、数据路径围绕 `usb_request` 和 endpoint queue
 
 Function 为 endpoint 分配 `usb_request`，设置 buffer、length、complete，再调用 `usb_ep_queue()`。请求提交后 buffer 归 UDC 使用，completion 才能重用或释放。持续发送/接收通常维护 request pool，避免在中断完成路径频繁分配。
 
@@ -100,7 +100,7 @@ Dual-role 控制器从 Gadget 切到 Host 前，先 unbind Gadget/断开 pull-up
 
 ConfigFS 拆除也遵循同一顺序：先清 UDC 解绑，等待 function disable/unbind，再删除 config symlink、function 和 gadget目录。直接 `rm -rf` 活跃 Gadget 不是安全停机协议。
 
-## Gadget bring-up 从 UDC 状态开始
+## 七、Gadget bring-up 从 UDC 状态开始
 
 ```bash
 ls /sys/class/udc
@@ -112,6 +112,6 @@ find /sys/kernel/config/usb_gadget -maxdepth 3 -type f
 
 官方 Gadget API 见 [Linux USB Gadget API](https://docs.kernel.org/driver-api/usb/gadget.html)。调试时打开 UDC/composite/function 的 dynamic debug，可把一次 setup 从硬件中断追到具体 function。
 
-## 小结
+## 八、小结
 
 Linux Gadget 由 UDC 硬件适配、Composite 设备模型和 Function 协议实现组成。`usb_composite_probe` 注册设备，`usb_function` 贡献 interface/endpoint 与 class setup，ConfigFS 负责动态组装，FunctionFS 允许用户态实现功能。正确实现必须处理 EP0、set_alt/disable、request 所有权和 Host 兼容性。下一篇将比较常见 USB Class 在 Host 侧如何绑定和传输。

@@ -11,7 +11,7 @@ USB Class 的价值是让设备用标准描述符和协议表达功能，Host �
 
 本篇不把类驱动写成名称清单，而是比较它们如何从描述符进入 Linux 对象，再把 USB 数据接入 input、SCSI、TTY、V4L2 或 ALSA。
 
-## HID：Report Descriptor 决定数据位含义
+## 一、HID：Report Descriptor 决定数据位含义
 
 HID Interface Descriptor 指向 HID Descriptor，后者给出 Report Descriptor 长度。Report Descriptor 用 item 描述 Usage Page、Usage、Report Size/Count、Input/Output/Feature；interrupt endpoint 只搬运 report 字节，本身不知道哪个 bit 是按键或坐标。
 
@@ -25,7 +25,7 @@ HID Report Descriptor 是一台小型虚拟机式的数据声明：Global item �
 
 调试可查看 `/sys/kernel/debug/hid/*/rdesc`、`hid-recorder`/hidraw 与 usbmon，对照 Report Descriptor 计算每个字段 bit offset，不要仅凭十六进制 payload 猜键位。
 
-## MSC：USB bulk 传输之上仍有存储命令协议
+## 二、MSC：USB bulk 传输之上仍有存储命令协议
 
 传统 Mass Storage Bulk-Only Transport 使用一个 bulk OUT、一个 bulk IN。Host 发送 CBW（命令块封装），设备执行 SCSI 命令并传输数据，最后返回 CSW（命令状态封装）。Linux `usb-storage` 把设备接入 SCSI 中层，最终出现 `/dev/sdX`。
 
@@ -39,7 +39,7 @@ Endpoint STALL/phase error 的恢复通常执行 Mass Storage Reset、clear halt
 
 UAS 使用 USB streams 与 SCSI task management，允许多个 command并行和乱序完成；Linux `uas` 对 HCD stream/设备 quirks 有要求。不稳定设备可能通过 quirks 回退 `usb-storage` BOT。性能比较必须确认实际绑定模块与 queue depth。
 
-## CDC ACM：两个 interface 共同形成串口功能
+## 三、CDC ACM：两个 interface 共同形成串口功能
 
 CDC ACM 通常包含 Communication Class interface 和 Data Class interface。控制 interface 提供 interrupt IN notification 和 line coding/control line state 请求，数据 interface 提供 bulk IN/OUT。IAD 或 Union Functional Descriptor 说明两者关系。
 
@@ -53,7 +53,7 @@ Interrupt IN notification 可上报 SERIAL_STATE（DCD/DSR/break/parity 等）�
 
 `cdc_acm` 的 write buffer、read URB 与 TTY flip buffer构成异步链路。`ttyACM` 打开成功但无数据，要分别检查 class control、bulk endpoint、URB completion和下游 UART/协议。
 
-## UVC：控制面和流数据面分属不同 interface
+## 四、UVC：控制面和流数据面分属不同 interface
 
 UVC 通常用 VideoControl interface 描述 Camera Terminal、Processing Unit 等 entity，用 VideoStreaming interface 的多个 altsetting 提供不同带宽。应用通过 V4L2 协商 format/frame/interval，驱动再执行 Probe/Commit 控制并切换 altsetting。
 
@@ -70,7 +70,7 @@ Streaming 开始前，Host 在 VideoStreaming interface上执行 UVC Probe/Commi
 
 带宽错误应核对 `wMaxPacketSize` transaction bits、`bInterval`、altsetting和同一 Host controller 上其他 periodic endpoint。应用 buffer不足则出现在 V4L2 queue/drop，不应混为总线带宽。
 
-## UAC：时钟、altsetting 与同步方式共同决定音频流
+## 五、UAC：时钟、altsetting 与同步方式共同决定音频流
 
 USB Audio Class 用 AudioControl interface 描述 clock/entity，用 AudioStreaming interface 描述 PCM format 和 endpoint。Isochronous endpoint 按帧持续传输，异步播放设备可能通过 feedback endpoint 调整 Host 发送速率。
 
@@ -82,13 +82,13 @@ UAC 的 Clock Source/Selector、Feature Unit 与 Terminal entity形成控制拓�
 
 Linux `snd-usb-audio` 日志、`/proc/asound/card*/stream*` 和 `arecord/aplay --dump-hw-params` 可核对 altsetting、endpoint、format和 rate。音频爆音要同时看 iso packet status、feedback和 ALSA XRUN。
 
-## 标准 Class 与 Vendor Class 如何选择
+## 六、标准 Class 与 Vendor Class 如何选择
 
 HID 适合小型结构化控制数据，CDC ACM 适合串口式字节流，MSC 适合块设备，UVC/UAC 适合标准音视频生态。Vendor Class 提供最大协议自由，但 Host 需要 WinUSB/libusb 或自定义驱动，也要自行设计版本、边界、超时和恢复。
 
 选择 class 应优先考虑 Host 生态和数据语义，不应仅因“免驱”强行套用。例如高吞吐采集若伪装成 HID，会受到 report 与 interrupt 调度限制；块存储若直接暴露自定义 bulk，则要重做缓存一致性和文件系统并发协议。
 
-## 从 Linux 绑定结果反推 class 问题
+## 七、从 Linux 绑定结果反推 class 问题
 
 ```bash
 lsusb -t
@@ -98,6 +98,6 @@ readlink /sys/bus/usb/devices/1-2:1.0/driver
 
 没有绑定时检查 class/subclass/protocol、IAD/Union 和模块；已绑定但上层节点缺失时继续检查类驱动 probe 日志；节点存在但传输异常时进入 class control request 和数据 endpoint。`usbhid`、`usb-storage`、`cdc_acm`、`uvcvideo`、`snd-usb-audio` 的日志和 trace 各自对应不同协议层。
 
-## 小结
+## 八、小结
 
 USB Class 不只是预定义 endpoint 组合，而是描述符、控制请求、数据格式和 Linux 上层子系统的完整契约。HID 由 report 定义语义，MSC 在 bulk 上承载 SCSI，CDC ACM 组合控制/数据 interface，UVC/UAC 通过 altsetting 和 isochronous 调度传输媒体。下一篇将把这些层次用于系统排错，避免把所有故障都归为“USB 不稳定”。
