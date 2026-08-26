@@ -58,6 +58,14 @@ hexdump -C /sys/bus/usb/devices/1-2/descriptors
 
 重点检查 `bLength`、`wTotalLength`、interface/endpoint 数量、IAD/Union 引用和 endpoint 类型。Device 固件日志应能对应 EP0 setup 与状态阶段。
 
+### usbmon 文本与 Wireshark 分别适合快速定位和协议解码
+
+usbmon `S/C/E` 记录 submit、complete、error，包含 tag、时间、bus/device/endpoint、transfer type、status、length和可选数据。用同一 tag配对 S/C，可以计算延迟和实际长度；只看 complete 不知道请求原始 setup/长度。
+
+Wireshark 选择 usbmon 接口或读取 pcap，可按 `usb.device_address`、`usb.endpoint_address`、`usb.setup.bRequest` 过滤。控制传输检查 Setup/Data/Status，bulk/class协议再按 endpoint和 payload解码。抓包本身会增加 I/O，应限制目标 bus/device。
+
+`-ETIMEDOUT` 表示规定时间内没有完成，可能是 Device未响应、endpoint未准备、HCD/控制器卡住或取消等待；它不直接证明线材。与 `-EPROTO`、STALL、disconnect状态和最后一条总线 transaction一起判断。
+
 ## 第三层：interface 匹配和 probe
 
 设备能被 `lsusb` 识别但没有功能节点，检查每个 interface 的 modalias 和 driver symlink：
@@ -91,6 +99,14 @@ find /sys/kernel/tracing/events/usb -maxdepth 2 -type f 2>/dev/null
 
 不要在生产系统盲目打开所有 trace；选择 URB submit/complete 和目标 bus/device，控制日志量。
 
+### dynamic_debug 与 tracepoint 把“打印日志”升级成时间线
+
+Dynamic debug 可按 module/file/function开启 `pr_debug()`，适合看 probe、PM、completion和错误分支。Tracepoint/ftrace用于 submit/complete、IRQ、workqueue和调度时间；先查看 `/sys/kernel/tracing/events/usb` 当前内核实际提供的事件，再选择性启用。
+
+将 driver request id/URB 指针写入 trace，可把用户调用、URB submit、HCD completion、workqueue和 wake串起来。不要在高频 completion中无节制 printk，它会改变时序并制造新的 timeout。
+
+KASAN 发现 use-after-free/out-of-bounds，lockdep 检查锁顺序，kmemleak检查拔插后对象；这些工具解释软件内存/并发，不替代 usbmon 的协议证据。
+
 ## 第五层：Class 协议和用户接口
 
 `/dev/ttyACM0` 存在但不能通信，继续检查 CDC line coding、control line state 和 bulk 数据；U 盘出现但 I/O 失败，要区分 BOT/UAS transport、SCSI sense 和文件系统；摄像头掉帧要检查 UVC Probe/Commit、altsetting、iso packet status、带宽和 V4L2 buffer。
@@ -104,6 +120,14 @@ udevadm info /dev/ttyACM0
 ```
 
 用户节点只证明上层子系统注册成功，不证明数据路径、协议状态和性能正确。
+
+## HCD DMA、IOMMU 与 cache 是 Host 侧隐藏的数据层
+
+Interface driver提交 URB 后，HCD 可能为 transfer buffer建立 DMA mapping、构造 xHCI/EHCI descriptor并访问 IOMMU。出现 IOMMU fault、event ring不更新或 payload旧数据时，问题可能在 Host Controller DMA/cache，而非外接 Device协议。
+
+记录 fault requester/IOVA、HCD ring dequeue/enqueue、DMA direction和 buffer生命周期。非一致 cache平台的 HCD/UDC port必须使用 DMA API；禁用 IOMMU只能作为受控对比，不能把越界访问当成修复。
+
+Runtime autosuspend 还会停止 controller/device链路。恢复后第一条 URB失败时检查 Host controller runtime PM、PHY clock和driver resume重提，而不只增加 timeout。
 
 ## 拔出、休眠和恢复是独立测试场景
 

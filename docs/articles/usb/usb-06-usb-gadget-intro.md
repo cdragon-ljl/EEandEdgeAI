@@ -25,6 +25,14 @@ Host 发来的 8 字节 Setup packet 先由 UDC 中断接收，再交给 Gadget 
 
 EP0 Data/Status 阶段仍使用 `usb_request`。Setup 回调不能返回后让临时 buffer 失效，也不能在 atomic 中断路径执行长时间阻塞操作。
 
+### Standard、Class 与 Vendor request 的分发边界
+
+Composite core 先处理 `GET_DESCRIPTOR`、`SET_CONFIGURATION`、`GET_CONFIGURATION` 等设备/配置级标准请求；Interface/Endpoint recipient 的请求再根据 `wIndex` 找到 function。Function 的 setup 回调处理 CDC line coding、HID report、Vendor command 等，无法识别时返回负 errno，由 EP0 转成 STALL。
+
+Setup 回调若有 IN Data，要设置 `cdev->req->buf/length` 并 queue EP0；OUT Data 则先接收到 EP0 request，completion 后才能解析。`wLength` 来自外部 Host，必须限制在 request buffer 和协议结构范围内。Status 阶段由 framework/UDC衔接，function 不能提前复用 buffer。
+
+`SET_CONFIGURATION` 会 enable 配置并调用 function `set_alt()`；`SET_INTERFACE` 切换 alternate setting 也进入 set_alt。Disable/unbind 要取消 endpoint request并恢复 function 私有状态，不能只 `usb_ep_disable()` 后释放仍在 completion 中使用的对象。
+
 ## Composite 框架把复合设备拆成可组合 Function
 
 ```mermaid
@@ -75,6 +83,22 @@ FunctionFS 不是绕过 Gadget 生命周期。用户进程退出、descriptor �
 Function 为 endpoint 分配 `usb_request`，设置 buffer、length、complete，再调用 `usb_ep_queue()`。请求提交后 buffer 归 UDC 使用，completion 才能重用或释放。持续发送/接收通常维护 request pool，避免在中断完成路径频繁分配。
 
 IN request 是 Device 向 Host 提供数据，但只有 Host 发起 IN token 才真正发送；OUT request 必须预先排队，否则 Host 发送时可能 NAK。高速吞吐依赖 endpoint FIFO/DMA、request 深度和 function 协议，不是单纯扩大一个 buffer。
+
+### request pool 比 completion 中临时分配更稳定
+
+`usb_ep_alloc_request()` 创建 request，function 设置 buffer、length、complete/context 后调用 `usb_ep_queue()`。提交成功后 request 与 buffer 归 UDC 异步使用；completion 收到 status/actual 后才能重用。
+
+持续 bulk/isochronous 数据通路通常预分配 request pool：FREE request填数据后变为 IN_FLIGHT，completion 再回 FREE/READY。Completion 运行上下文由 UDC 决定，不能假设可以睡眠；文件 I/O、协议解析和大块复制应转交线程/workqueue。
+
+OUT endpoint 必须提前 queue 接收 request，否则 Host 发 OUT token时只能 NAK。IN 数据准备好也不会主动发送，仍需等待 Host IN token。Request 数量、endpoint FIFO 与 DMA 深度共同决定吞吐。
+
+### Suspend、remote wakeup 与角色切换属于设备生命周期
+
+Host suspend 后 UDC/function 收到 suspend event，应停止不必要时钟/数据生产；resume 恢复。Remote wakeup 只有 Host 通过 `SET_FEATURE(DEVICE_REMOTE_WAKEUP)` 授权且设备状态允许时才能发起，不能任意拉总线。
+
+Dual-role 控制器从 Gadget 切到 Host 前，先 unbind Gadget/断开 pull-up、完成所有 request，再切 PHY/role并注册 HCD。仅改变 `dr_mode` 或 role switch 状态而不收敛 request，会让旧 Device DMA继续访问 buffer。
+
+ConfigFS 拆除也遵循同一顺序：先清 UDC 解绑，等待 function disable/unbind，再删除 config symlink、function 和 gadget目录。直接 `rm -rf` 活跃 Gadget 不是安全停机协议。
 
 ## Gadget bring-up 从 UDC 状态开始
 

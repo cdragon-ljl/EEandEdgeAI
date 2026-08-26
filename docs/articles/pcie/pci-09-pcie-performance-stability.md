@@ -21,6 +21,14 @@ lspci -s BDF -vv | grep -E 'LnkCap|LnkSta'
 
 理论 line rate 还要扣除编码与协议开销。小 TLP 的 header/LCRC 比例更高，所以大量几十字节请求远低于大 payload 的效率。
 
+### 从 GT/s 到业务吞吐的分层预算
+
+Gen3 8 GT/s使用 128b/130b编码，单 lane单方向编码后约 7.877 Gb/s；x4再乘 lane，但业务还要扣除 TLP header、LCRC、DLLP、ACK/credit和空闲。一个 256B Memory Write与 32B小写的有效率差异很大。
+
+性能模型至少分四层：Link有效带宽、TLP payload效率、DMA/内存带宽、软件 queue/CPU。若设备内部只允许一个 outstanding Read，Completion RTT会先限制吞吐；若 Device持续 Write但 Host内存远端 NUMA，瓶颈可能在内存而非 Link。
+
+测试报告应写 LnkSta、MPS/MRRS、payload、queue depth、方向、IOMMU和CPU/NUMA，不用“PCIe x4 理论值”代替环境。
+
 ## Max_Payload_Size 决定写 TLP 的最大数据段
 
 MPS 由链路路径上设备能力和系统配置共同决定，Device Control 中的当前值可能低于 Device Capability 上限。更大 MPS 减少 header 开销，但增加单包占用与错误重放成本，并要求整个路径支持。
@@ -53,6 +61,14 @@ numactl --hardware
 
 irqbalance 可能重新分配 affinity，手工 hint 与系统策略要协调。所有 vector 都落到 CPU0 会形成单核瓶颈；盲目分散又会增加共享状态锁竞争。
 
+### Interrupt moderation 要与 batch 和 P99 一起测
+
+Interrupt moderation可按 completion count、timer或两者触发。阈值 32 表示累计一批再 IRQ，timer保证低流量不会永久等待。增大阈值通常降低 IRQ/CPU、提高吞吐，但 P99/P999延迟上升。
+
+每次实验同时记录 completions/IRQ、poll budget耗尽次数、CQ high watermark、平均/P99延迟和CPU。只看总带宽会把排队延迟隐藏在深 ring中。
+
+自适应 moderation可以按负载切换，但必须防止震荡，并为实时/管理 queue保留低延迟 vector。IRQ affinity、worker和buffer NUMA位置也要成组配置。
+
 ## DMA mapping、IOMMU 和 cache 可能成为软件瓶颈
 
 每个小 buffer 单独 map/unmap 会产生 IOMMU 页表和 IOTLB invalidation；长期 pool、scatter-gather 合并和合理大页可减少成本。SWIOTLB bounce 会额外复制，应通过日志确认。
@@ -69,6 +85,14 @@ dmesg | grep -i aer
 ```
 
 设备驱动还应维护 submitted/completed/timeout/reset、IRQ、ring full、DMA mapping failure 和数据校验错误。压力结束后 producer/consumer、mapping 和 request 数必须收敛，不能只因数据还在流动就认为稳定。
+
+### 稳定性测试要证明资源守恒和错误恢复
+
+长压不仅跑固定大包。应交替 payload、queue depth、并发进程、runtime PM、FLR/hot reset、IOMMU fault注入和用户异常退出。每轮结束检查 submitted/completed/failed/in_flight守恒、DMA mapping与buffer pool归零、IRQ/work无残留。
+
+AER Correctable计数增长虽然未中断业务，仍可能说明链路 margin不足；Completion Timeout、Surprise Down、Malformed TLP要与发生时 queue/reset状态关联。Reset成功标准不是设备重新出现在 lspci，而是 ring重新同步且旧 generation completion不会污染新请求。
+
+将错误率、恢复时间和连续运行时长与吞吐一起验收，才能称为稳定性优化。
 
 ## 一套可复现的 profiling 顺序
 

@@ -124,6 +124,39 @@ Completion 先从 anchor 自动脱离，再区分正常完成、主动取消和�
 
 Completion 不能调用 `copy_to_user()`，也不应获取可能睡眠的 mutex。它只做短状态提交，用户线程完成可睡眠操作。
 
+## read、poll 和非阻塞语义必须共享同一个接收状态
+
+持续 RX 不应只保存一块 `rx_buf + rx_len`，否则 completion 在用户尚未读取时再次到来会覆盖数据。教学实现至少使用一个带 producer/consumer 的 ring，或多个 FREE/IN_FLIGHT/READY buffer。Completion 在 `rx_lock` 下把 buffer 从 IN_FLIGHT 移到 READY，随后唤醒 `wait_queue`。
+
+`read()` 的等待条件应是“READY 队列非空、设备断开或发生不可恢复错误”：
+
+```c
+ret = wait_event_interruptible(dev->read_wait,
+        demo_has_ready(dev) || READ_ONCE(dev->disconnected));
+if (ret)
+    return ret;
+if (READ_ONCE(dev->disconnected) && !demo_has_ready(dev))
+    return -ENODEV;
+```
+
+若文件以 `O_NONBLOCK` 打开且当前无数据，返回 `-EAGAIN`，不能仍然睡眠。取得 READY buffer 后再 `copy_to_user()`；复制可能睡眠，因此不能持 completion 使用的自旋锁。通常先在锁内摘下 buffer并改为 USER_OWNED，解锁后复制，最后重新提交 RX。
+
+`poll()` 注册同一个 waitqueue，并根据相同条件返回 `EPOLLIN`；断开返回 `EPOLLHUP`，错误返回 `EPOLLERR`。Read 与 poll 如果使用不同状态变量，会出现“poll 可读但 read 阻塞”或永久漏唤醒。
+
+## 异步写队列需要背压和取消策略
+
+每次 write 分配 URB/buffer在低速应用中可接受，但高并发会无界占用内存。可以用 semaphore 限制在途 write 数，或维护固定 TX request pool。队列满时阻塞或 `O_NONBLOCK -> -EAGAIN`，语义与 read 一致。
+
+Completion 释放配额并唤醒写者。Disconnect 先阻止新 write，再 kill anchor；所有 completion 返回后配额和对象引用应回到初始值。错误重试要由设备协议决定，不能对所有 `-EPIPE/-EPROTO` 自动重提造成风暴。
+
+## autosuspend 前后要停止并恢复数据流
+
+Interface driver 可使用 runtime PM。Open/首次 I/O 通过 `usb_autopm_get_interface()` 保证设备 active，空闲后 `usb_autopm_put_interface()`；每次成功 get 都必须在错误、release 和 disconnect 路径配对。
+
+Suspend 回调停止持续 RX 或让设备进入低功耗，resume 重新确认 altsetting/endpoint 状态并提交 request。设备支持 remote wakeup 时还要配置标准 feature 与 class 状态。物理仍连接不代表 URB 在 autosuspend 期间可继续提交。
+
+调试“空闲一段时间后第一次读失败”时，记录 runtime status、autosuspend delay、resume 回调和 RX 重提，而不是把错误归因于随机 USB timeout。
+
 ## disconnect 的顺序决定是否安全
 
 ```c

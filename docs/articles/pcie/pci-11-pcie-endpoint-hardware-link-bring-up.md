@@ -103,6 +103,14 @@ Host BAR address、TLP offset 和 Endpoint 内部 target 是三个地址域。�
 
 最小 MMIO 通过后再触发 MSI：Host 启用 vector，写 IRQ_TRIGGER，确认 `/proc/interrupts` 与 handler。最后才由 Host DMA API 提供地址，Endpoint outbound engine 发 Memory Read/Write。这个顺序把配置、BAR、中断和 DMA 四类错误逐一隔离。
 
+### Endpoint Configuration Space 的最小实现与 Capability 递增
+
+先实现合法 Type 0 Configuration Space：VID/DID、Class Code、Header Type、Command/Status和一个 BAR。Host能稳定读写 Command、完成 BAR sizing并保持配置后，再加入 MSI/MSI-X、PCIe Capability、AER等；不要一次声明未完成的 Capability链。
+
+BAR mask、64位和 prefetchable属性必须与实际 aperture一致。Function Level Reset支持、Device Serial Number和Resizable BAR等能力只有硬件/firmware真正实现状态恢复时才公开。
+
+Host `lspci -vvxxxx` 的每个字段都应能对应 Endpoint IP配置或用户逻辑寄存器。
+
 ## 四、设备树中的 RC 节点
 
 一个抽象的 RC 节点可能包含以下资源：
@@ -237,6 +245,14 @@ done
 
 稳定性测试的价值在于区分“一次能起来”和“产品可以长期工作”。
 
+### Outbound DMA 从 Host 提供的 dma_addr_t 开始
+
+Host驱动通过 DMA API分配/映射 buffer，把 `dma_addr_t`、length和request id写入 BAR/descriptor。Endpoint outbound DMA将该地址作为 PCIe Memory Request目标；它可能是 IOVA，绝不能按 Host物理地址猜测。
+
+先做 one-shot：Host给 4 KiB，Endpoint写固定 pattern，MSI后Host校验；再做 Endpoint读 Host、scatter-gather和 ring。检查 address高低位、MPS/MRRS、Completion status、IOMMU fault和 Device内部 AXI错误。
+
+Device写 payload/CQE必须先于 MSI可见；reset/PERST#/FLR后停止旧 outbound DMA。若 Host unmap后 Device迟到访问，IOMMU应直接暴露 fault。
+
 ## 九、常见故障定位
 
 ### 故障 1：链路停在 Detect
@@ -258,6 +274,14 @@ done
 ### 故障 5：开启 ASPM 后链路异常
 
 先关闭省电特性建立稳定基线，再逐项启用 L0s/L1、L1 Substates 和 runtime PM。不要把低功耗问题与初始链路问题混在一起。
+
+## Linux PCI Endpoint Framework 的另一侧视角
+
+当 SoC运行 Linux并充当 Endpoint，PCI Endpoint Framework用 `pci_epc` 表示 Endpoint Controller，EPC driver适配硬件，`pci_epf` Function driver配置 Configuration Space、BAR、MSI和数据协议。`pci_epf_test`/对应 Host test driver可用于最小验证。
+
+Framework API负责 function bind/unbind和资源配置，但 PHY、LTSSM、ATU、DMA/cache仍由 EPC/平台实现。Host侧普通 `pci_driver` 与 Endpoint侧 EPF不是同一角色，调试日志要注明所在端。
+
+这套框架适合验证 BAR read/write/copy/MSI，再扩展自定义 Function，顺序与 FPGA Endpoint最小闭环一致。
 
 ## 十、验收清单
 

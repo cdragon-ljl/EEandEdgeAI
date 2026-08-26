@@ -27,6 +27,14 @@ Bridge 的 Secondary bus 是其下游起点，Subordinate 表示该桥下可达�
 
 配置空间前 256 字节是传统区域，PCIe Extended Configuration Space 扩展到 4 KiB。具体平台通过 ECAM 或 Host controller config window 实现访问，普通设备驱动应使用 `pci_read_config_*()`，不直接假设 ECAM 虚拟地址。
 
+### Host bridge 如何实现配置空间访问
+
+Linux `pci_bus_read_config_*()` 最终通过 bus ops访问 ECAM或控制器 config window。ECAM通常按 segment/bus/device/function/offset编码地址，部分 SoC则需先编程 outbound ATU再读寄存器。
+
+`pci_bus_read_config_word(bus, devfn, PCI_VENDOR_ID, &vendor)` 返回访问错误与读值；vendor `0xffff` 才表示 function不存在。配置访问 abort、超时或 byte-enable错误会让扫描漏设备，不能简单归为 Endpoint未上电。
+
+扫描从 root bridge建立 `pci_host_bridge` 和 root bus，遍历 devfn创建 `pci_dev`，读取 Header Type决定 multifunction/bridge，再由 `pci_scan_child_bus()` 递归。Host controller 的 bus-range不足会限制可分配 bus number。
+
 ## Linux 递归扫描 bridge
 
 简化流程是：
@@ -63,6 +71,14 @@ PCI core 为 BAR 分配地址并写回配置空间，同时设置 bridge window�
 
 资源不足时，内核日志会显示 BAR assignment failure。常见原因是固件 window 太小、32 位地址空间不足、大 BAR/Resizable BAR、bridge aperture 配置或多个设备竞争。
 
+### Bridge window 是下游资源能否路由的第二道门
+
+Type 1 Header的 I/O、Memory、Prefetchable Base/Limit必须覆盖下游 BAR。Endpoint BAR已分配但上游任一 bridge window遗漏时，配置空间仍可读，Memory TLP却被 UR/abort。
+
+64 位 prefetchable window由高低寄存器组合；固件给出的 aperture太小会让大 BAR/Resizable BAR分配失败。Linux resource allocator可能重分配，但 Host bridge outbound window仍要覆盖最终 CPU resource。
+
+Hotplug bridge还要预留 bus number、MMIO和 vector资源，否则空槽启动时正常，插入设备后才出现 `no space for [mem size]`。这也是 hotplug与静态启动枚举的资源规划差异。
+
 ## Capability 链扩展中断、电源和 PCIe 能力
 
 Status 的 Capabilities List bit 表示传统 Capability 链存在，指针从配置头开始，每项包含 Capability ID 和 next pointer。常见项包括 Power Management、MSI、MSI-X、PCI Express、Vendor Specific。
@@ -70,6 +86,14 @@ Status 的 Capabilities List bit 表示传统 Capability 链存在，指针从�
 PCIe Extended Capability 从 0x100 开始，头部含 ID、Version 和 next offset。AER、Device Serial Number、SR-IOV、Resizable BAR、ATS/PASID 等位于这里。
 
 Capability 是变长链，offset 可能不同。驱动使用 `pci_find_capability()`、`pci_find_ext_capability()` 和专用 API，而不是把某个设备观察到的固定 offset 写死。`lspci -vv` 已能解码大量 capability，`lspci -xxx/-xxxx` 则提供原始配置字节。
+
+### Capability 解析必须沿链而不是记 offset
+
+传统 Capability从 Status指示和 pointer开始，每项 ID/next；PCI Express Capability内含 Device/Link/Slot/Root Capability与 Control/Status。Extended Capability从 0x100开始，header的 next以 dword offset链接 AER、DSN、SR-IOV、Resizable BAR、ATS/PASID等。
+
+驱动使用 `pci_find_capability()`、`pci_find_ext_capability()` 和专用 helper。链指针环、越界或重复属于设备/固件错误；直接按某次 `lspci` offset读写会在不同硬件 revision失效。
+
+SR-IOV启用后 PF创建多个 VF function，各自有 BDF/配置和资源，但 PF仍管理共享硬件。枚举数量、VF BAR和IOMMU group需要一起规划。
 
 ## Command 寄存器决定设备能否响应和发起事务
 

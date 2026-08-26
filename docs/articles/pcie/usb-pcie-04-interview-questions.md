@@ -89,6 +89,52 @@ UDC 已注册，继续查是否 bind UDC、pull-up/VBUS、EP0 setup、descriptor
 
 跨层跳跃是最常见错误答案：设备节点存在不证明数据正确，IRQ计数不证明 completion正确，平均吞吐不证明 reset后资源收敛。
 
+### `usb_submit_urb()` 成功后可以立刻复用 buffer 吗？
+
+不能。成功表示URB已交usbcore/HCD异步拥有，buffer在completion或同步kill前必须有效且不被并发修改。Streaming DMA还可能由HCD映射。错误答案是“submit只复制指针所以函数返回就能改”；正因为只保存指针，生命周期更长。
+
+证据是URB状态、anchor、completion和kill是否完成，不是调用栈已经返回。
+
+### CherryUSB CDC 能枚举但 OUT 数据收不到，如何分层？
+
+先看Host是否发bulk OUT、DCD是否配置endpoint/FIFO、IRQ是否调用 `usbd_event_ep_out_complete_handler()`、报告nbytes是否正确、应用是否重提 `usbd_ep_start_read()`，再查DMA cache invalidate。
+
+错误答案是直接改CDC描述符；能配置并出现串口通常说明描述符/EP0主线已成功，数据问题更接近DCD和buffer ownership。
+
+### 提高 MPS 一定提升 PCIe 吞吐吗？
+
+不一定。大MPS降低header比例，但路径所有设备必须支持，还会占credit/buffer并影响公平性；瓶颈若是outstanding Read、内存或CPU则无效。应对照LnkSta、MPS/MRRS、TLP大小、credit和吞吐。
+
+错误答案是用setpci把值改到设备上限；路径和系统策略不匹配可能导致错误。
+
+### IOMMU fault 只在压力下出现，最可能看什么？
+
+重点看ring wrap、descriptor length、高位地址、timeout/unmap后迟到DMA、reset generation和并发mapping回收。压力让所有权窗口和回绕出现，不代表IOMMU性能不足。
+
+证据链是fault IOVA/requester/direction到具体request id和mapping生命周期。
+
+### FLR 后为什么设备仍枚举但业务不工作？
+
+FLR保留function在PCI拓扑中，但会清设备内部queue/DMA/IRQ状态。驱动必须stop、执行reset、恢复PCI state，重新写ring base/index、MSI-X映射和firmware状态，再允许提交。`lspci`可见只证明Configuration Space存在。
+
+错误答案是重新probe才能恢复；成熟驱动应把init/stop复用于slot_reset/runtime resume。
+
+### Ring full 时扩大队列是否就是 backpressure？
+
+不是。扩大只增加缓冲时间。Backpressure要求提交入口阻塞/`-EAGAIN`、payload pool与CQ high watermark传回生产者，设备也在CQ不足时停止消费SQ。长期生产率过高最终仍必须限流。
+
+### 如何在 USB 和 PCIe 之间选择控制与数据通路？
+
+先看角色、拓扑、可插拔、Host生态、带宽/延迟、主动DMA和安全。USB适合标准Class/线缆外设/MCU Device，PCIe适合板内低延迟MMIO和多队列DMA。某些系统用USB做维护、PCIe做高速数据，但要统一固件版本/reset协议。
+
+错误答案是只比较Gbps；软件生态、供电、隔离和恢复成本同样决定方案。
+
+### 如何证明 error recovery 真正完成？
+
+恢复后不仅设备重新出现，还要验证旧请求全部完成为错误、URB/DMA mapping/reference收敛、queue generation更新、IRQ/work无残留、新请求可运行且数据正确。USB做反复拔插/suspend，PCIe做FLR/AER/timeout。
+
+证据链应有状态迁移和计数守恒，不是一条“reset success”日志。
+
 ## 小结
 
 可靠的 USB/PCIe 面试回答必须给出对象、状态、调用上下文和证据链，并主动指出错误答案忽略的条件。USB 重点是 interface/endpoint/URB/Gadget/Class 与 disconnect；PCIe 重点是 Link/config/BAR/MSI-X/DMA/IOMMU/reset。真正可迁移的能力，是判断当前层次并沿所有权追到完成或回收。

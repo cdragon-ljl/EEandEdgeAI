@@ -55,6 +55,22 @@ PCIe 主要分配 bus number、BAR/bridge window、MSI vector 和 DMA IOVA。性
 
 USB 配置错误常见 endpoint/altsetting带宽不足；PCIe 资源错误常见 BAR aperture、MSI vector、DMA mask/IOMMU mapping。
 
+## 调度与流控体现总线哲学
+
+USB Host Controller为 endpoint安排 frame/microframe，Device不能主动发 transaction。Bulk使用剩余带宽，interrupt/iso按 interval和bandwidth预留；NAK让 Host稍后重试。Hub/TT还会影响低全速设备调度。
+
+PCIe Endpoint可主动发 Memory Read/Write，credit和tag限制 outstanding，Data Link replay保证相邻链路可靠。Queue/doorbell由设备协议定义，RC不逐请求轮询。PCIe backpressure表现为 credit、ring full、Completion延迟，USB则表现为 NAK、periodic带宽和URB调度。
+
+因此同样是“设备有数据”，USB Device准备IN endpoint等待Host token，PCIe Endpoint可DMA写Host内存后MSI-X。软件架构不能直接互换。
+
+## 功耗、安全和可访问范围
+
+USB设备通常受Host端口供电/功耗声明、autosuspend和remote wakeup控制，外接设备可频繁更换，Host应把描述符和payload当不可信输入。
+
+PCIe设备常有更强DMA权限。IOMMU/domain/group、ACS和reset决定隔离；Bus Master Enable打开后，错误descriptor可直接破坏内存。PCIe runtime PM/ASPM/D-state也比单纯断电复杂。
+
+MCU USB Device通过协议栈限制endpoint/buffer，Linux PCIe加速器则需要完整IOMMU和用户ABI安全模型。选择总线也要考虑攻击面和固件更新，不只看接口速率。
+
 ## 错误与恢复的基本单位不同
 
 USB 可在单个 URB 上报告 STALL、short packet、protocol error，也可 reset endpoint/device；拔出后 interface disconnect、在途 URB 被 shutdown/cancel。
@@ -62,6 +78,14 @@ USB 可在单个 URB 上报告 STALL、short packet、protocol error，也可 re
 PCIe 通过 Completion Status、AER、Link state、IOMMU fault 和设备 queue status报告。恢复可能是 queue reset、FLR、hot reset、secondary bus reset 或 slot power cycle。
 
 USB 类协议常有自己的 reset（如 MSC BOT reset）；PCIe driver 也有设备自定义 reset。总线可靠不替代设备协议恢复。
+
+### Error recovery 的触发和影响范围
+
+USB可针对 endpoint clear halt、取消单个URB、reset Device或重置Host端口；class还可执行BOT reset/UVC重新协商。拔出后对象重建，旧address/interface不能继续使用。
+
+PCIe可进行queue abort、FLR、Function error recovery、Secondary Bus/Hot Reset或slot power cycle；AER回调可能在同一 `pci_dev` 上恢复。Reset范围可能影响同桥其他function/device，必须评估。
+
+两者都要求先停止异步访问、让completion/IRQ/work收敛，再释放/重建资源。固定sleep不是error recovery，恢复后要验证generation、mapping和用户状态。
 
 ## 选择总线看设备行为，不只看峰值带宽
 

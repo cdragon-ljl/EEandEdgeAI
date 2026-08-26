@@ -73,6 +73,22 @@ USB 反复插拔、autosuspend/resume、STALL/reset、在途 URB取消；PCIe FL
 
 使用 trace-cmd 给 driver state、IRQ、workqueue 加时间线，比散落 printk 更容易判断停止顺序。动态调试应只打开目标 module/file，避免日志改变时序。
 
+## dynamic_debug、tracepoint 和 sanitizer 解决不同问题
+
+`dynamic_debug`按 module/file/function启用 `pr_debug()`，适合观察probe、PM、error path和状态机。USB可启用usbcore/HCD/class，PCIe可启用PCI core、AER、IOMMU和目标driver；高频路径应限范围。
+
+Tracepoint/ftrace/trace-cmd建立时间线：USB URB submit/complete、IRQ/work/调度，PCIe queue submit/IRQ/poll/reset。工具只记录内核已埋点事件，自定义driver应增加request id、queue id和generation trace。
+
+KASAN发现越界/UAF，lockdep发现锁顺序，kmemleak检查拔插后泄漏；IOMMU fault检测设备DMA越界。它们不能替代线级usbmon/PCIe analyzer，但能把软件所有权问题与协议问题分开。
+
+## Protocol analyzer 何时值得使用
+
+USB analyzer可直接观察reset、setup、token/handshake、包间时序和电气错误；当usbmon显示Host提交但Device无/错响应时很有价值。Device固件与Host抓包应对时。
+
+PCIe analyzer可观察LTSSM、TLP/DLLP、credit、replay、Completion和ordering；当AER/header log不足或怀疑硬件顺序时使用。`lspci -xxx`只是Configuration Space快照，不是TLP抓包。
+
+分析仪证据仍需映射到driver request/descriptor。没有request id/address对照，看到TLP也难定位应用操作。
+
 ## 证据矩阵
 
 - `usbmon + Wireshark`：USB transaction/URB，不能证明 Device 内部状态；

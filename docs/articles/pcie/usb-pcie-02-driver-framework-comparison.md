@@ -48,6 +48,22 @@ USB completion 和 PCI hardirq 都不能睡眠，适合自旋锁、状态提交�
 
 `usb_interface` 的 intfdata 与 `pci_dev` 的 drvdata只是找到私有对象，不自动保证对象还活着。kref/refcount、dead/disconnected 标志和停止异步工作仍需显式设计。
 
+## Reference count 保护软件对象，不代表硬件仍可用
+
+USB driver常用 `usb_get_dev()/usb_put_dev()` 保护 `usb_device`，对私有对象用 `kref`；interface disconnect后对象可因open file继续存在，但所有 I/O检查 disconnected。URB anchor负责在途请求，不等于用户引用。
+
+PCIe driver的 `pci_dev` 由device core管理，私有对象仍需 reference count保护open/VMA/work。Remove后即使内存还在，BAR已解除、DMA/IRQ已停，file operation必须返回dead。VMA引用只能延长payload内存，不能延长已拔出的硬件。
+
+Reference count解决“何时释放软件内存”，stop/kill/synchronize解决“硬件何时不再访问”，两者缺一不可。
+
+## 错误回滚与 managed resource 的边界
+
+USB probe失败反向释放endpoint buffer/URB、intfdata、注册节点和device引用；PCIe probe反向停止硬件、IRQ、DMA、BAR/region、master和enable。每个goto label只撤销已成功阶段。
+
+`devm_*`/`pcim_*`减少机械释放，但不会自动让设备DMA quiescent；USB interface managed action同样不能阻止completion重提。Managed resource释放前仍要执行总线特定stop顺序。
+
+错误注入应覆盖每个分配/注册阶段，确认没有残留sysfs节点、IRQ、URB、DMA mapping和reference。
+
 ## 电源管理和 reset 入口不同但目标相同
 
 USB runtime PM 可能 autosuspend Device/interface、停止 URB并支持 remote wakeup；resume 后 endpoint/interface配置由 core/class协同。
@@ -55,6 +71,14 @@ USB runtime PM 可能 autosuspend Device/interface、停止 URB并支持 remote 
 PCI PM 保存 PCI state、设置 D-state，并在 resume/reset 后重建 BAR 内 queue/IRQ/DMA状态。FLR/AER recovery 可在 `pci_dev` 不消失时重置 function。
 
 两者都应把 start/stop/reinitialize 抽成内部状态机供 probe、resume、reset共享，避免每个回调复制不同资源顺序。
+
+## 用户接口和权限模型不能照搬
+
+USB标准Class通常通过TTY、Block、Input、V4L2、ALSA子系统提供成熟权限/ABI；Vendor设备可用usbfs/libusb或自定义driver。用户不能直接控制HCD ring。
+
+PCIe自定义设备常使用char/ioctl/mmap或VFIO。BAR/doorbell和DMA ring直接暴露会允许任意设备访问，必须限制offset、buffer ownership、IOMMU mapping和reset。VFIO以IOMMU group为安全边界。
+
+对两种总线，ABI都要定义版本、timeout、取消、拔出/reset后返回值和兼容性；“mmap零拷贝”不能替代权限与生命周期设计。
 
 ## 代码阅读时从哪些入口进入
 

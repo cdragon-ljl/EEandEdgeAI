@@ -31,6 +31,14 @@ lspci -s BDF -vvxxxx
 
 Vendor ID 可读但 header 后部异常，可能是配置访问宽度/ATU；bridge 下设备缺失，检查 secondary/subordinate bus 与 bridge reset/window；BDF 变化不应被脚本写死。
 
+### Configuration Space 原始读取是枚举层的边界证据
+
+Endpoint进入 L0后，Root Complex应能通过 ECAM/config window读取 Vendor ID和 Header。`lspci -xxxx` 与 sysfs config展示 Configuration Space；完全读全 1/abort时，检查 RC config ATU、bus range和 BDF，而不是 BAR driver。
+
+Type 1 bridge的 secondary/subordinate bus和 memory window决定下游可见性。Bridge本身可见、下游缺失时，递归 bus number或 reset/window是独立故障层。
+
+Capability链损坏会让 MSI/AER/PCIe能力解析异常；记录原始 offset/next，避免用 setpci盲改。
+
 ## 阶段三：BAR 和地址转换
 
 `lspci -vv` 查看 Region，sysfs resource 核对 Host 分配：
@@ -55,6 +63,14 @@ lspci -s BDF -k
 未绑定看 ID/module/override；probe 失败按 enable、regions、DMA mask、BAR、IRQ、queue 的最后成功点定位。dynamic debug 应打印具体 errno 与硬件状态。
 
 设备 enable 后 probe 失败还可能留下 bus master 或中断，检查错误路径是否反向回滚。
+
+### Completion Timeout、Unsupported Request 与 Malformed TLP 指向不同问题
+
+Memory Read有 request/completion配对。Completion Timeout说明目标没有在期限内返回，可能是 address route、Endpoint状态或内部总线卡住；Unsupported Request常见访问未实现 BAR/offset或属性不支持；Completer Abort表示目标接收但无法完成；Malformed TLP更接近格式/硬件协议错误。
+
+AER header log可还原 TLP header，结合 requester/completer和 address定位。不要把所有 AER都归为信号质量，Receiver Error/Bad DLLP与 UR/CTO属于不同层。
+
+Posted Write没有 completion，写错地址可能只通过 AER或后续业务超时体现。关键控制写按设备规范 readback确认。
 
 ## 阶段五：INTx/MSI/MSI-X
 
@@ -84,6 +100,14 @@ dmesg -w | grep -i -E 'aer|pcie'
 ```
 
 恢复可能执行 FLR、hot reset、secondary bus reset 或 slot power cycle。Reset 后 BAR 配置通常由 PCI core 保持/恢复，但设备内部 ring/IRQ 状态需要驱动重建。
+
+### Reset 后必须重建哪些状态
+
+FLR重置单 function，Secondary Bus Reset影响桥下链路，PERST#/slot power更彻底。Reset可能清设备 DMA engine、queue index、MSI-X table shadow和内部 firmware，但 Host配置空间/BAR由PCI core重新恢复部分状态。
+
+驱动恢复顺序：冻结提交、停/确认 DMA、mask/sync IRQ、执行 reset、恢复 PCI state、重新写 BAR queue/doorbell、清旧 completion、增加 generation、unmask并唤醒。跳过任何一步都可能让旧 DMA访问新内存。
+
+AER `error_detected/slot_reset/resume`、timeout recovery与remove需要共享状态机，防止并发双 reset或双释放。
 
 ## 用一张证据链避免跨层猜测
 

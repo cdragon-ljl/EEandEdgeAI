@@ -19,6 +19,12 @@ Linux `usbhid` 解析 report descriptor，创建 `hid_device`，再映射到 inp
 
 排查 HID 时，`lsusb -v` 只能看到 HID descriptor，真正字段要从 debugfs hid report descriptor 或 usbmon 数据解析。报告长度与 endpoint max packet 不一致、Report ID 遗漏、logical min/max 错误都可能造成事件异常。
 
+HID Report Descriptor 是一台小型虚拟机式的数据声明：Global item 设置 Usage Page、Logical Min/Max、Report Size/Count，Local item选择 Usage，Main item声明 Input/Output/Feature。Report ID 不为 0 时，每个 report 首字节携带 ID；Host buffer 长度和解析必须包含它。
+
+控制请求 `GET_REPORT/SET_REPORT` 处理 Feature/Output，`SET_IDLE` 控制重复上报，`SET_PROTOCOL` 在 Boot/Report Protocol 间切换。键盘 BIOS 场景依赖 Boot Protocol，复杂传感器通常只支持 Report Protocol。错误的 Report Count/Size 可能让 endpoint 字节能收到却无法映射 input event。
+
+调试可查看 `/sys/kernel/debug/hid/*/rdesc`、`hid-recorder`/hidraw 与 usbmon，对照 Report Descriptor 计算每个字段 bit offset，不要仅凭十六进制 payload 猜键位。
+
 ## MSC：USB bulk 传输之上仍有存储命令协议
 
 传统 Mass Storage Bulk-Only Transport 使用一个 bulk OUT、一个 bulk IN。Host 发送 CBW（命令块封装），设备执行 SCSI 命令并传输数据，最后返回 CSW（命令状态封装）。Linux `usb-storage` 把设备接入 SCSI 中层，最终出现 `/dev/sdX`。
@@ -27,6 +33,12 @@ Linux `usbhid` 解析 report descriptor，创建 `hid_device`，再映射到 inp
 
 高性能设备可能使用 UAS，它借助多个 stream/queue 提高并发，并由 `uas` 驱动而非 `usb-storage` 管理。设备 quirks 可能迫使 Linux 回退 BOT。
 
+BOT 的一条命令严格经历 CBW、可选 Data、CSW。CBW 包含 signature、tag、data length、direction 和 SCSI CDB；CSW 回显 tag并给出 residue/status。Tag 不匹配或 CSW signature 错误意味着 transport失步，不是文件系统错误。
+
+Endpoint STALL/phase error 的恢复通常执行 Mass Storage Reset、clear halt bulk IN/OUT，再重新同步 CBW/CSW。SCSI CHECK CONDITION 还要发 REQUEST SENSE，区分介质未就绪、写保护和硬件错误。
+
+UAS 使用 USB streams 与 SCSI task management，允许多个 command并行和乱序完成；Linux `uas` 对 HCD stream/设备 quirks 有要求。不稳定设备可能通过 quirks 回退 `usb-storage` BOT。性能比较必须确认实际绑定模块与 queue depth。
+
 ## CDC ACM：两个 interface 共同形成串口功能
 
 CDC ACM 通常包含 Communication Class interface 和 Data Class interface。控制 interface 提供 interrupt IN notification 和 line coding/control line state 请求，数据 interface 提供 bulk IN/OUT。IAD 或 Union Functional Descriptor 说明两者关系。
@@ -34,6 +46,12 @@ CDC ACM 通常包含 Communication Class interface 和 Data Class interface。�
 Linux `cdc_acm` 绑定后接入 TTY core，生成 `/dev/ttyACM*`。用户写串口参数时，驱动通过 class control request 发送 SET_LINE_CODING；bulk endpoint 才传实际字节流。
 
 `/dev/ttyUSB*` 常来自 FTDI/CH34x/CP210x 等 vendor serial 驱动，不等于 CDC ACM。排错时先看 interface class 和绑定模块，再看设备节点名字。
+
+控制面常见请求包括 `SET_LINE_CODING`、`GET_LINE_CODING`、`SET_CONTROL_LINE_STATE` 和 `SEND_BREAK`。Line coding 只是向设备传递期望波特率/格式，USB bulk 链路本身不按这个波特率发送；设备若桥接 UART 才据此配置 UART。
+
+Interrupt IN notification 可上报 SERIAL_STATE（DCD/DSR/break/parity 等）。Control/Data interface通过 Union Functional Descriptor 或 IAD关联，驱动可能用 `usb_driver_claim_interface()` 占用伙伴。固件 interface 编号或 Union 引用错误，会出现控制节点绑定但 bulk data interface 被别的驱动占用。
+
+`cdc_acm` 的 write buffer、read URB 与 TTY flip buffer构成异步链路。`ttyACM` 打开成功但无数据，要分别检查 class control、bulk endpoint、URB completion和下游 UART/协议。
 
 ## UVC：控制面和流数据面分属不同 interface
 
@@ -46,11 +64,23 @@ v4l2-ctl --list-formats-ext -d /dev/video0
 v4l2-ctl --stream-mmap=4 --stream-count=300 -d /dev/video0
 ```
 
+Streaming 开始前，Host 在 VideoStreaming interface上执行 UVC Probe/Commit：先提交期望 format/frame/interval/payload，读取设备调整结果，再 Commit 固化。之后选择带宽足够的 Alternate Setting并提交 isochronous/bulk URB。
+
+每个 UVC payload 有 header，包含 FID、EOF、PTS/SCR 和 error bit。`uvcvideo` 按 FID/EOF 将多个 USB packet组装成 frame；某个 iso packet status失败、payload error或 EOF 丢失都会影响一帧，而不一定让整条 URB status失败。
+
+带宽错误应核对 `wMaxPacketSize` transaction bits、`bInterval`、altsetting和同一 Host controller 上其他 periodic endpoint。应用 buffer不足则出现在 V4L2 queue/drop，不应混为总线带宽。
+
 ## UAC：时钟、altsetting 与同步方式共同决定音频流
 
 USB Audio Class 用 AudioControl interface 描述 clock/entity，用 AudioStreaming interface 描述 PCM format 和 endpoint。Isochronous endpoint 按帧持续传输，异步播放设备可能通过 feedback endpoint 调整 Host 发送速率。
 
 Linux `snd-usb-audio` 接入 ALSA。设备能枚举但 `arecord/aplay` 失败时，要检查支持的 sample format/rate/channel、altsetting、clock source 和 feedback，而不是只看 endpoint 地址。
+
+UAC 的 Clock Source/Selector、Feature Unit 与 Terminal entity形成控制拓扑。Host 选择 sample rate、channel/format和 Streaming altsetting后，iso endpoint持续搬 PCM。设备描述符声明的 rate 与实际 clock不一致会产生长期漂移。
+
+同步类型决定速率控制：synchronous 跟随 USB SOF，adaptive 设备适应 Host，asynchronous 设备使用独立时钟并通过 feedback endpoint告诉 Host 实际消费速率。Feedback 格式与更新周期错误会造成周期性 underrun/overrun，即使每个 packet都成功。
+
+Linux `snd-usb-audio` 日志、`/proc/asound/card*/stream*` 和 `arecord/aplay --dump-hw-params` 可核对 altsetting、endpoint、format和 rate。音频爆音要同时看 iso packet status、feedback和 ALSA XRUN。
 
 ## 标准 Class 与 Vendor Class 如何选择
 

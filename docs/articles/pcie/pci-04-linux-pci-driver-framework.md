@@ -88,6 +88,14 @@ err_disable:
 
 完整驱动应为每个后续阶段设置明确 label，且 label 只撤销已经完成的步骤。把所有错误跳到同一个 `kfree` 会遗漏 IRQ、DMA、BAR 或 device enable。
 
+### 完整错误回滚要覆盖 IRQ、ring 和硬件启动
+
+Probe后半段常见顺序是 alloc ring、`pci_alloc_irq_vectors()`、request IRQ、program base、start/unmask。每一步都应有对应 label：启动失败先 mask/stop，free IRQ/vector，free DMA，iounmap，clear master，release regions，disable device。
+
+IRQ在 request成功后可能立即到达，所以软件 queue、lock和私有指针必须先初始化，设备中断源保持 mask到最后。反向释放时先 mask并 `synchronize_irq()`，再释放 handler和ring，避免早到/迟到中断访问半初始化内存。
+
+`pci_set_drvdata()` 只保存指针，不增加自定义对象 reference count。用户 open、mmap、work和error recovery并发时仍需 dead状态、refcount和完成同步。
+
 ## Managed API 能减少释放代码，但不能决定停机顺序
 
 `pcim_enable_device()`、`pcim_iomap_regions()`、`devm_kzalloc()`、`devm_request_irq()` 等可以在 device detach 时自动释放资源。它们适合缩短机械回滚，但不会替你停止设备 DMA、mask 中断或等待 workqueue。
@@ -113,6 +121,14 @@ Suspend/resume 需要保存/恢复 PCI state、停止队列、设置电源状态
 成熟驱动应把“停止硬件、初始化硬件、恢复队列”拆成可重入内部函数，让 probe、resume、reset/error recovery 共享，而不是在每个回调复制不同顺序。
 
 官方 PCI 驱动 API 见 [PCI Support Library](https://docs.kernel.org/driver-api/pci/pci.html)。调试 probe 失败时，除 dmesg 外应检查 resource、enable count、DMA mask、MSI capability 和 driver symlink，定位最后一个成功阶段。
+
+### runtime PM、system sleep 与 reset 的状态差异
+
+Runtime PM处理设备空闲但仍绑定：`pm_runtime_get_sync()`/put 控制 active引用，runtime_suspend停止 queue/IRQ并进入 D-state，runtime_resume恢复 PCI state和设备内部寄存器。System suspend还要协调冻结用户任务、wake capability和平台电源。
+
+FLR只重置 function，Secondary Bus Reset影响桥下多个设备，Hot Reset影响链路。Reset可能清 DMA engine、MSI-X table和BAR内部配置，但 `pci_dev`对象仍存在。驱动应复用统一 stop/init函数重建 queue，而不是只重新写一个 control bit。
+
+AER通过 `struct pci_error_handlers` 的 `error_detected()`、`slot_reset()`、`resume()` 协商恢复。`error_detected()` 停止 I/O并返回恢复能力，slot_reset重新初始化硬件，resume恢复提交。不能在 AER callback与普通 remove同时重复释放资源。
 
 ## 小结
 

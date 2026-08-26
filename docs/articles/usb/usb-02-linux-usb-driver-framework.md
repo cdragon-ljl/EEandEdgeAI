@@ -230,7 +230,7 @@ USB core 做的事情包括：
 
 ### 从 Host Controller 到 interface driver 的分层
 
-Host Controller Driver（xHCI/EHCI/DWC2 等）把硬件队列和寄存器适配为通用 HCD，向 usbcore 注册 root hub，并把 URB 转成控制器描述符；hub 驱动处理端口、复位和枚举；usbcore 管理 `usb_device`、`usb_interface` 与 URB；具体 `struct usb_driver` 只实现某个 interface 功能。
+Host Controller Driver（xHCI/EHCI/DWC2 等）把硬件队列和寄存器适配为 `struct usb_hcd` 与通用 HCD 操作，向 usbcore 注册 root hub，并把 URB 转成控制器描述符；hub 驱动处理端口、复位和枚举；usbcore 管理 `usb_device`、`usb_interface` 与 URB；具体 `struct usb_driver` 只实现某个 interface 功能。
 
 ```mermaid
 flowchart TB
@@ -343,6 +343,18 @@ dmesg -w
 ### 坑 5：把 USB 当普通字符设备写
 
 USB 驱动不是简单的 `open/read/write`，它先要走匹配和传输模型。
+
+### 一个驱动需要占用伙伴 Interface 时怎么办
+
+某些复合功能由多个 interface 组成，例如 CDC control/data。主 interface 的 probe 可通过描述符找到伙伴，再用 `usb_driver_claim_interface()` 让同一 driver 显式占用它；disconnect/unwind 时必须 `usb_driver_release_interface()`。不能只保存伙伴指针却让另一个驱动同时绑定，也不能假设 interface 编号固定为 0/1。
+
+Claim 成功后两个 interface 仍有独立 intfdata 和 PM 状态。驱动要定义哪个对象拥有共享私有结构、哪个 disconnect 执行最终停止，避免两个 disconnect 重复释放。
+
+### runtime PM 让“设备还插着但暂时不可传输”成为常态
+
+USB autosuspend 会在空闲时让 interface/device进入低功耗，远程唤醒或下一次 I/O 再恢复。File operation 启动控制/数据传输前，可按驱动模型使用 `usb_autopm_get_interface()`，完成后 `usb_autopm_put_interface()`；失败与断开路径必须配对。
+
+Runtime PM 回调应停止/恢复 URB 与设备 class 状态。仅因物理未拔出就假设 endpoint 永远可用，会在 suspend 窗口得到 `-EHOSTUNREACH/-ESHUTDOWN` 或丢失设备配置。
 
 ## 十四、把这一讲记成一句话
 

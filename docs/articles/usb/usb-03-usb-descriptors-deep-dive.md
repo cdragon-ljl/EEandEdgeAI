@@ -301,6 +301,12 @@ int usb_set_interface(struct usb_device *dev,
 
 对普通厂商自定义 bulk 设备，很多时候只有 alt 0。但写驱动时仍然不要忽略这个概念，尤其是分析摄像头、声卡这类设备时。
 
+### Linux 如何保存配置与 Alternate Setting
+
+usbcore 读取完整配置树后建立 `struct usb_host_config`，其中保存 Configuration Descriptor、interface cache、IAD 和 extra descriptor。每个 `usb_interface` 指向当前 `struct usb_host_interface`，其 altsetting 数组保存同一 interface number 的不同 Alternate Setting。
+
+类驱动切换高带宽模式时调用 `usb_set_interface()`，成功后 `cur_altsetting` 改变，endpoint 能力也随之改变。驱动不能在 probe 时缓存一个 endpoint descriptor 后无视后续 altsetting 切换。
+
 ## 七、Endpoint Descriptor：真正的数据通道地图
 
 Endpoint 是 USB 数据传输的通道。除了默认控制端点 0 以外，普通数据端点都通过 Endpoint Descriptor 描述。
@@ -458,6 +464,12 @@ IAD 不会让 Linux 只创建一个 interface；usbcore 仍创建多个 `usb_int
 BOS（Binary Object Store）由 BOS header 与多个 Device Capability 组成，可描述 USB 2.0 Extension、SuperSpeed、Container ID 和 Platform Capability。WebUSB、Microsoft OS 2.0 等常借助 Platform Capability 给出 UUID、vendor code 或 descriptor set 信息。
 
 Host 是否读取 BOS 与设备 USB 版本、平台能力有关。排查 SuperSpeed 或平台 descriptor 时，不能只检查 Configuration tree；还要核对 BOS 的总长度、每个 capability 的 `bLength` 和后续 vendor request 是否一致。
+
+### 在 extra 字节中安全寻找 Class Descriptor
+
+Class-specific descriptor 常保存在 `usb_host_interface->extra` 或 endpoint extra 中。驱动可以用 `usb_get_extra_descriptor()` 按类型查找，但返回前仍需验证 class 版本、`bLength`、引用的 interface/entity ID 和剩余长度。
+
+直接把 `extra` 强转成目标结构并信任 `wTotalLength` 会把外部设备输入变成越界读取。CDC Union、UVC/UAC entity 链等还要检查引用对象确实存在，避免形成环或悬空 ID。
 
 ## 十、使用 lsusb -v 读懂真实设备
 

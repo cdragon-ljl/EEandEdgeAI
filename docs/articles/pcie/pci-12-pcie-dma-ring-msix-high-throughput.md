@@ -322,6 +322,14 @@ CPU 使用率
 
 如果队列经常满，可能是设备发送太快或上层处理太慢；如果队列长期空，可能是提交线程、内存分配或设备生产端不足。
 
+### Backpressure 必须从 CQ 一直传回提交入口
+
+当 SQ free低于阈值，submit阻塞或返回 `-EAGAIN`；当 payload pool耗尽，不能继续只填 descriptor；当 CQ接近满，Device必须停止取新SQE或触发 overflow/error。任何一层继续生产都会覆盖仍有所有权的数据。
+
+驱动暴露 queue depth、SQ/CQ high watermark、ring full、dropped和wait time，用户态据此限流。加深 ring只能吸收短突发，长期生产速率大于消费速率时只会增加延迟。
+
+多队列共享全局内存/带宽时还要公平调度，避免一个 queue耗尽 descriptor或MSI-X预算。Reset/错误向所有阻塞提交者广播并让状态收敛。
+
 ## 十、背压、generation 与 reset 让 ring 能长期运行
 
 SQ 满时 software producer 不能覆盖 device consumer 尚未释放的槽位；可以阻塞提交者、返回 `-EAGAIN` 或让上层 queue 限流。CQ 接近满时 Device 也必须停止产生新 completion 或报告 overflow，否则软件会永久丢失 buffer ownership。

@@ -561,6 +561,12 @@ usb_control_msg()
 
 如果你将来要看 USB 摄像头或音频驱动，这一块非常重要。
 
+### `iso_frame_desc` 让每个 packet 独立报告结果
+
+Isochronous URB 在尾部携带 `iso_frame_desc[]`。每项给出 buffer offset、期望 length、actual_length 和 status；`number_of_packets` 决定数组项数，`interval/start_frame` 参与周期调度。
+
+整条 URB 的 `status == 0` 不代表每个 packet 都成功。音视频驱动必须逐项检查丢包/短包，再按 class payload header 组帧。重提 URB 前也要重新初始化每项 length/status，不能沿用上一次实际长度。
+
 ## 十六、常见错误与排查方法
 
 ### 1. `usb_submit_urb()` 返回失败

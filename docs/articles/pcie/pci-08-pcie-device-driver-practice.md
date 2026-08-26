@@ -155,6 +155,14 @@ writel(1, dev->bar0 + REG_DOORBELL);
 
 这里体现了 PCIe 驱动最典型的数据启动方式：准备 buffer，写地址，敲 doorbell。
 
+### DMA mask、ring 和中断必须在启动前闭合
+
+示例在 `dma_alloc_coherent()` 前应先尝试 `dma_set_mask_and_coherent()`，64 位失败再按硬件能力回退 32 位；不能分配后再发现设备地址寄存器装不下。`pci_set_master()` 只允许设备发事务，不替代 mapping。
+
+单 buffer演示能验证一次 DMA，但长期数据通路应使用 descriptor ring：CPU填地址/长度、`dma_wmb()`、推进 producer并写 doorbell；IRQ读取 completion前 `dma_rmb()`，按 request id回收。Request table记录 FREE/PREPARED/DEVICE_OWNED/DONE/FAILED和generation。
+
+申请 IRQ后设备源保持 mask，直到 ring、lock和waitqueue初始化完成。停止时先 mask/stop、`synchronize_irq()`，再释放 ring，防止早到/迟到中断。
+
 ## 七、申请中断
 
 ```c
@@ -184,7 +192,7 @@ ret = request_irq(dev->irq, demo_irq, 0, "demo_pci", dev);
 
 真实设备里，中断处理一般只做快速确认和唤醒，复杂处理放到底半部。
 
-## 八、把完成事件交给用户态：ioctl、poll 与 mmap
+## 把完成事件交给用户态：ioctl、poll 与 mmap
 
 真实驱动需要把“提交”和“完成”变成稳定 ABI。ioctl 可以接收 command、buffer index、length，驱动验证参数和设备状态后填 DMA descriptor、执行 `dma_wmb()`、推进 producer 并写 doorbell。Ring 满时阻塞或返回 `-EAGAIN`，不能覆盖仍由设备拥有的槽位。
 
@@ -194,11 +202,19 @@ ret = request_irq(dev->irq, demo_irq, 0, "demo_pci", dev);
 
 零拷贝不是简单调用 mmap。必须定义 CPU/设备/用户三方何时拥有 buffer、谁执行 cache sync/barrier、进程异常退出如何回收、reset 后旧 buffer 如何失效。
 
-## 九、timeout 与 reset 先停止 DMA，再回收内存
+## Timeout 与 reset 先停止 DMA，再回收内存
 
 DMA timeout 后不能立即 free buffer。驱动先阻止新提交、mask IRQ、停止或 abort queue，确认设备 quiescent，再 unmap/recycle in-flight request。若设备不再响应，可执行 Function Level Reset 或设备自定义 reset，并重建 BAR 内 queue base、producer/consumer 和 MSI-X 状态。
 
 Reset 期间 ioctl 返回 busy，poll 唤醒错误。每次 reset 增加 generation，迟到 completion 若携带旧 id/generation必须丢弃，不能误完成新请求。Remove 复用同一 stop 状态机：撤销用户入口、停止 DMA、同步 IRQ/work，最后释放 coherent memory、BAR 和 PCI resource。
+
+## 电源管理、AER 与并发状态机
+
+Runtime PM空闲时停止 queue并进入低功耗，resume重新写 BAR内 queue base/doorbell/IRQ状态。System suspend、FLR和AER slot_reset也应复用 stop/init函数，避免 probe与恢复路径分叉。
+
+`struct pci_error_handlers` 的 `error_detected()` 先冻结 I/O，`slot_reset()` 重建硬件，`resume()` 恢复提交。与 remove并发时用全局状态和锁保证只执行一次资源释放。
+
+多进程 open/mmap使用 reference count延长软件对象，但 dead状态后禁止 MMIO/DMA。最后一个 reference只释放内存，硬件资源已由 remove/恢复状态机停止。
 
 ## 八、remove 清理流程
 

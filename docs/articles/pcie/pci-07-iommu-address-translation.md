@@ -38,6 +38,14 @@ Domain 包含 IOVA 到物理页的映射和权限，设备或一组必须共享�
 
 Map 时选择页大小、read/write permission，unmap 后还要失效 IOTLB。频繁小映射会产生页表与 invalidation 开销，批量/长期 buffer 可减少成本，但增加 pinned memory 和生命周期压力。
 
+### IOMMU group 决定最小安全隔离单元
+
+Requester ID通常选择 domain，但缺少 ACS或共享桥/别名时多个 function可能无法隔离，Linux把它们放入同一 IOMMU group。VFIO只能安全地把整个 group交给一个用户/VM；只解绑其中一个 function不一定阻止伙伴发起访问。
+
+`/sys/kernel/iommu_groups/*/devices` 展示分组。组过大时先检查硬件拓扑/ACS和平台限制，不应通过忽略 group强行直通。
+
+Domain页表权限包含 read/write，map/unmap后还需 IOTLB invalidation。设备缓存 ATS translation时，还要同步失效 device TLB。
+
 ## Fault 是最直接的越界证据
 
 IOMMU fault 常包含 requester、IOVA、读写方向和原因。典型根因：
@@ -51,6 +59,14 @@ IOMMU fault 常包含 requester、IOVA、读写方向和原因。典型根因：
 
 记录 fault IOVA 后，应回到软件 descriptor/ring 查对应请求，而不是简单关闭 IOMMU。`iommu=off` 能“绕过”问题时，往往只是让越界变成静默内存破坏。
 
+### DMA map 到 IOVA 的完整生命周期
+
+`dma_map_single()` 检查 DMA mask、选择 IOVA区间、建立物理页映射并执行平台 cache操作；descriptor只保存返回 IOVA。Device完成后 unmap撤销映射/失效 IOTLB，地址可被重用。
+
+长期 buffer pool可减少 map/IOTLB成本，但 reset/remove仍要统一 unmap。Unmap后迟到 DMA可能 fault到同一旧 IOVA；若 IOVA已重新分配，还可能静默破坏新 buffer，因此 generation与设备 quiescent同样重要。
+
+大页/连续 IOVA可减少 IOTLB miss，但物理页不必连续。IOVA allocator碎片、页表内存和 invalidation批次也要纳入性能测量。
+
 ## SWIOTLB 是 bounce，不是 IOMMU 隔离
 
 设备 DMA mask 无法到达目标物理页、平台又没有合适 IOMMU mapping 时，DMA layer可能使用 SWIOTLB：分配设备可达的低地址 bounce buffer，TO_DEVICE 前复制进去，FROM_DEVICE 后复制回来。
@@ -62,6 +78,12 @@ IOMMU fault 常包含 requester、IOVA、读写方向和原因。典型根因：
 Address Translation Service（ATS）允许设备缓存地址转换；Page Request Interface（PRI）允许请求缺页服务；PASID 标识进程/地址空间。它们用于 SVA、加速器和虚拟化，但要求 PCIe capability、IOMMU 和驱动协同。
 
 启用 ATS 后还要维护 device TLB invalidation；PASID 不等于自动安全，设备必须在每个请求携带正确标识。普通 DMA ring 驱动不需要为了“性能”自行打开这些能力。
+
+### ATS、PRI、PASID 的调用关系
+
+ATS让设备请求并缓存 IOMMU translation；PRI让设备在访问缺页时发 Page Request；PASID在 TLP中标识进程/地址空间。三者组合可实现 Shared Virtual Address，但需要 PCIe capability、IOMMU、mmu notifier和设备 fault恢复共同支持。
+
+PASID并不自动等于权限，设备每个 request必须带正确 PASID，IOMMU为其选择 page table。进程退出或 unmap时要 invalidate CPU/IOMMU/device三处 translation。普通固定 DMA ring没有需求时不应自行启用。
 
 ## VFIO 把 IOMMU 隔离交给用户态/虚拟机
 

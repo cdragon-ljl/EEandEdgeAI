@@ -194,11 +194,11 @@ USB 之所以适合各种外设，是因为它支持不同特性的传输方式�
 
 ### EP0 上真正发生的是三阶段控制传输
 
-枚举步骤背后都是 Endpoint 0 控制传输。每次请求先发送 8 字节 Setup packet，包含方向/类型/接收者、`bRequest`、`wValue`、`wIndex` 和 `wLength`；随后是可选 Data 阶段，最后用反方向零长度 Status 阶段确认完成。
+枚举步骤背后都是 Endpoint 0 控制传输。每次请求先发送 8 字节 Setup packet，其中 `bmRequestType` 编码方向、请求类型和接收者，随后是 `bRequest`、`wValue`、`wIndex` 和 `wLength`；随后是可选 Data 阶段，最后用反方向零长度 Status 阶段确认完成。
 
-`GET_DESCRIPTOR` 用 `wValue` 高字节表示描述符类型、低字节表示索引。Host 首次只取 Device Descriptor 前 8 字节，是为了先得到 EP0 最大包长。`SET_ADDRESS` 的特殊点是 Device 必须等 Status 阶段结束后再切换到新地址，否则 Host 的状态包仍发往地址 0，而设备已经不再响应。
+`GET_DESCRIPTOR` 用 `wValue` 高字节表示描述符类型、低字节表示索引。Host 首次只取 Device Descriptor 前 8 字节，是为了先得到 `bMaxPacketSize0`，再用正确 EP0 最大包长完成后续控制传输。`SET_ADDRESS` 的特殊点是 Device 必须等 Status 阶段结束后再切换到新地址，否则 Host 的状态包仍发往地址 0，而设备已经不再响应。
 
-Linux hub 线程检测端口变化、去抖和 reset 后创建 `usb_device`。`usb_new_device()` 继续读取设备/配置描述符、建立字符串和配置对象并注册整台设备；`usb_set_configuration()` 选择配置并创建各 `usb_interface`，driver core 随后才匹配 interface driver。于是可以按状态区分问题：
+Linux hub 线程从 `hub_port_connect_change()` 进入 `hub_port_connect()`，完成端口去抖、reset、速度识别和 `usb_device` 分配。`usb_new_device()` 继续读取设备/配置描述符、建立字符串和配置对象并注册整台设备；`usb_set_configuration()` 选择配置并创建各 `usb_interface`，driver core 随后才匹配 interface driver。于是可以按状态区分问题：
 
 ```text
 没有 connect 日志        -> VBUS / role / PHY / port
@@ -392,6 +392,17 @@ USB 线只接通了供电，数据线没通，或者接触不良。
 ### 5. 带宽或传输问题
 
 比如摄像头、声卡这类高数据量设备，如果总线带宽不够，可能出现掉帧、卡顿、超时。
+
+### 从 errno 和 usbmon 判断枚举停在哪一步
+
+`-EPROTO` 常见于 PID/CRC/握手等协议错误或信号问题，`-ETIMEDOUT` 表示预期响应未到，`-EPIPE` 表示 STALL。它们只有结合请求阶段才有意义：Device Descriptor 第一次读取失败与 `SET_CONFIGURATION` 后类请求 STALL 不是同一问题。
+
+```bash
+sudo modprobe usbmon
+sudo cat /sys/kernel/debug/usb/usbmon/0u
+```
+
+usbmon 能看到 EP0 submit/complete、setup 字段、返回长度和 status。Wireshark 打开 usbmon 接口后可直接解码 `GET_DESCRIPTOR`、`SET_ADDRESS` 和 `SET_CONFIGURATION`。先找到最后一个成功请求，再检查 Device 固件对应 handler，比反复插拔更能定位地址切换和描述符问题。
 
 ## 十一、应该如何建立 USB 的学习脑图
 

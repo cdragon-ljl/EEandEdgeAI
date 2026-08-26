@@ -38,6 +38,14 @@ ring = dma_alloc_coherent(&pdev->dev, ring_bytes,
 
 Ring、completion queue、doorbell shadow 等长期共享结构适合 coherent memory。大 payload 全部使用 coherent 可能浪费受限区域或降低 cache 性能。
 
+### Coherent 不等于无须 memory barrier
+
+Coherent保证 CPU 与设备无需显式 cache clean/invalidate即可看到同一内存，但不保证字段发布顺序。CPU填 descriptor各字段后执行 `dma_wmb()`，再写 ownership/producer/doorbell；Host消费 Device CQE前执行 `dma_rmb()`，再读 status/payload。
+
+`wmb()`、`dma_wmb()` 和 MMIO ordering面向不同观察者。DMA共享结构优先使用 DMA barrier，doorbell使用 `writel()`；仅把字段声明为 volatile无法建立设备可见顺序。
+
+Coherent allocation返回的 CPU/DMA address都要按设备寄存器宽度写入。Ring size、alignment和不跨硬件边界等限制由设备 ABI额外检查。
+
 ## Streaming mapping 适合有明确所有权阶段的数据 buffer
 
 ```c
@@ -56,6 +64,14 @@ dma_unmap_single(&pdev->dev, dma, len, DMA_TO_DEVICE);
 
 Scatterlist 使用 `dma_map_sg()` 后，以返回的 DMA segment 数遍历，而不是原始 sg entry 数。IOMMU 或合并可能改变 segment 边界。
 
+### 重复共享 streaming buffer 需要 sync，而不是反复猜 cache
+
+一次 map到最终 unmap之间，ownership可多次切换。设备写完后 CPU读取前调用 `dma_sync_single_for_cpu()`；CPU修改后再次交设备前调用 `dma_sync_single_for_device()`。Direction仍必须与实际数据流一致。
+
+`dma_map_sg()` 可能合并相邻 entry，返回 DMA segment数。编程设备时使用 `for_each_sg(sgl, sg, count, i)` 对应映射后的 DMA地址/长度语义，而 unmap使用原始 nents参数，遵循 DMA API文档，不能混用返回值。
+
+映射失败用 `dma_mapping_error()`；高频 map/unmap的错误路径也必须配对。Timeout/reset前若设备仍访问，不能提前 sync/unmap/free。
+
 ## Descriptor ring 是一份所有权状态机
 
 ```mermaid
@@ -73,6 +89,14 @@ CPU 填 descriptor 地址、长度和 flag，执行 `dma_wmb()`，再更新 prod
 `volatile` 只能影响编译器单次访问，不能替代 DMA barrier/cache maintenance。Doorbell MMIO ordering 与 descriptor memory ordering要一起满足。
 
 Ring full/empty 通常由 monotonic producer/consumer 或 generation/phase bit区分。只用相等判断而没有额外状态，容易把 full 与 empty 混淆。
+
+### Ring wrap、generation 和乱序完成
+
+长度为 2 的幂可用 mask回绕，但 full/empty仍需保留一槽、单调计数或 phase bit。Producer只发布 PREPARED descriptor，consumer只回收 COMPLETED；设备和CPU各写自己的 index，避免双写 cache line。
+
+设备允许乱序完成时，CQE携带 request id/generation，Host按 id查 mapping；不能默认最早提交最早完成。Reset增加 generation，迟到旧 CQE必须丢弃，防止完成已复用 buffer。
+
+Scatter-gather descriptor还要限制每请求 segment数、总长度和硬件边界，映射后的 segment与用户原始 iovec不一一对应。
 
 ## DMA completion 不等于数据可以立即释放
 

@@ -28,6 +28,14 @@ flowchart TB
 
 Bridge/port 将总线号范围隔开。Linux 枚举得到的 domain:bus:device.function（BDF）是拓扑位置，不是设备永久身份；热插拔或固件资源变化可能改变 BDF。
 
+## Lane 速率、编码和有效带宽要分开计算
+
+Gen1/Gen2 使用 8b/10b 编码，2.5/5.0 GT/s 每 10 bit只有 8 bit有效；Gen3 起使用 128b/130b，速率依次为 8/16/32 GT/s 等。单 lane 单方向 raw payload上限还要扣除 TLP header、LCRC、DLLP、SKP和 flow-control空隙。
+
+例如大量 16 字节 Memory Write使用 3DW/4DW header时，协议开销比例远高于 256/512 字节 payload。链路 x4 不代表单请求延迟变成四分之一，它提高的是并行符号吞吐。性能报告应同时写实际 `LnkSta` speed/width、MPS、请求大小和方向。
+
+Lane bonding由 Physical Layer完成，上层 TLP不感知具体 lane。链路可因训练问题从 x4 降到 x2/x1继续工作，所以“设备枚举成功”不能替代宽度验证。
+
 ## 三层协议各自解决不同可靠性问题
 
 Transaction Layer 把 CPU/设备请求编码为 TLP（Transaction Layer Packet），包括 Memory Read/Write、Configuration Read/Write、Completion 和 Message。请求头包含 address、length、Requester ID、tag、attribute 等，读请求依赖 Completion 返回数据，posted Memory Write 通常没有 Completion。
@@ -45,6 +53,20 @@ CPU 对 BAR 映射地址执行 `writel()`，Root Complex 生成 Memory Write TLP
 Memory Read 是 non-posted 请求，需要 tag 匹配 Completion。设备可同时发出多个 outstanding request，吞吐受 tag、credit、Max Read Request Size 和 Completion 延迟影响。Memory Write 是 posted，请求离开发送方并不等于目标寄存器副作用已经完成；驱动需要时通过 readback 或规范定义的同步点确认。
 
 TLP payload 还受到 Max Payload Size（MPS）限制，大请求可能拆包。链路速率只是 raw capability，编码开销、TLP/DLLP header、credit、包大小和流控共同决定有效吞吐。
+
+### TLP header、tag 与 Completion 如何配对
+
+3DW header用于 32 位地址，4DW用于 64 位地址。Memory Request包含 requester ID、tag、first/last byte enable、length和 attribute。Non-posted Read保存 tag等待 Completion；Completion携带 completer ID、status、byte count、lower address和原 tag。
+
+同一 requester可用多个 tag保持 outstanding Read。Tag/credit耗尽时即使 lane空闲也不能继续发。Completion可能按 MPS/RCB拆分，接收端要按 byte count/lower address重组，而不能假设一个 Read只返回一个 TLP。
+
+Posted Write没有 Completion，错误通过 AER或设备协议间接体现。需要确认 MMIO side effect时使用同一设备的安全 readback或规范定义的 flush，而不是等待不存在的 write completion。
+
+### DLLP credit 与 replay只保证一跳传输
+
+Data Link Layer为 TLP加 sequence/LCRC，接收端 ACK/NAK，发送端在 replay buffer保留未确认 TLP。Replay Timer/rollover异常说明链路可靠性问题，但 ACK只证明下一跳收到，不证明目标设备业务已经处理。
+
+Credit分为 Posted/Non-Posted/Completion 的 Header/Data（PH/PD、NPH/NPD、CplH/CplD）。接收 buffer不足时发送方停发相应类型，其他类型可能继续。设备 DMA读吞吐受 NPH/tag和 Cpl credit共同限制。
 
 ## LTSSM 决定链路何时能传 TLP
 
@@ -65,6 +87,14 @@ PERST# 释放、REFCLK 稳定、lane 极性/映射、receiver detect、equalizat
 接收端为 posted、non-posted、completion 的 header/data buffer 宣告 credit，发送端 credit 不足时必须停发。队列设计若产生大量小读请求，可能受 non-posted tag/credit 限制，而不是 PCIe lane 带宽。
 
 PCIe 允许一定程度的事务重排，Relaxed Ordering、No Snoop 和 ID-based ordering 等 attribute 会改变约束。驱动在 descriptor ready、doorbell 和 completion 之间仍要使用 DMA API 与 memory barrier，不能把“PCIe 可靠传输”误解为 CPU 内存操作天然有序。
+
+### Ordering attribute 与软件 barrier 是两套约束
+
+默认 PCIe ordering约束同一 traffic class/requester的事务，但 Relaxed Ordering、ID-based Ordering、No Snoop会改变规则。它们不等于 CPU memory model，也不替代 DMA API barrier。
+
+CPU先写 descriptor普通内存，再写 BAR doorbell，驱动需要 `dma_wmb()` 和正确 MMIO accessor；设备先写 payload/CQE再 MSI，也需硬件保证顺序，Host读取时用 `dma_rmb()`。链路可靠与内存可见性必须同时成立。
+
+ASPM L0s/L1、L1 Substates降低功耗但增加唤醒延迟，对 REFCLK/CLKREQ#和平台固件有要求。低负载偶发 timeout、Recovery增加时，应对比关闭 ASPM而不是把其当永久修复。
 
 ## Linux 看到的是已经训练好的设备树
 
