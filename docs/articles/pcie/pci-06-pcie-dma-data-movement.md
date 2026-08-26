@@ -11,7 +11,7 @@ PCIe 高吞吐来自设备直接 DMA 访问内存，CPU 只准备 descriptor、�
 
 本篇从地址域与 DMA API 开始，建立 descriptor ring 的所有权协议。
 
-## CPU 虚拟地址、物理地址和 DMA 地址不是同一个值
+## 一、CPU 虚拟地址、物理地址和 DMA 地址不是同一个值
 
 CPU 使用普通虚拟地址访问内存；物理地址描述 RAM 位置；设备看到的是 `dma_addr_t`。IOMMU 打开时 DMA 地址通常是 IOVA，经过页表转换到物理页；没有 IOMMU 时也可能受 Host bridge offset、总线限制或 bounce buffer 影响。
 
@@ -27,7 +27,7 @@ if (ret)
 
 这同时决定 streaming 与 coherent allocation 能否满足设备地址宽度。失败应终止 probe，而不是截断高位。
 
-## Coherent allocation 适合共享控制结构
+## 二、Coherent allocation 适合共享控制结构
 
 ```c
 ring = dma_alloc_coherent(&pdev->dev, ring_bytes,
@@ -46,7 +46,7 @@ Coherent保证 CPU 与设备无需显式 cache clean/invalidate即可看到同�
 
 Coherent allocation返回的 CPU/DMA address都要按设备寄存器宽度写入。Ring size、alignment和不跨硬件边界等限制由设备 ABI额外检查。
 
-## Streaming mapping 适合有明确所有权阶段的数据 buffer
+## 三、Streaming mapping 适合有明确所有权阶段的数据 buffer
 
 ```c
 memcpy(buf, src, len);
@@ -72,7 +72,7 @@ Scatterlist 使用 `dma_map_sg()` 后，以返回的 DMA segment 数遍历，而
 
 映射失败用 `dma_mapping_error()`；高频 map/unmap的错误路径也必须配对。Timeout/reset前若设备仍访问，不能提前 sync/unmap/free。
 
-## Descriptor ring 是一份所有权状态机
+## 四、Descriptor ring 是一份所有权状态机
 
 ```mermaid
 stateDiagram-v2
@@ -98,19 +98,19 @@ Ring full/empty 通常由 monotonic producer/consumer 或 generation/phase bit�
 
 Scatter-gather descriptor还要限制每请求 segment数、总长度和硬件边界，映射后的 segment与用户原始 iovec不一一对应。
 
-## DMA completion 不等于数据可以立即释放
+## 五、DMA completion 不等于数据可以立即释放
 
 设备写 completion 后触发 MSI-X。Handler/轮询读取 completion，确认 descriptor 已完成，再 unmap streaming buffer、通知用户或放回 pool。若硬件支持 out-of-order completion，不能按提交顺序盲目释放。
 
 超时处理需要先停止/abort queue，确认设备不再访问 descriptor 和 payload，再 unmap/free。仅因为软件 timer 到期就释放，会让迟到 DMA 写入已复用内存。
 
-## 用户内存、pin 和 mmap 增加生命周期约束
+## 六、用户内存、pin 和 mmap 增加生命周期约束
 
 直接 DMA 用户页需要 pin pages、构建 sg、map DMA，并在设备完成后 unmap/unpin。长期 pin 会影响内存迁移与回收，不能无限保留。更安全的入门设计是内核管理 DMA buffer，通过 read/write 或受控 mmap 暴露。
 
 Coherent ring mmap 给用户时，用户不能直接修改硬件 ownership 字段，除非 ABI 明确定义边界和 barrier。生产驱动常将 control ring 保留内核，只映射 payload pool。
 
-## 如何定位 DMA 地址与一致性问题
+## 七、如何定位 DMA 地址与一致性问题
 
 IOMMU fault 给出 device、IOVA 和访问类型，先对照 descriptor DMA address、长度和方向；无 fault 但数据旧，检查 sync/barrier/cache；设备读错地址，检查 mask、高低 32 位寄存器写序；随机越界，检查 descriptor length、ring wrap 和设备停止时机。
 
@@ -121,6 +121,6 @@ cat /sys/kernel/debug/iommu/* 2>/dev/null
 
 压力测试同时记录 submitted/completed、producer/consumer、mapping failure、timeout 和 reset 次数。只看平均吞吐无法发现偶发 ownership 破坏。
 
-## 小结
+## 八、小结
 
 PCIe DMA 驱动必须区分 CPU、物理和 DMA 地址，先设置 mask，再选择 coherent 或 streaming API。Descriptor ring 用所有权、barrier 和 doorbell连接 CPU/设备，completion 后才能 unmap/recycle。`dma_alloc_coherent`、`dma_map_single`、`dma_wmb` 各自解决不同问题。下一篇加入 IOMMU，解释 DMA 地址如何被隔离和转换。

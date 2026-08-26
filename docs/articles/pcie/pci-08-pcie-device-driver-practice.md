@@ -192,7 +192,7 @@ ret = request_irq(dev->irq, demo_irq, 0, "demo_pci", dev);
 
 真实设备里，中断处理一般只做快速确认和唤醒，复杂处理放到底半部。
 
-## 把完成事件交给用户态：ioctl、poll 与 mmap
+## 八、把完成事件交给用户态：ioctl、poll 与 mmap
 
 真实驱动需要把“提交”和“完成”变成稳定 ABI。ioctl 可以接收 command、buffer index、length，驱动验证参数和设备状态后填 DMA descriptor、执行 `dma_wmb()`、推进 producer 并写 doorbell。Ring 满时阻塞或返回 `-EAGAIN`，不能覆盖仍由设备拥有的槽位。
 
@@ -202,13 +202,13 @@ ret = request_irq(dev->irq, demo_irq, 0, "demo_pci", dev);
 
 零拷贝不是简单调用 mmap。必须定义 CPU/设备/用户三方何时拥有 buffer、谁执行 cache sync/barrier、进程异常退出如何回收、reset 后旧 buffer 如何失效。
 
-## Timeout 与 reset 先停止 DMA，再回收内存
+## 九、Timeout 与 reset 先停止 DMA，再回收内存
 
 DMA timeout 后不能立即 free buffer。驱动先阻止新提交、mask IRQ、停止或 abort queue，确认设备 quiescent，再 unmap/recycle in-flight request。若设备不再响应，可执行 Function Level Reset 或设备自定义 reset，并重建 BAR 内 queue base、producer/consumer 和 MSI-X 状态。
 
 Reset 期间 ioctl 返回 busy，poll 唤醒错误。每次 reset 增加 generation，迟到 completion 若携带旧 id/generation必须丢弃，不能误完成新请求。Remove 复用同一 stop 状态机：撤销用户入口、停止 DMA、同步 IRQ/work，最后释放 coherent memory、BAR 和 PCI resource。
 
-## 电源管理、AER 与并发状态机
+## 十、电源管理、AER 与并发状态机
 
 Runtime PM空闲时停止 queue并进入低功耗，resume重新写 BAR内 queue base/doorbell/IRQ状态。System suspend、FLR和AER slot_reset也应复用 stop/init函数，避免 probe与恢复路径分叉。
 
@@ -216,7 +216,7 @@ Runtime PM空闲时停止 queue并进入低功耗，resume重新写 BAR内 queue
 
 多进程 open/mmap使用 reference count延长软件对象，但 dead状态后禁止 MMIO/DMA。最后一个 reference只释放内存，硬件资源已由 remove/恢复状态机停止。
 
-## 八、remove 清理流程
+## 十一、remove 清理流程
 
 ```c
 static void demo_remove(struct pci_dev *pdev)
@@ -240,7 +240,7 @@ static void demo_remove(struct pci_dev *pdev)
 
 退出顺序要注意：先停止设备和 DMA，再释放中断和内存，最后释放 BAR 和设备资源。
 
-## 九、调试命令
+## 十二、调试命令
 
 ```bash
 lspci -nn
@@ -258,7 +258,7 @@ ls /sys/bus/pci/devices/
 - 中断是否增长
 - DMA 是否完成
 
-## 十、常见问题
+## 十三、常见问题
 
 ### 1. probe 没触发
 
@@ -276,7 +276,7 @@ ls /sys/bus/pci/devices/
 
 检查 MSI/MSI-X 是否启用、设备是否真的写了中断、状态位是否正确清除。
 
-## 十一、验证清单
+## 十四、验证清单
 
 - `lspci` 能看到设备
 - `probe()` 正常触发
@@ -286,7 +286,7 @@ ls /sys/bus/pci/devices/
 - DMA buffer 能被设备访问
 - 卸载驱动无资源泄漏
 
-## 十二、小结
+## 十五、小结
 
 PCIe 驱动实践的核心不是孤立 API，而是一条完整链路：
 

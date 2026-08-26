@@ -11,7 +11,7 @@ PCIe Endpoint 通过 BAR 声明“我需要多大的 CPU 可访问窗口”，�
 
 本篇从写 `0xffffffff` 的 sizing 机制出发，解释 32/64 位与 prefetchable 属性、Linux resource 管理、`pci_request_region()`、`pci_iomap()` 和 posted write 顺序。
 
-## BAR 寄存器编码类型和地址属性
+## 一、BAR 寄存器编码类型和地址属性
 
 Memory BAR 低位编码 I/O/Memory、32/64 位和 prefetchable，地址位按大小对齐。64 位 BAR 使用相邻两个 dword 组合地址，并占用两个 BAR index。I/O BAR 使用独立 I/O space，在很多嵌入式平台并不常见。
 
@@ -19,7 +19,7 @@ Prefetchable 表示读取没有副作用且允许合并/预取，通常用于 fr
 
 BAR 只描述 Host 地址窗口。Endpoint 内部还要把 BAR hit + offset 路由到寄存器、BRAM 或 DMA aperture；这个地址转换属于 Endpoint 设计。
 
-## 写全 1 sizing 为什么能得到大小
+## 二、写全 1 sizing 为什么能得到大小
 
 枚举器保存 BAR 原值，写 `0xffffffff`，读回硬件实现的地址 mask，再恢复。未实现的低地址位读为 0，取反加一得到窗口大小。
 
@@ -35,7 +35,7 @@ I/O BAR与 Memory BAR mask规则不同，Resizable BAR还通过 Extended Capabil
 
 驱动 probe读取 `pci_resource_len()` 而不是重新 sizing。系统固件、bridge aperture和地址位宽共同决定最终 start，不保证等于 Endpoint设计文档示例地址。
 
-## Linux resource 树保存分配结果
+## 三、Linux resource 树保存分配结果
 
 ```c
 resource_size_t start = pci_resource_start(pdev, 0);
@@ -47,7 +47,7 @@ unsigned long flags   = pci_resource_flags(pdev, 0);
 
 Bridge memory/prefetchable window 必须覆盖下游 BAR，Host bridge outbound window 又必须把 CPU 地址转换为 PCIe address。任何一级缺失都会出现资源分配失败或 MMIO abort。
 
-## request 再 iomap，先声明所有权再访问
+## 四、request 再 iomap，先声明所有权再访问
 
 ```c
 ret = pci_request_region(pdev, 0, "demo");
@@ -73,7 +73,7 @@ Prefetchable BAR保证 read无副作用、允许合并/预取，常用于 frame 
 
 Write-combining映射可提升顺序写吞吐，但读与严格控制寄存器不适合。使用前确认 BAR语义和平台 accessor。
 
-## MMIO 必须使用 accessor 并尊重寄存器语义
+## 五、MMIO 必须使用 accessor 并尊重寄存器语义
 
 ```c
 u32 status = readl(bar0 + REG_STATUS);
@@ -91,7 +91,7 @@ readl(bar0 + REG_STATUS); /* flush posted write when register is safe */
 
 Read 的副作用、write-one-to-clear、doorbell、64 位寄存器拆分顺序由设备手册决定。通用 `readl` 不能替代设备级同步协议。
 
-## CPU 地址、PCIe 地址和设备内部 offset 不一定相同
+## 六、CPU 地址、PCIe 地址和设备内部 offset 不一定相同
 
 在 SoC RC 上，CPU 访问 `0x60000000` 可能经 Host controller outbound ATU 转成 PCIe address `0x00000000`，命中 Endpoint BAR0，再由 Endpoint 将 offset 0x1000 路由到寄存器。驱动看到的是 CPU resource start，设备 DMA 使用的则是 DMA API 返回地址，两者不要混用。
 
@@ -105,7 +105,7 @@ IOMMU 通常影响 Endpoint DMA 到内存的地址，不改变 CPU 对 BAR MMIO 
 
 DMA方向相反：Endpoint发往 Host内存的 address来自 DMA API/IOMMU，不应从 BAR resource推导。BAR是控制/MMIO窗口，DMA address是设备 requester访问内存的目标。
 
-## 释放前先停止设备产生访问
+## 七、释放前先停止设备产生访问
 
 remove/error path 应先禁止设备队列、DMA 和中断，确保不再访问 BAR 相关状态，再 `pci_iounmap()`、`pci_release_region()`。先解除映射后再写 stop 寄存器显然无效；设备仍 DMA 时释放其他内存则更危险。
 
@@ -119,6 +119,6 @@ cat /proc/iomem | grep -i pci
 
 配置空间 BAR 有值但 resource 文件为 0/冲突，查枚举分配；resource 正常但首次 read abort，查 bridge/RC window 和 Endpoint decode；read 值固定全 1，可能是 Completion Unsupported Request、链路/Endpoint reset 或访问了未实现 offset。
 
-## 小结
+## 八、小结
 
 BAR 用属性位与 size mask声明窗口，PCI core 为其分配 Host resource，驱动通过 `pci_request_region` 获得所有权、`pci_iomap` 建立 `__iomem` 映射，再用 `readl/writel` 访问。Posted write、bridge/ATU 地址转换和设备寄存器副作用决定了 MMIO 不能当普通内存。下一篇把 BAR 放入完整 `pci_driver` probe/remove 与错误回滚。

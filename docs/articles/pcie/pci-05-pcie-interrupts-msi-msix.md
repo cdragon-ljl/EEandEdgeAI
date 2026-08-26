@@ -11,7 +11,7 @@ PCIe 设备通常用中断通知 DMA 完成、队列事件和错误。INTx、MSI
 
 本篇从设备发出通知的方式开始，沿 `pci_alloc_irq_vectors()` 到 handler、affinity 和中断丢失排查。
 
-## INTx 是需要设备撤销的共享电平事件
+## 一、INTx 是需要设备撤销的共享电平事件
 
 传统 INTx 在 PCIe 中以 Message TLP 模拟引脚 assert/deassert，仍保留电平和共享语义。多个设备可以共享同一 Linux IRQ，handler 必须读取本设备 status，若没有 pending 返回 `IRQ_NONE`。
 
@@ -19,7 +19,7 @@ PCIe 设备通常用中断通知 DMA 完成、队列事件和错误。INTx、MSI
 
 INTx 兼容性好，但共享、单 vector 和电平处理不适合多队列高吞吐设计。
 
-## MSI 是设备发出的一次 Memory Write
+## 二、MSI 是设备发出的一次 Memory Write
 
 MSI Capability 由系统配置 message address/data。设备触发时发送 Memory Write TLP，Root Complex 将其转换为 CPU interrupt。没有共享物理线，也不存在传统 deassert；设备仍需在自己的 status/queue 中记录待处理工作。
 
@@ -35,7 +35,7 @@ MSI没有电平 deassert，但设备自己的 completion/status仍需消费和�
 
 设备写 payload/CQE 必须先于 MSI对 Host可见。PCIe ordering与设备实现要保证这一点，Host handler读取 DMA completion前执行 `dma_rmb()`。否则可能出现 IRQ先到、CQE仍旧的“伪丢中断”。
 
-## MSI-X 用 BAR 中的表把 vector 分开配置
+## 三、MSI-X 用 BAR 中的表把 vector 分开配置
 
 MSI-X Capability 指向 MSI-X Table 与 Pending Bit Array（PBA）所在 BAR/offset。每个 table entry 有 message address、data 和 vector control，可独立 mask。PBA 记录被 mask 时到达的 pending vector。
 
@@ -51,7 +51,7 @@ Vector被 mask时事件应在 PBA保留 pending，unmask后触发；table写入�
 
 多队列常将 RX/TX/management/error分配不同 vector。实际 `pci_alloc_irq_vectors()` 返回少于请求时，驱动要重建 queue-vector映射，而不是假设 table全部启用。
 
-## Linux 统一 vector 申请并允许降级
+## 四、Linux 统一 vector 申请并允许降级
 
 ```c
 int nvec = pci_alloc_irq_vectors(pdev, 1, wanted,
@@ -81,13 +81,13 @@ Interrupt moderation按 completion计数或时间聚合。阈值大降低 IRQ/CP
 
 Affinity按 queue、worker和NUMA内存布置。`pci_alloc_irq_vectors_affinity()` 可生成 managed affinity；`irq_set_affinity_hint()` 只是提示且 remove时要清除，不能与 irqbalance策略互相覆盖。
 
-## Handler、threaded IRQ 与轮询之间如何分工
+## 五、Handler、threaded IRQ 与轮询之间如何分工
 
 硬中断 handler 应读取/ack 原因、屏蔽需要延后处理的 queue，并安排 NAPI、tasklet、work 或 threaded IRQ。大量 completion 不应在 hardirq 中逐个进行复杂用户通知。
 
 网络驱动常在中断后关闭 queue IRQ，用 NAPI 轮询一批 descriptor，再重新 unmask；NVMe/存储则按 completion queue 批量回收。中断合并通过计数/时间阈值降低 IRQ 率，但会增加尾延迟。
 
-## 中断“丢失”要区分设备、PCIe、IRQ 和软件队列
+## 六、中断“丢失”要区分设备、PCIe、IRQ 和软件队列
 
 ```bash
 lspci -s BDF -vv | grep -A5 -E 'MSI|MSI-X'
@@ -99,6 +99,6 @@ Capability Disabled 表示设备没有启用相应模式；msi_irqs 存在但计
 
 AER Unsupported Request/Completer Abort 可能说明 MSI write 地址被设备/平台错误处理，IOMMU interrupt remapping 配置也会影响虚拟化场景。不要直接轮询替代中断掩盖根因。
 
-## 小结
+## 七、小结
 
 INTx 是共享电平事件，需要设备 deassert；MSI 用 Memory Write 触发；MSI-X 通过 BAR table 提供大量独立可 mask vector。Linux 用 `pci_alloc_irq_vectors` 统一申请并可能降级，`pci_irq_vector` 映射实际 IRQ，affinity 与队列设计共同决定扩展性。下一篇进入 DMA，解释中断到来前 descriptor 和数据如何在 CPU 与设备之间交接所有权。

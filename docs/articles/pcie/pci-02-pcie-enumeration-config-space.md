@@ -11,7 +11,7 @@ PCIe Link 进入 L0 后，系统仍不知道对端是什么设备、需要多少
 
 本篇从 BDF 和配置头开始，沿 Linux PCI core 的扫描路径解释设备发现、bridge recursion、Capability 和资源分配。
 
-## BDF 是一次枚举中的拓扑地址
+## 一、BDF 是一次枚举中的拓扑地址
 
 BDF 由 Bus、Device、Function 组成，常写作 `0000:01:00.0`，前缀 0000 是 domain/segment。一个 device slot 最多有多个 function；multifunction bit 告诉扫描器是否继续 function 1-7。
 
@@ -19,7 +19,7 @@ BDF 由 Bus、Device、Function 组成，常写作 `0000:01:00.0`，前缀 0000 
 
 BDF 由桥后的 bus number 和 devfn 决定，系统重配或热插拔后可能变化。驱动应匹配 VID/DID/class 并绑定 `pci_dev`，用户态若需稳定身份应结合 serial、slot、设备树/ACPI 路径等信息。
 
-## Type 0 与 Type 1 Header 分别描述 Endpoint 和 Bridge
+## 二、Type 0 与 Type 1 Header 分别描述 Endpoint 和 Bridge
 
 Type 0 header 用于普通 Endpoint，包含 6 个 BAR、Subsystem ID、Expansion ROM、interrupt pin 等。Type 1 header 用于 PCI-to-PCI Bridge，BAR 数更少，并包含 Primary/Secondary/Subordinate bus number 和 I/O/Memory/Prefetchable window。
 
@@ -35,7 +35,7 @@ Linux `pci_bus_read_config_*()` 最终通过 bus ops访问 ECAM或控制器 conf
 
 扫描从 root bridge建立 `pci_host_bridge` 和 root bus，遍历 devfn创建 `pci_dev`，读取 Header Type决定 multifunction/bridge，再由 `pci_scan_child_bus()` 递归。Host controller 的 bus-range不足会限制可分配 bus number。
 
-## Linux 递归扫描 bridge
+## 三、Linux 递归扫描 bridge
 
 简化流程是：
 
@@ -63,7 +63,7 @@ flowchart TB
 
 Bridge window 必须覆盖下游 BAR。Endpoint BAR 自身有地址但上游 bridge window 未开放时，配置空间仍可读，MMIO 访问却无法路由。
 
-## BAR sizing 与资源分配发生在驱动 probe 之前
+## 四、BAR sizing 与资源分配发生在驱动 probe 之前
 
 系统通过保存 BAR 原值、写全 1、读回 size mask、恢复原值推导需求。64 位 BAR 组合两个 dword，I/O、non-prefetchable memory、prefetchable memory进入不同资源树。
 
@@ -79,7 +79,7 @@ Type 1 Header的 I/O、Memory、Prefetchable Base/Limit必须覆盖下游 BAR。
 
 Hotplug bridge还要预留 bus number、MMIO和 vector资源，否则空槽启动时正常，插入设备后才出现 `no space for [mem size]`。这也是 hotplug与静态启动枚举的资源规划差异。
 
-## Capability 链扩展中断、电源和 PCIe 能力
+## 五、Capability 链扩展中断、电源和 PCIe 能力
 
 Status 的 Capabilities List bit 表示传统 Capability 链存在，指针从配置头开始，每项包含 Capability ID 和 next pointer。常见项包括 Power Management、MSI、MSI-X、PCI Express、Vendor Specific。
 
@@ -95,13 +95,13 @@ Capability 是变长链，offset 可能不同。驱动使用 `pci_find_capabilit
 
 SR-IOV启用后 PF创建多个 VF function，各自有 BDF/配置和资源，但 PF仍管理共享硬件。枚举数量、VF BAR和IOMMU group需要一起规划。
 
-## Command 寄存器决定设备能否响应和发起事务
+## 六、Command 寄存器决定设备能否响应和发起事务
 
 Command 中的 Memory Space Enable 控制 BAR memory response，I/O Space Enable 控制 I/O BAR，Bus Master Enable 允许设备发 DMA 请求。枚举分配资源不代表这些 bit 都已打开。
 
 Linux 驱动调用 `pci_enable_device()` 使能合适 decode，`pci_set_master()` 打开 bus mastering。未完成 DMA mask/queue 初始化就过早启用设备产生 DMA，会让 Endpoint 使用无效地址；正确顺序由驱动 lifecycle 负责。
 
-## 用 lspci 与 sysfs 核对枚举结果
+## 七、用 lspci 与 sysfs 核对枚举结果
 
 ```bash
 lspci -Dnn
@@ -112,6 +112,6 @@ cat /sys/bus/pci/devices/0000:01:00.0/resource
 
 先看 BDF/topology，再看 header、BAR、Capability 和 driver。配置空间能读、BAR 资源也存在但驱动未绑定，检查 modalias/id table；设备完全不存在则回到 LTSSM/Host bridge；bridge 下设备缺失还要检查 secondary/subordinate 和 window。
 
-## 小结
+## 八、小结
 
 PCIe 枚举用 BDF 定位 function，用 Type 0/1 Header区分 Endpoint/Bridge，通过 `pci_scan_child_bus` 递归拓扑并为 BAR/bridge window 分配资源。Capability 链扩展 MSI、PCIe、AER 等能力，Command bit 控制 decode 和 bus master。下一篇将聚焦 BAR，从 sizing mask 走到 Linux resource、`pci_request_region`、`pci_iomap` 和正确 MMIO 访问。

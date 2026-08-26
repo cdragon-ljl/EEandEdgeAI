@@ -340,7 +340,7 @@ SQ 满时 software producer 不能覆盖 device consumer 尚未释放的槽位�
 
 长期一致性可以用守恒关系检查：`submitted = completed + failed + in_flight`，DMA mapping 数和 buffer pool 数在停止后归零，所有 queue producer/consumer 回到同一 generation。吞吐仍在增长并不能证明资源没有缓慢泄漏。
 
-## 十、稳定性设计
+## 十一、稳定性设计
 
 ### 1. DMA 超时
 
@@ -378,7 +378,7 @@ if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64))) {
 
 这并不代表硬件真的支持 64 位地址。最终应以设备 spec、IOMMU 配置和平台 DMA 能力为准。
 
-## 十一、硬件验证方法
+## 十二、硬件验证方法
 
 至少准备：
 
@@ -398,7 +398,7 @@ if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64))) {
 6. 环形队列连续传输通过；
 7. 高负载、长时间和复位恢复通过。
 
-## 十二、验收清单
+## 十三、验收清单
 
 - [ ] 描述符和 completion 的字节序已明确；
 - [ ] TX/RX buffer 的所有权转移有清晰协议；
@@ -410,7 +410,7 @@ if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64))) {
 - [ ] 设备 reset 或链路掉线时不会继续提交 DMA；
 - [ ] 已完成单 buffer、环形队列、高负载和恢复测试。
 
-## 十三、小结
+## 十四、小结
 
 PCIe 高吞吐驱动的主线是：
 

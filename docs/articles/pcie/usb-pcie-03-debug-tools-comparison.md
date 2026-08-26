@@ -11,7 +11,7 @@ draft: false
 
 本篇按“想回答什么问题”比较工具边界。
 
-## 设备是否被总线发现
+## 一、设备是否被总线发现
 
 USB：`dmesg -w` 看端口与枚举，`lsusb -t` 看 topology/speed/driver，`lsusb -v` 看描述符。设备不存在时继续查 VBUS、role、PHY 与 EP0。
 
@@ -19,7 +19,7 @@ PCIe：`lspci -Dnn/-tv` 看 BDF/topology，`lspci -vv` 看 LnkSta、BAR、Capabi
 
 两者的“能列出设备”只证明枚举层成功，不证明功能数据通路。
 
-## 描述与配置是否合理
+## 二、描述与配置是否合理
 
 USB 原始描述符：
 
@@ -38,7 +38,7 @@ cat /sys/bus/pci/devices/BDF/config | hexdump -C
 
 配合 `lspci -vv` 检查 Type header、BAR、MSI/MSI-X、PCIe、AER、SR-IOV。`setpci` 会写配置，生产设备上应极谨慎。
 
-## 单次传输发生了什么
+## 三、单次传输发生了什么
 
 USB 使用 usbmon，Wireshark 解码 Setup、URB submit/complete、endpoint、status 和 payload：
 
@@ -53,13 +53,13 @@ PCIe 普通 Linux 软件没有等价的全量 TLP 抓包。驱动 tracepoint、f
 
 不要把 `lspci -xxx` 当数据包抓取，它只读 Configuration Space。
 
-## 中断是否到达并服务了正确队列
+## 四、中断是否到达并服务了正确队列
 
 两者都可看 `/proc/interrupts`。USB Host Controller IRQ 是 HCD 服务所有端口/URB，不等于某个 interrupt endpoint 一次 IRQ；PCIe MSI-X 常能直接按 queue vector 映射。
 
 USB 继续结合 usbmon completion 和 class driver log；PCIe 结合 msi_irqs、queue producer/consumer、MSI-X mask/table 和 handler counter。
 
-## DMA、cache 与地址转换哪里出错
+## 五、DMA、cache 与地址转换哪里出错
 
 USB HCD/UDC DMA 通常由 controller driver 管理，interface driver提交 URB；嵌入式 HCD问题看 controller ring/FIFO、DMA API、IOMMU和 cache。
 
@@ -67,13 +67,13 @@ PCIe Endpoint DMA由功能驱动/设备 ring直接管理，IOMMU fault 的 reque
 
 KASAN/lockdep/kmemleak 用于两种驱动的软件寿命错误，但不能检测外部设备 DMA 越界；IOMMU 更适合暴露后者。
 
-## 错误恢复是否真正收敛
+## 六、错误恢复是否真正收敛
 
 USB 反复插拔、autosuspend/resume、STALL/reset、在途 URB取消；PCIe FLR/hot reset/AER recovery、DMA timeout、Surprise Down。测试结束后都要检查请求/映射/引用计数归零。
 
 使用 trace-cmd 给 driver state、IRQ、workqueue 加时间线，比散落 printk 更容易判断停止顺序。动态调试应只打开目标 module/file，避免日志改变时序。
 
-## dynamic_debug、tracepoint 和 sanitizer 解决不同问题
+## 七、dynamic_debug、tracepoint 和 sanitizer 解决不同问题
 
 `dynamic_debug`按 module/file/function启用 `pr_debug()`，适合观察probe、PM、error path和状态机。USB可启用usbcore/HCD/class，PCIe可启用PCI core、AER、IOMMU和目标driver；高频路径应限范围。
 
@@ -81,7 +81,7 @@ Tracepoint/ftrace/trace-cmd建立时间线：USB URB submit/complete、IRQ/work/
 
 KASAN发现越界/UAF，lockdep发现锁顺序，kmemleak检查拔插后泄漏；IOMMU fault检测设备DMA越界。它们不能替代线级usbmon/PCIe analyzer，但能把软件所有权问题与协议问题分开。
 
-## Protocol analyzer 何时值得使用
+## 八、Protocol analyzer 何时值得使用
 
 USB analyzer可直接观察reset、setup、token/handshake、包间时序和电气错误；当usbmon显示Host提交但Device无/错响应时很有价值。Device固件与Host抓包应对时。
 
@@ -89,7 +89,7 @@ PCIe analyzer可观察LTSSM、TLP/DLLP、credit、replay、Completion和ordering
 
 分析仪证据仍需映射到driver request/descriptor。没有request id/address对照，看到TLP也难定位应用操作。
 
-## 证据矩阵
+## 九、证据矩阵
 
 - `usbmon + Wireshark`：USB transaction/URB，不能证明 Device 内部状态；
 - `lsusb -v`：描述符，不能证明 class stream；
@@ -99,6 +99,6 @@ PCIe analyzer可观察LTSSM、TLP/DLLP、credit、replay、Completion和ordering
 - perf/ftrace：CPU 路径与延迟，不能测物理信号；
 - protocol analyzer：线级 USB/TLP，成本高但跨越软件猜测。
 
-## 小结
+## 十、小结
 
 USB 调试以枚举、描述符、usbmon/Wireshark 和 class log 为主；PCIe 以 LTSSM、`lspci -vv`、BAR、MSI-X、ring、IOMMU fault 与 AER 为主。工具输出必须对应当前层次，不能用配置空间或设备节点替代数据通路证据。下一篇通过场景问答检验这种证据边界。

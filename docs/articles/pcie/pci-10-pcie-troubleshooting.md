@@ -11,7 +11,7 @@ PCIe 故障必须按链路建立顺序排查。`lspci` 看不到设备时，驱�
 
 本篇从电源/PERST#/REFCLK、LTSSM 开始，逐层建立配置、BAR、IRQ、DMA、IOMMU 和 AER 的观察边界。
 
-## 阶段一：电源、PERST#、REFCLK 和 lane
+## 一、电源、PERST#、REFCLK 和 lane
 
 确认各电源 rail、时序和功耗限制；PERST# 应在 REFCLK 与电源稳定后按规范释放；lane 数、极性反转、lane reversal 与板级连接要符合 RC/EP 支持。
 
@@ -19,7 +19,7 @@ PCIe 故障必须按链路建立顺序排查。`lspci` 看不到设备时，驱�
 
 `lspci` 完全无设备且 LTSSM 不到 L0，不需要先改 `pci_device_id`。
 
-## 阶段二：Host bridge 与配置空间访问
+## 二、Host bridge 与配置空间访问
 
 RC 自身要正确 probe，ECAM/config window 和 bus range 有效。检查启动日志和：
 
@@ -39,7 +39,7 @@ Type 1 bridge的 secondary/subordinate bus和 memory window决定下游可见性
 
 Capability链损坏会让 MSI/AER/PCIe能力解析异常；记录原始 offset/next，避免用 setpci盲改。
 
-## 阶段三：BAR 和地址转换
+## 三、BAR 和地址转换
 
 `lspci -vv` 查看 Region，sysfs resource 核对 Host 分配：
 
@@ -52,7 +52,7 @@ BAR assignment failure 说明 aperture/window/地址空间不足；resource 有�
 
 不要在运行设备上随意写 BAR 全 1。先用驱动/只读工具确认分配，再通过最小 scratch register 验证。
 
-## 阶段四：驱动绑定和 probe 回滚
+## 四、驱动绑定和 probe 回滚
 
 ```bash
 readlink /sys/bus/pci/devices/BDF/driver
@@ -72,13 +72,13 @@ AER header log可还原 TLP header，结合 requester/completer和 address定位
 
 Posted Write没有 completion，写错地址可能只通过 AER或后续业务超时体现。关键控制写按设备规范 readback确认。
 
-## 阶段五：INTx/MSI/MSI-X
+## 五、INTx/MSI/MSI-X
 
 `lspci -vv` 确认 capability Enabled，`/proc/interrupts` 看 vector 计数。计数不涨时检查设备 event、mask、MSI-X table、message address/data；计数涨但 completion 不动，检查 handler ack、queue mapping 和 ownership。
 
 共享 INTx handler 返回值错误会影响其他设备；MSI-X vector 与 queue 数不匹配会读错 completion。中断风暴通常是源未清或 unmask 时机错误。
 
-## 阶段六：DMA 与 IOMMU fault
+## 六、DMA 与 IOMMU fault
 
 IOMMU fault 是设备访问了未映射/无权限 IOVA 的直接证据。记录 requester、IOVA、方向，再在 descriptor ring 找地址和 length：
 
@@ -90,7 +90,7 @@ dmesg | grep -Ei 'IOMMU fault|SMMU|DMAR|AMD-Vi|swiotlb'
 
 临时关闭 IOMMU 只可用于对比，不能作为修复；它可能把可见 fault 变成静默越界。
 
-## 阶段七：AER 和链路恢复
+## 七、AER 和链路恢复
 
 AER Correctable 持续增加说明链路有压力，Uncorrectable/Fatal 需要解析 TLP header log 和 source ID。Surprise Down、Completion Timeout、Unsupported Request、Malformed TLP 分别指向链路、目标响应、地址/请求和协议格式。
 
@@ -109,7 +109,7 @@ FLR重置单 function，Secondary Bus Reset影响桥下链路，PERST#/slot powe
 
 AER `error_detected/slot_reset/resume`、timeout recovery与remove需要共享状态机，防止并发双 reset或双释放。
 
-## 用一张证据链避免跨层猜测
+## 八、用一张证据链避免跨层猜测
 
 ```mermaid
 flowchart TD
@@ -124,6 +124,6 @@ flowchart TD
 
 每层都要求一个可观察证据后再进入下一层。现场记录寄存器、lspci、dmesg、IOMMU fault 和 ring counters 的时间线，比只保存最终错误截图更有价值。
 
-## 小结
+## 九、小结
 
 PCIe 排错顺序是 PERST#/REFCLK/lane、LTSSM、配置空间、BAR/ATU、驱动、IRQ、DMA/IOMMU、AER/恢复。`lspci -vv` 只能证明配置层状态，不证明 DMA 正确；IOMMU fault 也不等于 IOMMU 本身有 bug。下一篇从 Endpoint 视角解释 Host 为何看到这些状态，以及 FPGA/SoC EP 如何建立最小 BAR 通路。

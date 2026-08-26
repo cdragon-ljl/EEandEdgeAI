@@ -9,7 +9,7 @@ draft: false
 ---
 USB/PCIe 面试真正考察的不是命令清单，而是能否从现象判断当前层次、指出内核对象和异步所有权，并给出可验证证据。下面的问题同时给出可靠推导和常见错误答案。
 
-## USB 场景
+## 一、USB 场景
 
 ### `lsusb` 能看到设备但没有 `/dev/ttyACM0`，先查什么？
 
@@ -39,7 +39,7 @@ URB 提交后由 usbcore/HCD异步拥有，completion 可能与 disconnect 并�
 
 UDC 已注册，继续查是否 bind UDC、pull-up/VBUS、EP0 setup、descriptor/configfs function 和 setup status。UDC存在不代表 composite已连接 Host。
 
-## PCIe 场景
+## 二、PCIe 场景
 
 ### `lspci` 看不到 Endpoint，驱动 id_table 有问题吗？
 
@@ -71,7 +71,7 @@ UDC 已注册，继续查是否 bind UDC、pull-up/VBUS、EP0 setup、descriptor
 
 关闭 IOMMU 可能把 fault 变成静默内存破坏，只能作为受控对比。
 
-## 跨总线设计问题
+## 三、跨总线设计问题
 
 ### USB URB 与 PCIe DMA descriptor 有什么共同点和差异？
 
@@ -135,6 +135,6 @@ FLR保留function在PCI拓扑中，但会清设备内部queue/DMA/IRQ状态。�
 
 证据链应有状态迁移和计数守恒，不是一条“reset success”日志。
 
-## 小结
+## 四、小结
 
 可靠的 USB/PCIe 面试回答必须给出对象、状态、调用上下文和证据链，并主动指出错误答案忽略的条件。USB 重点是 interface/endpoint/URB/Gadget/Class 与 disconnect；PCIe 重点是 Link/config/BAR/MSI-X/DMA/IOMMU/reset。真正可迁移的能力，是判断当前层次并沿所有权追到完成或回收。

@@ -11,7 +11,7 @@ Linux PCI driver 的 probe 入口看似简单，但真正正确性来自资源�
 
 本篇用一个具备 BAR、DMA 和 IRQ 的 Endpoint 说明 `struct pci_driver` 生命周期，并解释 managed API、remove、PM 与 reset 的边界。
 
-## `struct pci_driver` 连接 ID 匹配与生命周期
+## 一、`struct pci_driver` 连接 ID 匹配与生命周期
 
 ```c
 static const struct pci_device_id demo_ids[] = {
@@ -33,7 +33,7 @@ module_pci_driver(demo_driver);
 
 `pci_set_drvdata()` 将私有对象绑定 `pci_dev`。发布字符设备/netdev 等用户入口应放在所有底层资源可用之后。
 
-## probe 按依赖顺序启用设备
+## 二、probe 按依赖顺序启用设备
 
 典型顺序如下：
 
@@ -51,7 +51,7 @@ DMA mask 应在任何 DMA allocation 前设置。设备只支持 32 位 DMA 而�
 
 `pci_set_master()` 不会创建 DMA 映射，只允许设备发起 Memory Request。应在 descriptor 地址有效后、启动硬件前打开；错误回滚停止硬件后可 `pci_clear_master()`。
 
-## 一个可审计的 probe 骨架
+## 三、一个可审计的 probe 骨架
 
 ```c
 static int demo_probe(struct pci_dev *pdev,
@@ -96,25 +96,25 @@ IRQ在 request成功后可能立即到达，所以软件 queue、lock和私有�
 
 `pci_set_drvdata()` 只保存指针，不增加自定义对象 reference count。用户 open、mmap、work和error recovery并发时仍需 dead状态、refcount和完成同步。
 
-## Managed API 能减少释放代码，但不能决定停机顺序
+## 四、Managed API 能减少释放代码，但不能决定停机顺序
 
 `pcim_enable_device()`、`pcim_iomap_regions()`、`devm_kzalloc()`、`devm_request_irq()` 等可以在 device detach 时自动释放资源。它们适合缩短机械回滚，但不会替你停止设备 DMA、mask 中断或等待 workqueue。
 
 remove 仍应先撤销用户入口，停止提交，mask 设备中断，停止 DMA engine，`synchronize_irq()`/cancel work，再释放 ring。Managed cleanup 随后解除 IRQ/map/memory，顺序必须与硬件状态兼容。
 
-## remove、热插拔与用户引用并发
+## 五、remove、热插拔与用户引用并发
 
 PCIe 热插拔、AER recovery、驱动 unbind 都可能触发 remove。用户仍 mmap/read/poll 时，私有对象不能立即释放。与 USB 类似，需要 disconnected/dead 状态、引用计数和 waitqueue 唤醒；不同之处是 PCIe 设备还可能继续 bus-master DMA，因此必须先在硬件层停机并清 bus master。
 
 BAR mmap 给用户后，remove 需要阻止新的 fault/access；生产驱动通常借助 subsystem 提供的生命周期或自建 VMA 引用。仅删除 `/dev` 节点不能撤销已经建立的映射。
 
-## 中断和队列初始化要避免早到事件
+## 六、中断和队列初始化要避免早到事件
 
 request_irq 后 IRQ 可能立即到达。设备中断源应保持 mask，直到 handler 所需锁、ring 和状态全部初始化。启动顺序通常是 clear pending、request vectors/IRQ、初始化软件队列和 descriptor、写硬件地址、最后 unmask/start。
 
 错误回滚则先 mask/stop，再 free_irq 和 DMA。若 free ring 在前，晚到中断会读取已释放 descriptor。
 
-## PM、reset 与 AER 复用同一资源状态机
+## 七、PM、reset 与 AER 复用同一资源状态机
 
 Suspend/resume 需要保存/恢复 PCI state、停止队列、设置电源状态并重新初始化硬件。Function Level Reset、Secondary Bus Reset 或 AER recovery 可能清 BAR 内寄存器，但 `pci_dev` 和驱动对象仍存在。
 
@@ -130,6 +130,6 @@ FLR只重置 function，Secondary Bus Reset影响桥下多个设备，Hot Reset�
 
 AER通过 `struct pci_error_handlers` 的 `error_detected()`、`slot_reset()`、`resume()` 协商恢复。`error_detected()` 停止 I/O并返回恢复能力，slot_reset重新初始化硬件，resume恢复提交。不能在 AER callback与普通 remove同时重复释放资源。
 
-## 小结
+## 八、小结
 
 Linux `pci_driver` 的关键不在注册宏，而在 probe/remove 的依赖顺序：enable、regions、DMA mask、bus master、BAR、ring、IRQ、硬件和用户入口逐层发布，失败与 remove 反向撤销。Managed API 只能管理资源释放，不能替代硬件停机。下一篇将深入 INTx、MSI 和 MSI-X，解释 IRQ vector 如何与队列和 CPU affinity 对应。
