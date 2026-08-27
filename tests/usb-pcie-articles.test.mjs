@@ -38,6 +38,61 @@ const articleContracts = {
 
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+const articleBody = (path) => readFileSync(path, 'utf8').replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
+
+const orderedTopicContracts = {
+  'docs/articles/usb/usb-01-usb-architecture-enumeration.md': [
+    'Universal Serial Bus',
+    'Host',
+    'Device',
+    'Endpoint',
+    'Control Transfer',
+    '枚举',
+    'SET_ADDRESS',
+    'usb_new_device',
+  ],
+  'docs/articles/pcie/pci-01-pcie-architecture-basics.md': [
+    'PCI Express',
+    '点对点',
+    'Root Complex',
+    'Lane',
+    'Transaction Layer',
+    'TLP',
+    'LTSSM',
+    'lspci',
+  ],
+};
+
+const diagramContracts = {
+  'docs/articles/usb/usb-01-usb-architecture-enumeration.md': 2,
+  'docs/articles/usb/usb-02-linux-usb-driver-framework.md': 2,
+  'docs/articles/usb/usb-03-usb-descriptors-deep-dive.md': 3,
+  'docs/articles/usb/usb-04-urb-and-data-transfer.md': 3,
+  'docs/articles/usb/usb-05-usb-device-driver-practice.md': 2,
+  'docs/articles/usb/usb-06-usb-gadget-intro.md': 2,
+  'docs/articles/usb/usb-07-usb-class-drivers.md': 2,
+  'docs/articles/usb/usb-08-usb-troubleshooting.md': 1,
+  'docs/articles/usb/usb-09-usb-host-controller-device-tree-bring-up.md': 2,
+  'docs/articles/usb/usb-10-mcu-usb-cherryusb-stack.md': 2,
+  'docs/articles/pcie/pci-01-pcie-architecture-basics.md': 4,
+  'docs/articles/pcie/pci-02-pcie-enumeration-config-space.md': 2,
+  'docs/articles/pcie/pci-03-bar-and-mmio.md': 2,
+  'docs/articles/pcie/pci-04-linux-pci-driver-framework.md': 2,
+  'docs/articles/pcie/pci-05-pcie-interrupts-msi-msix.md': 2,
+  'docs/articles/pcie/pci-06-pcie-dma-data-movement.md': 3,
+  'docs/articles/pcie/pci-07-iommu-address-translation.md': 2,
+  'docs/articles/pcie/pci-08-pcie-device-driver-practice.md': 2,
+  'docs/articles/pcie/pci-09-pcie-performance-stability.md': 2,
+  'docs/articles/pcie/pci-10-pcie-troubleshooting.md': 1,
+  'docs/articles/pcie/pci-11-pcie-endpoint-hardware-link-bring-up.md': 3,
+  'docs/articles/pcie/pci-12-pcie-dma-ring-msix-high-throughput.md': 2,
+  'docs/articles/pcie/usb-pcie-01-bus-model-comparison.md': 1,
+  'docs/articles/pcie/usb-pcie-02-driver-framework-comparison.md': 1,
+  'docs/articles/pcie/usb-pcie-03-debug-tools-comparison.md': 1,
+};
+
+const officialSourcePattern = /https:\/\/(?:www\.)?(?:usb\.org|docs\.kernel\.org|pcisig\.com)|https:\/\/github\.com\/cherry-embedded\/CherryUSB/gi;
+
 test('USB and PCIe rewrites preserve publication contracts without appended templates', () => {
   for (const [series, contracts] of Object.entries(articleContracts)) {
     contracts.forEach(([file, markers], index) => {
@@ -84,6 +139,40 @@ test('PCIe articles use one numbered H2 heading style across the complete series
     for (const heading of headings) {
       assert.match(heading, /^[一二三四五六七八九十百]+、/, `${file} has an inconsistent H2 heading: ${heading}`);
     }
+  }
+});
+
+test('foundation articles introduce concepts in beginner learning order', () => {
+  for (const [path, topics] of Object.entries(orderedTopicContracts)) {
+    const body = articleBody(path);
+    let previous = -1;
+
+    for (const topic of topics) {
+      const current = body.indexOf(topic);
+      assert.ok(current > previous, `${path} must introduce ${topic} in learning order`);
+      previous = current;
+    }
+  }
+});
+
+test('main USB and PCIe articles cite at least two official primary sources', () => {
+  const mainArticles = [
+    ...articleContracts.usb.map(([file]) => join('docs/articles/usb', file)),
+    ...articleContracts.pcie
+      .filter(([file]) => file.startsWith('pci-'))
+      .map(([file]) => join('docs/articles/pcie', file)),
+  ];
+
+  for (const path of mainArticles) {
+    const sources = articleBody(path).match(officialSourcePattern) ?? [];
+    assert.ok(sources.length >= 2, `${path} must cite at least two official primary sources`);
+  }
+});
+
+test('articles visualize architecture, sequence, state, or ownership where required', () => {
+  for (const [path, minimum] of Object.entries(diagramContracts)) {
+    const diagrams = articleBody(path).match(/```mermaid\r?\n/g) ?? [];
+    assert.ok(diagrams.length >= minimum, `${path} needs at least ${minimum} Mermaid diagrams`);
   }
 });
 
