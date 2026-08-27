@@ -1,275 +1,177 @@
 ---
 title: "嵌入式知识体系 · USB 驱动开发实战 #09 · USB Host 控制器与设备树 Bring-up"
-description: "USB 外设驱动真正落到嵌入式板卡上，第一道门槛通常不是 `usb_driver`，而是 **Host 控制器能否正常工作**。如果控制器没有启动、PHY 没有上电、VBus 没有输出，后面的 `lsusb`、类驱动和 `probe()` 都不会出现。"
+description: "USB Host Bring-up 需要同时打通 VBUS、PHY、clock/reset、Controller IP、设备树、HCD 和 root hub。本篇从原理图一路走到 usbcore。"
 pubDate: "2026-08-18"
 series: usb
 order: 9
 tags: ["USB", "Linux Driver"]
 draft: false
 ---
-USB 外设驱动真正落到嵌入式板卡上，第一道门槛通常不是 `usb_driver`，而是 **Host 控制器能否正常工作**。如果控制器没有启动、PHY 没有上电、VBus 没有输出，后面的 `lsusb`、类驱动和 `probe()` 都不会出现。
+前面的文章默认 Host Controller 已经工作。本篇处理更靠近 BSP 的问题：新板第一次插入 U 盘时没有任何反应，应该从哪里开始？答案不是先改 USB Class Driver，而是证明从连接器到 root hub 的每一层都已建立。
 
-这一篇以 Linux USB Host bring-up 为主线，覆盖控制器、PHY、时钟、复位、供电、设备树和实际外设验证。示例以常见的 DWC2/DWC3 控制器为背景，具体节点名称必须以目标 SoC 的官方 DTS、内核版本和板级原理图为准。
+Host Bring-up 横跨原理图、供电、PHY、clock/reset、控制器 Device Tree、平台驱动和 HCD。只要其中一层未初始化，usbcore 就收不到端口变化，也不会创建 `usb_device`。
 
-## 一、先建立正确的问题分层
+## 一、从连接器到 Class Driver 的完整链路
 
-USB Host 的工作链路可以拆成五层：
+一条可用 Host 通路包含：连接器和 VBUS power switch、USB PHY、Host Controller IP、clock/reset/power domain、平台驱动、HCD、root hub、usbcore、Interface Driver 和用户 API。
 
 ```mermaid
 flowchart LR
-    A[5V VBus 与限流开关] --> B[USB 连接器与 ESD]
-    B --> C[USB PHY]
-    C --> D[Host 控制器 DWC2/DWC3]
-    D --> E[USB core 与 hub]
-    E --> F[类驱动或专用驱动]
+    CON[Connector and VBUS switch] --> PHY[USB PHY or PIPE/UTMI interface]
+    PHY --> HC[Host Controller IP]
+    DT[Device Tree resources] --> HC
+    HC --> HCD[Linux HCD]
+    HCD --> RH[Root Hub]
+    RH --> CORE[usbcore enumeration]
+    CORE --> CLASS[Class or vendor Interface Driver]
+    CLASS --> API[block, tty, V4L2, custom API]
 ```
 
-每一层失败的表现不同：
+连接器形态必须与角色一致。Type-A 通常用于固定 Host；Type-B/Micro-B 常用于 Device；Type-C 通过 CC 协商角色并可能需要 mux。OTG/Micro-AB 还涉及 ID pin。原理图中把 D+/D- 接上并不等于 Host 角色已经成立。
 
-| 层次 | 主要问题 | 常见现象 |
-|---|---|---|
-| VBus | 供电开关、过流、极性 | 插入设备完全无反应 |
-| 连接器 | D+/D-、SuperSpeed 差分线、ESD | 反复重连或高速降级 |
-| PHY | 电源、参考时钟、校准 | 控制器启动失败、信号错误 |
-| 控制器 | 时钟、复位、模式 | 没有 `/sys/bus/usb/devices` 下的 root hub |
-| USB core | 枚举、hub、类驱动 | 能看到 root hub，但设备不绑定 |
-| 外设驱动 | 描述符、端点、协议 | 设备出现但功能不可用 |
+VBUS 由 regulator 或 load switch 提供，常带 enable 与 over-current。设备树 `vbus-supply` 将控制器/PHY 与 regulator 关联。没有 VBUS，Device 不会正常连接；一直强开 VBUS 又可能在 Device 角色或 Type-C 冲突时造成双向供电风险。
 
-排查时必须从下往上确认，不能一看到 `probe()` 没进就立即修改设备驱动。
+PHY 负责模拟收发、速度检测和电气状态，可能是 SoC 内置 USB2 PHY、独立 USB3 PHY 或组合 PHY。需要 reference clock、reset、power supply、校准和 mode。USB3 还要确认 TX/RX lane、polarity、Type-C orientation mux 和 PIPE interface。
 
-## 二、硬件 bring-up 前必须确认的内容
+## 二、EHCI、xHCI、DWC2 与 DWC3 的软件边界
 
-### 1. 连接器类型与角色
+EHCI 是 USB 2.0 High-Speed Host Controller 规范。很多控制器还需要 companion controller 管理 Low/Full-Speed；嵌入式平台也可能通过内部 transaction translator 统一处理。Linux 通用 EHCI 核心位于 `ehci-hcd`，平台 glue 负责 clock、PHY 和寄存器差异，设备树 compatible 有时使用 `generic-ehci`。
 
-先确认板上接口是：
+xHCI 统一管理 USB 2.0 与 SuperSpeed root hub 逻辑，使用 command ring、event ring、transfer ring 和 TRB。Linux 常会为一个 xHCI controller 注册两个 roothub：一个面向 USB2 端口，一个面向 USB3 端口。只看到 USB2 root hub 并不能证明 SuperSpeed PHY/port 已工作。
 
-- 固定 Host 口；
-- 固定 Device 口；
-- OTG/DRD 双角色口；
-- USB Type-C，角色由 CC 状态和 Type-C 控制器决定。
+DWC2 是常见 USB2 Dual-Role Controller，可在 Host 与 Device 模式工作；DWC3 面向 USB3 Dual-Role，常与 xHCI Host core 和 Gadget Device core 组合。厂商 glue driver 负责 mode、PHY、clock/reset、quirk，再创建/驱动子设备。把 DWC3 与 xHCI 当成互斥概念会误读日志：DWC3 是 IP 集成，Host 模式可能由 xHCI HCD 驱动。
 
-Micro-B、USB-A 和 USB-C 只是连接器形态，不等于 Linux 中的角色。一个 USB-C 接口可能由 extcon、USB role switch、Type-C Port Manager 或外部 PD 芯片共同决定数据角色。
+控制器 IP 决定 HCD 数据结构和 debug register，但 usbcore 以上保持统一。Bring-up 先验证 HCD/root hub，再讨论 Class Driver。
 
-### 2. VBus 电源路径
+## 三、设备树必须完整描述依赖资源
 
-Host 端必须向外设提供 VBus。检查原理图时重点确认：
-
-- VBUS 是否经过受控负载开关；
-- 负载开关的 `EN` 是否接到 GPIO；
-- 过流输出是否接入 SoC GPIO 或中断；
-- 默认上电状态是否安全；
-- 5V 电源是否足以支持目标外设的启动电流；
-- USB-C 的 5.1 kΩ Rd/Rp 与角色配置是否匹配。
-
-不要只用万用表测空载 5V。插入 U 盘、摄像头或移动硬盘时，还要观察 VBus 是否瞬间跌落。
-
-### 3. 高速信号路径
-
-USB 2.0 重点关注 D+、D- 的差分布线、阻抗、长度匹配和 ESD 器件寄生电容。USB 3.x 还要检查 TX/RX 差分对、参考地、连接器翻转路径和高速 mux。
-
-在 USB 2.0 设备上，SuperSpeed 线路问题不会影响 USB 2.0 枚举；因此“USB 能识别”不代表高速通道完整。
-
-## 三、Linux 内核中的控制器层次
-
-以 Host 模式为例，软件结构大致是：
-
-```text
-USB device driver / class driver
-        |
-      usbcore
-        |
-       hub
-        |
-   HCD: xHCI / EHCI / OHCI / DWC2
-        |
-       PHY
-        |
-    SoC USB pins and power
-```
-
-HCD 是 Host Controller Driver 的缩写。它负责把 USB core 的请求翻译成控制器硬件可以执行的队列、传输描述符和中断处理。
-
-常见控制器包括：
-
-- `xhci-hcd`：USB 3.x，通常同时管理 USB 2.0 root hub 和 SuperSpeed root hub；
-- `dwc2`：常见于 USB 2.0，支持 Host、Device 或 OTG；
-- `dwc3`：控制器 IP，本身常由 glue 层连接 SoC 时钟、复位和 PHY；
-- `ehci`、`ohci`：较老的 USB 2.0 Host 控制器。
-
-先确认控制器驱动是否存在，再看对应设备树节点是否被内核实例化。
-
-### `usb_add_hcd()` 是进入 usbcore 的注册边界
-
-Platform probe 取得 MMIO/IRQ，enable clock、deassert reset、初始化 PHY 后，通常用 `usb_create_hcd()` 创建通用对象，填充控制器私有状态，再调用 `usb_add_hcd()` 注册 root hub并允许中断。此后即使没有外设，`lsusb -t` 也应能看到 root hub。
-
-失败回滚必须反向停止控制器、remove HCD、退出 PHY、assert reset 和 disable clock。Root hub 都没有出现时，问题仍在控制器/HCD，修改 USB interface driver没有作用。
-
-OHCI、EHCI、xHCI、DWC2/DWC3 的调度结构不同，但都通过 HCD 边界交给 usbcore。设备树 compatible 应匹配真实 IP/glue；例如 `generic-ehci` 只适合符合通用 EHCI platform binding 的控制器，不能替代厂商 glue 对 clock/PHY/quirk 的处理。
-
-## 四、设备树中需要表达什么
-
-设备树不是把 USB 协议写进去，而是描述控制器依赖的硬件资源。一个简化的控制器节点可能类似下面这样：
+不同 SoC binding 不同，以下示例只展示常见关系，不能直接复制 compatible 和寄存器：
 
 ```dts
-usb_host: usb@12340000 {
+usb_host0: usb@fe800000 {
     compatible = "vendor,soc-usb-host";
-    reg = <0x0 0x12340000 0x0 0x10000>;
-    interrupts = <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>;
-
-    clocks = <&cru USB_BUS_CLK>,
-              <&cru USB_REF_CLK>;
-    clock-names = "bus", "ref";
-
-    resets = <&cru SRST_USB_HOST>;
-    reset-names = "usb-host";
-
-    phys = <&usb2phy 0 PHY_TYPE_USB2>;
+    reg = <0x0 0xfe800000 0x0 0x10000>;
+    interrupts = <GIC_SPI 120 IRQ_TYPE_LEVEL_HIGH>;
+    clocks = <&cru ACLK_USB>, <&cru HCLK_USB>;
+    clock-names = "aclk", "hclk";
+    resets = <&cru SRST_USB>;
+    reset-names = "usb";
+    phys = <&usb2phy0>;
     phy-names = "usb2-phy";
-
     vbus-supply = <&vcc5v0_usb>;
     dr_mode = "host";
     status = "okay";
 };
 ```
 
-这只是结构示意，不能直接复制到任意芯片。字段含义如下：
+`reg` 和 IRQ 错误会让平台 probe 失败或中断不增长；clock/reset 缺失可能导致寄存器读写为固定值；`phys/phy-names` 错误会让 controller 初始化成功但端口永远没有 connect；`dr_mode` 错误会启动 Gadget 或 role-switch 路径；`status = "disabled"` 会让节点根本不创建设备。
 
-- `compatible`：选择匹配的控制器驱动；
-- `reg`：控制器寄存器物理地址和长度；
-- `interrupts`：控制器中断；
-- `clocks`：总线、参考、睡眠等时钟；
-- `resets`：控制器复位线；
-- `phys`：USB PHY；
-- `vbus-supply`：Host 侧 VBus 电源；
-- `dr_mode`：`host`、`peripheral` 或 `otg`；
-- `status`：必须确保最终加载的 DTB 中是 `okay`。
+PHY 节点可能包含 port child、clock output、VBUS detection 和 orientation switch。`usb-role-switch` 属性表示角色由外部 role-switch consumer/provider 控制，常与 Type-C controller、extcon 或 connector graph 关联。固定 Host 板不应无意义地引入动态角色状态机。
 
-### 设备树修改的验证方法
-
-不要只看源码。编译并启动后，应直接检查运行时设备树：
+设备树修改后必须确认运行内核实际加载的新 DTB：
 
 ```bash
-tr '\0' '\n' < /proc/device-tree/soc/usb@12340000/compatible
-cat /proc/device-tree/soc/usb@12340000/status
-readlink /sys/bus/platform/devices/12340000.usb/driver
+tr -d '\0' < /sys/firmware/fdt | strings | grep -A4 usb@fe800000
+ls -l /sys/bus/platform/devices | grep fe800000
 ```
 
-实际路径取决于 SoC 和内核设备模型。`/proc/device-tree` 证明的是当前运行 DTB，源码中写了 `status = "okay"` 并不能证明板子真的使用了这份 DTB。
+只检查源码 DTS 不足以证明 bootloader 选择了该 DTB。
 
-## 五、从启动日志判断控制器状态
+## 四、平台 probe 如何创建 HCD 和 root hub
 
-建议先打开串口，执行：
+典型 Host 平台驱动先启用 regulator/clock、释放 reset、初始化 PHY，再申请 HCD：
 
-```bash
-dmesg -wH
+```c
+hcd = usb_create_hcd(&demo_hc_driver, &pdev->dev,
+                     dev_name(&pdev->dev));
+if (!hcd)
+    return -ENOMEM;
+
+hcd->regs = devm_platform_ioremap_resource(pdev, 0);
+if (IS_ERR(hcd->regs)) {
+    ret = PTR_ERR(hcd->regs);
+    goto err_put;
+}
+
+ret = usb_add_hcd(hcd, irq, IRQF_SHARED);
+if (ret)
+    goto err_put;
 ```
 
-然后重新加载或重启观察 USB 相关日志：
+`usb_create_hcd()` 分配并初始化 `struct usb_hcd` 软件对象，还没有让控制器开始服务。驱动设置寄存器、资源和私有字段后调用 `usb_add_hcd()`；后者请求/启用控制器、注册 bus 和 root hub，使 usbcore 能通过虚拟 Hub Control 请求读取端口状态。
 
-```bash
-dmesg | grep -Ei 'usb|xhci|dwc2|dwc3|phy|vbus|regulator|over-current'
+```mermaid
+sequenceDiagram
+    participant P as Platform Driver
+    participant R as Regulator Clock Reset PHY
+    participant H as HCD Core
+    participant C as Host Controller
+    participant U as usbcore Root Hub
+    P->>R: enable VBUS, clocks, deassert reset, power PHY
+    P->>H: usb_create_hcd
+    P->>C: map registers and initialize hardware
+    P->>H: usb_add_hcd
+    H->>C: start controller and IRQ
+    H->>U: register root hub
+    U->>C: poll or interrupt for port status
+    C-->>U: connection change
+    U->>U: hub_port_connect and enumerate Device
 ```
 
-正常 Host 启动通常能看到控制器注册、root hub 建立，以及 `hub 1-0:1.0` 一类信息。典型判断：
+root hub 不是外部芯片，而是 HCD 对 controller root ports 的软件表示。`lsusb -t` 先看到 root hub，才能期待下游 Device。remove 时顺序相反：`usb_remove_hcd()` 停止 root hub 和调度，再释放 HCD，最后关闭 PHY/clock/VBUS。
 
-- 只有 PHY 错误：先查 PHY 电源、时钟和复位；
-- 控制器 probe 失败：查 `reg`、中断、clock、reset、phy phandle；
-- root hub 已建立但插入无日志：查 VBus、连接器和插座检测；
-- 有插入日志但枚举失败：查信号质量、供电和设备兼容性；
-- 枚举成功但功能不工作：进入类驱动或专用驱动层。
+平台 devm 资源可以减少错误路径代码，但不能决定停机顺序。必须先停止 HCD 对寄存器和 DMA 的访问，再让 devm unmap/clock disable。
 
-## 六、真实硬件上的最小验证阶梯
+## 五、角色、电源与 PHY 状态必须一致
 
-不要一开始就用 USB 摄像头和移动硬盘。建议采用由简单到复杂的顺序：
+Dual-role 系统中，`dr_mode`、role switch、Type-C Data Role、VBUS source/sink 和 controller mode 必须形成一致状态。例如角色切到 Host 时，应先确认端口成为 source、打开 VBUS、设置 PHY Host mode，再启动 HCD；切到 Device 时先停止 HCD/断开下游，再关闭 source，启动 UDC 并等待外部 VBUS。
 
-1. USB 鼠标或键盘：低功耗、协议标准、日志直观；
-2. U 盘：验证 bulk 传输、存储栈和持续供电；
-3. USB 转串口：验证设备节点、热插拔和用户态收发；
-4. USB 网卡：验证持续数据流和网络吞吐；
-5. UVC 摄像头：验证 isochronous/bulk 视频流和高带宽；
-6. 移动硬盘：验证启动电流、供电余量和长时间稳定性。
+不一致会产生典型现象：
 
-每接入一个设备，都记录以下信息：
+- HCD/root hub 存在，但 VBUS 关闭，插入无 connect。
+- VBUS 打开，controller 仍在 Device mode，没有 Host transaction。
+- USB2 正常，SuperSpeed lane mux 方向错误，只能 High-Speed。
+- role 在抖动，HCD 与 UDC 反复注册，日志不断 connect/disconnect。
+
+runtime PM 也会关闭 PHY/clock。wake capability 和 port power 策略应允许连接变化唤醒 Host；否则 suspend 后插入 Device 没有 IRQ。Bring-up 初期可以固定电源定位，但最终必须恢复 PM 测试。
+
+## 六、用日志和寄存器证明每一层
+
+第一轮检查：
 
 ```bash
-lsusb
+dmesg | grep -Ei 'usb|xhci|ehci|dwc|phy|vbus|regulator'
 lsusb -t
-usb-devices
-cat /sys/kernel/debug/usb/devices 2>/dev/null
+ls -l /sys/bus/platform/drivers/*usb* 2>/dev/null
+cat /proc/interrupts | grep -Ei 'xhci|ehci|dwc|usb'
 ```
 
-`lsusb -t` 可以帮助确认设备挂在哪个 root hub、运行在 USB 2.0 还是 SuperSpeed，以及当前绑定了哪个驱动。
+正常顺序通常是平台/PHY probe、HCD 注册、root hub 出现、端口连接、Device 速度和地址、Interface Driver。没有平台设备说明 DT/driver match；probe defer 说明 regulator/clock/PHY provider 未就绪；HCD 注册失败看 IRQ、寄存器和 reset；root hub 存在但无连接回到 VBUS/PHY/port。
 
-## 七、Host 与 Device 角色切换
+控制器 debug register 提供更底层证据：xHCI 看 USBCMD/USBSTS、PORTSC、ring/event；EHCI 看 USBCMD/USBSTS/PORTSC 和 async/periodic schedule；DWC 看 mode、interrupt、port 和 PHY status。寄存器位随 IP 版本变化，必须对照对应 TRM，不在通用驱动中硬编码猜测。
 
-对于 OTG 或 USB-C 接口，`dr_mode = "otg"` 只是允许双角色，不等于系统会自动在所有板子上正确切换。还可能涉及：
+中断计数不增长时确认 controller IRQ 是否正确路由、触发类型是否匹配、硬件 interrupt enable 是否设置。计数增长但 usbcore 无事件，检查 HCD handler 是否清错状态或 event ring/port change 处理。
 
-- `usb-role-switch`；
-- extcon；
-- Type-C connector 节点；
-- VBUS 检测；
-- ID pin；
-- 外部 PD/Type-C 控制器。
+## 七、典型故障与验收阶梯
 
-运行时可以查看：
+**插入没有任何日志。** 先测 VBUS，再看 PHY line state/port status，确认 HCD/root hub 已存在。若 port status 有 connect 但内核无日志，查 HCD IRQ；port status 也没有，查 connector/PHY。
 
-```bash
-find /sys/class/usb_role -maxdepth 2 -type f -print -exec sh -c 'printf "  %s: " "$1"; cat "$1"' _ {} \;
-```
+**root hub 正常但所有设备 `-71`。** `-EPROTO` 对所有设备同时出现，更可能是 PHY mode、clock、信号或 controller 初始化，而不是每个 Device 固件。比较另一端口/速度和示波证据。
 
-如果设备树声明了双角色，但 role 节点不存在，说明控制器 glue、role switch 或内核配置还没有完整接通。
+**USB2 正常但 USB3 不出现。** 检查 USB3 PHY、PIPE clock/reset、TX/RX lane、Type-C orientation mux 和 xHCI USB3 roothub/port。不要因为同一连接器的 USB2 companion 正常就排除 SuperSpeed 硬件问题。
 
-## 八、常见故障定位
+**冷启动失败，热重启成功。** 重点查 power/reset/clock/PHY 时序、regulator ramp、firmware calibration 和 probe defer。增加固定 sleep 只能验证时序敏感，最终应由 reset/clock ready 条件或 binding 依赖解决。
 
-### 故障 1：插入设备没有任何日志
+验收从低到高：root hub 注册；Low/Full/High-Speed Device；SuperSpeed Device；外部 Hub 多设备；大流量；runtime suspend/wakeup；角色切换；冷热启动；过流/拔插；长时间错误计数。每级失败都保留当前层证据。
 
-先测 VBus，再检查插座 D+/D-。如果 VBus 为 0V，优先查看 regulator、GPIO、过流开关和 Host 角色；不要先改 USB 外设驱动。
+**参考资料**
 
-### 故障 2：root hub 正常，外设枚举失败
+- [Host Controller APIs in Linux USB documentation](https://docs.kernel.org/driver-api/usb/usb.html#host-controller-apis)
+- [Linux USB Power Management](https://docs.kernel.org/driver-api/usb/power-management.html)
+- [USB 2.0 Specification - USB-IF](https://www.usb.org/document-library/usb-20-specification)
 
-检查：
+## 八、小结
 
-- 插入瞬间 VBus 是否跌落；
-- `-71`、`-110` 等错误码；
-- USB 线和 ESD 器件；
-- PHY 供电与参考时钟；
-- 是否只有某一个外设失败。
+USB Host Bring-up 是一条从 VBUS/connector、PHY、clock/reset、Controller IP、Device Tree、平台驱动、HCD 和 root hub 到 usbcore 的依赖链。`usb_create_hcd()` 建立软件对象，`usb_add_hcd()` 才把控制器和 root hub 交给 USB Core。
 
-`-110` 常表示超时，但根因可能是信号、电源或设备固件没有响应。
-
-### 故障 3：USB 2.0 正常，USB 3.x 降速
-
-分别验证 SuperSpeed 差分对、连接器翻转路径、mux 配置和 xHCI/PHY 的高速电源。不要用 USB 2.0 设备作为 SuperSpeed 通路的证据。
-
-### 故障 4：设备反复断开重连
-
-重点看：
-
-- 过流保护是否触发；
-- VBus 负载开关是否反复关闭；
-- autosuspend 是否过早挂起；
-- Hub 电源是否不足；
-- 连接器机械接触是否可靠。
-
-## 九、验收清单
-
-完成一次 USB Host bring-up，至少应满足：
-
-- [ ] 运行时 DTB 中控制器节点为 `okay`；
-- [ ] 控制器、PHY、root hub 均成功 probe；
-- [ ] Host 端 VBus 在空载和负载下均符合设计要求；
-- [ ] 鼠标、U 盘、USB 转串口至少各验证一次；
-- [ ] `lsusb -t` 能确认速度、拓扑和绑定驱动；
-- [ ] 热插拔 50 次以上无异常；
-- [ ] 持续传输测试中无重复 reset、超时和供电告警；
-- [ ] USB 2.0 与 USB 3.x 路径分别验证过。
-
-## 十、小结
-
-USB Host bring-up 的主线是：
-
-**原理图确认 → VBus 与 PHY → 控制器资源 → 设备树 → HCD probe → root hub → 外设枚举 → 类驱动。**
-
-只有控制器和板级资源先稳定，USB 设备驱动层的调试才有意义。对于嵌入式 Linux，`probe()` 不进经常只是结果，真正的原因可能在供电、PHY、时钟、复位、角色切换或 DTB 没有生效。
-
----
+只有 root hub、端口状态、速度、枚举和 Interface Driver 逐层通过，才能把问题交给上层协议。下一篇将把视角移到 MCU，分析资源受限环境如何用 CherryUSB 实现 Device 与 Host 栈。

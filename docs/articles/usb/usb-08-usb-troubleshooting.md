@@ -1,140 +1,163 @@
 ---
 title: "嵌入式知识体系 · USB 驱动开发实战 #08 · USB 问题排查：从枚举失败到传输异常"
-description: "USB 设备插上没反应、枚举到一半失败、驱动不绑定、bulk 传输超时、摄像头掉帧，这些问题在嵌入式 Linux 工程里非常常见。"
+description: "USB 故障跨越供电、角色、PHY、EP0、描述符、驱动绑定、URB、Class 协议和用户 API。本篇用证据链逐层缩小问题。"
 pubDate: "2026-08-18"
 series: usb
 order: 8
 tags: ["USB", "Linux Driver"]
 draft: false
 ---
-USB 故障排查最浪费时间的方式，是看到“设备不能用”就同时修改设备树、驱动和应用。有效方法是找到最后一个已经成立的状态：控制器是否工作、端口是否检测连接、EP0 是否完成枚举、interface 是否绑定、URB 是否提交、class 协议是否正确。
+USB 故障难排，不是因为某个 API 隐蔽，而是一次业务操作会跨越多层：连接器与供电、角色和 PHY、Host Controller、EP0、描述符、Interface Driver、URB、Class 协议、用户 API。跳过前层直接修改后层，只会让现象变化，不能证明根因。
 
-本篇按证据层次组织工具和现象，所有命令都回答一个具体问题，不再附加通用排错清单。
+本篇不罗列“试试换线、重载驱动”之类经验，而是为每一层定义入口证据、检查手段、可能结果和进入下一层的条件。
 
-## 一、先冻结环境，避免比较不同系统
+## 一、先冻结环境并建立故障证据树
 
-记录内核版本、控制器驱动、拓扑、设备 VID/PID 和复现动作：
+在比较之前记录：Host 硬件、内核版本、Device 固件、端口/Hub、线缆、供电方式、目标速度、是否经过 Type-C/role switch、复现步骤和最后一个正常版本。否则两次实验可能根本不是同一系统。
+
+```mermaid
+flowchart TD
+    A[Insert or enable Device] --> B{Host sees port connection change}
+    B -->|No| C[Power, cable, role, PHY, connector]
+    B -->|Yes| D{Port reset and EP0 descriptor read succeed}
+    D -->|No| E[Speed detect, signal, EP0 firmware, setup trace]
+    D -->|Yes| F{Configuration parsed and Interface created}
+    F -->|No| G[Descriptor length, class tree, SET_CONFIGURATION]
+    F -->|Yes| H{Expected driver binds and probe succeeds}
+    H -->|No| I[modalias, id_table, competing driver, probe rollback]
+    H -->|Yes| J{URB completes with expected bytes}
+    J -->|No| K[Endpoint, halt, HCD, DMA, IOMMU, PM]
+    J -->|Yes| L{Class protocol and userspace state advance}
+    L -->|No| M[Class control, framing, queue, application]
+    L -->|Yes| N[Run hotplug and sustained-load validation]
+```
+
+每个菱形都是停止点。没有连接变化时，不应检查 `id_table`；Device Descriptor 读取失败时，不应修改 UVC 应用；URB 已正确完成而应用无数据时，才进入 Class/用户态。
+
+日志要带时间关联。保存 `dmesg -w`、usbmon、应用日志和必要的示波/协议分析结果，使用同一复现时间窗对齐，而不是从长日志中挑几个看似相关的错误。
+
+## 二、第一层：供电、角色、连接器和 PHY
+
+插入 Device 后完全没有日志，先判断 VBUS 和角色。Host port 应提供规范允许的 VBUS，Device 应在检测到 VBUS 后连接 pull-up/termination。Dual-role Type-C 端口还需要 CC/TCPC 正确确定 Data Role；`dr_mode = "host"`、`"peripheral"` 或 `"otg"` 必须与硬件和 role switch 一致。
+
+检查项包括：
+
+- VBUS 电压、限流开关、过流信号和 regulator enable。
+- D+/D- 或 SuperSpeed lane 是否接反、短路、ESD 器件/共模电感是否适配。
+- Device pull-up/termination 是否在正确时机出现。
+- PHY reference clock、reset、power domain 和 calibration 是否完成。
+- Type-C CC 方向与 mux 是否把 SuperSpeed lane 接到当前插入方向。
+
+USB 2.0 设备被识别成错误速度，会在最早 packet 就出现错误。High-Speed chirp/handshake 失败可能退回 Full-Speed；SuperSpeed link 失败则可能只剩 USB 2.0 companion device。`lsusb -t` 的速度是重要证据，不能只看连接器标有“USB 3.0”。
+
+反复 connect/disconnect 可能是 VBUS 压降、接触不良、PHY margin、Device watchdog reset 或 Host 主动 reset。观察端口状态和 Device reset pin/电源，区分物理断开与协议层 reset。
+
+## 三、第二层：EP0、枚举和描述符
+
+出现连接日志但没有 VID/PID，问题集中在 port reset、地址 0 和 EP0。使用 usbmon/Wireshark 查看 Setup packet：Host 是否发 `GET_DESCRIPTOR(Device)`，Device 是否返回 8 字节，`bMaxPacketSize0` 是否合理，随后 `SET_ADDRESS` 和完整配置读取是否发生。
+
+错误码要结合请求阶段：
+
+- `-EPROTO` / `-EILSEQ`：协议/CRC/bitstuff/handshake 异常，可能来自信号、错误速度或 Device EP0 状态机。
+- `-ETIMEDOUT`：请求长期没有完成，需要判断 Device 是持续 NAK、完全无响应还是 HCD 停止。
+- `-EPIPE`：Device stall，标准请求不受支持或状态机错误。
+- `device descriptor read/64, error -71`：通常仍早于 Interface Driver。
+
+Configuration 能读取但解析失败，检查每条 `bLength`、`wTotalLength`、Interface/Endpoint 数、Alternate 和 companion。用 `lsusb -v` 解码后仍应回看原始字节，因为工具可能在损坏边界后停止。
+
+```mermaid
+sequenceDiagram
+    participant H as Host usbcore
+    participant M as usbmon trace
+    participant D as Device EP0
+    H->>D: GET_DESCRIPTOR first 8 bytes
+    H-->>M: submit and complete status
+    D-->>H: bMaxPacketSize0
+    H->>D: SET_ADDRESS
+    H->>D: GET_DESCRIPTOR configuration header
+    D-->>H: wTotalLength
+    H->>D: GET_DESCRIPTOR full configuration
+    H->>D: SET_CONFIGURATION
+```
+
+usbmon 中 submit 有但 complete 没有，说明请求仍未返回；complete 有负 status，按错误分类；complete 为 0 但长度/数据错误，则进入 Device 固件和描述符内容。
+
+## 四、第三层：驱动绑定、URB 和 Class 协议
+
+Interface 已创建后，用 `lsusb -t`、sysfs `modalias` 和 driver symlink 判断绑定：
 
 ```bash
-uname -a
 lsusb -t
-lsusb
-lspci -k | grep -A3 -i usb
-journalctl -kf
+cat /sys/bus/usb/devices/1-1:1.0/modalias
+readlink /sys/bus/usb/devices/1-1:1.0/driver
 ```
 
-同一设备在 USB 2.0 Hub、USB 3.x 直连、不同线材或供电口下可能协商不同速度。先固定拓扑与线材，再比较日志；否则一次“修复”可能只是换了连接路径。
+没有绑定时检查 ID 表、module alias、driver_override、黑名单和竞争驱动。手工 unbind/bind 只能用于验证匹配，不应作为产品启动流程。`probe()` 被调用但返回失败，必须保留第一处错误码；后续“设备节点不存在”只是结果。
 
-## 二、供电、角色、PHY 与连接检测
+进入 URB 层后记录 Endpoint 地址、pipe、length、status、actual_length、提交/完成时间和 in-flight。`usb_submit_urb()` 返回 0 只表示排队成功。Bulk IN 长期 NAK 可能是 Device 尚未收到启动命令；`-EPIPE` 可能是协议状态不允许当前操作；short packet 可能是合法消息边界。
 
-插入后内核完全无日志，优先检查 VBUS、GND、D+/D- 或 SuperSpeed pair、连接器、供电电流、Host/Device 角色和 PHY。开发板还要核对 clock/reset/regulator、`dr_mode`、Type-C role switch 或 ID/VBUS 检测。
+Class 层需要专用证据：
 
-Hub 端口能报告 connect 但 reset 失败，说明软件已经看到电气连接，问题缩小到信号质量、速度握手、Device 固件或 PHY。反复 connect/disconnect 常见于供电跌落、接触不良和 EMI，不应先修改 interface driver。
+- HID：Report Descriptor 与原始 report 是否一致。
+- CDC ACM：DTR/RTS、line coding、Data Interface Bulk Endpoint 和 SerialState。
+- MSC：CBW/CSW tag、residue、status 与 SCSI sense。
+- UVC：Probe/Commit、Alternate、UVC payload FID/EOF、Iso packet status。
+- UAC：Clock/format/Alternate、feedback endpoint 和 ALSA xrun。
 
-## 三、EP0 枚举和描述符
+用户 API 也可能形成背压。V4L2 应用未及时 queue buffer、ALSA hw params 不匹配、TTY line discipline 或自定义 read FIFO 满，都能使 USB 层看似“没有新数据”。因此 URB 已完成后要继续检查数据是否被上层消费。
 
-`dmesg` 中常见错误要结合阶段解释：
+## 五、第四层：HCD DMA、IOMMU、cache 与电源管理
 
-- `-71`（EPROTO）常见于 PID/CRC/bitstuff/握手等协议错误或信号问题；
-- `-110`（ETIMEDOUT）表示预期响应未到，可能是 Device 固件卡住、地址切换错误或传输未完成；
-- `-32`（EPIPE）表示 STALL，标准请求或 endpoint 状态不被设备接受；
-- `-19`（ENODEV）常见于传输期间设备消失。
+Interface Driver 的 URB 会被 HCD 转换为控制器描述符并通过 DMA 访问内存。IOMMU fault 中的 requester/IOVA 可证明控制器访问了未映射地址，常见根因包括 transfer buffer 已释放、长度越界、控制器 reset 后继续使用旧 ring 或 DMA mask/映射错误。
 
-使用 usbmon 抓取 EP0：
+在非 coherent 架构中，HCD 和 DMA API 负责 cache ownership。厂商 HCD 若漏做 sync，可能只在压力下出现旧数据或 descriptor 未更新。不要在 Interface Driver 中随意 `dma_sync_*` 修补 HCD bug；先确认 buffer API 和 ownership 边界。
+
+dynamic_debug 和 tracepoint 可以建立软件时间线：
 
 ```bash
-sudo modprobe usbmon
-sudo cat /sys/kernel/debug/usb/usbmon/0u
+echo 'file drivers/usb/core/* +p' | \
+  sudo tee /sys/kernel/debug/dynamic_debug/control
+sudo trace-cmd record -e usb -e irq -e workqueue sleep 10
 ```
 
-Wireshark 可直接打开 usbmon 接口，把 Setup packet 解码成 `GET_DESCRIPTOR`、`SET_ADDRESS`、`SET_CONFIGURATION`。找到最后一个成功请求，再检查下一请求的 setup 字段、返回长度和 status。枚举阶段不需要先解码 UVC/MSC 数据。
+KASAN 发现 use-after-free/越界，lockdep 发现锁顺序，kmemleak 辅助发现泄漏。它们与 usbmon 互补：usbmon 证明总线请求，sanitizer 证明内核内存/并发错误。
 
-描述符错误用原始字节确认：
+runtime autosuspend 会让“设备仍插着但暂时不可访问”成为正常状态。低负载偶发首包超时，应记录 runtime status、autosuspend delay、suspend/resume callback 和远程唤醒，而不是永久关闭 PM 后宣称问题解决。
 
-```bash
-lsusb -v -d vid:pid
-hexdump -C /sys/bus/usb/devices/1-2/descriptors
-```
+热插拔/复位压力是独立场景。disconnect 必须阻止 resubmit、kill URB、取消 work/timer，并让 open file 安全失败。只有正常数据流压力不能覆盖 teardown 竞态。
 
-重点检查 `bLength`、`wTotalLength`、interface/endpoint 数量、IAD/Union 引用和 endpoint 类型。Device 固件日志应能对应 EP0 setup 与状态阶段。
+## 六、工具分别能证明什么
 
-### usbmon 文本与 Wireshark 分别适合快速定位和协议解码
+| 工具 | 主要证据 | 不能单独证明 |
+| --- | --- | --- |
+| `dmesg` | 内核阶段、错误码、bind/reset | 线上的精确 packet |
+| `lsusb -v/-t` | 描述符解析、拓扑、速度、driver | 运行时每次 transfer |
+| usbmon | URB submit/complete、Setup、长度/status | PHY 波形与 Device 内部状态 |
+| Wireshark | 协议字段、Class transaction 解码 | 内核锁和对象寿命 |
+| dynamic_debug/tracepoint | 内核调用和时间线 | 电气质量 |
+| KASAN/lockdep | 内存安全与锁问题 | USB 协议正确性 |
+| IOMMU fault | DMA 地址、方向、requester | 上层协议是否正确 |
+| 协议分析仪 | 总线 packet、时序、握手 | Linux 内部软件状态 |
+| 示波器 | 电压、眼图、reset/clock | 描述符与驱动绑定 |
 
-usbmon `S/C/E` 记录 submit、complete、error，包含 tag、时间、bus/device/endpoint、transfer type、status、length和可选数据。用同一 tag配对 S/C，可以计算延迟和实际长度；只看 complete 不知道请求原始 setup/长度。
+协议分析仪成本较高，适合 Host 与 Device 软件证据矛盾、需要看到重试/握手/时序或 SuperSpeed training 的情况。使用前先通过 usbmon 确认问题确实在 Host 软件证据之外。
 
-Wireshark 选择 usbmon 接口或读取 pcap，可按 `usb.device_address`、`usb.endpoint_address`、`usb.setup.bRequest` 过滤。控制传输检查 Setup/Data/Status，bulk/class协议再按 endpoint和 payload解码。抓包本身会增加 I/O，应限制目标 bus/device。
+## 七、三个典型问题的闭环推导
 
-`-ETIMEDOUT` 表示规定时间内没有完成，可能是 Device未响应、endpoint未准备、HCD/控制器卡住或取消等待；它不直接证明线材。与 `-EPROTO`、STALL、disconnect状态和最后一条总线 transaction一起判断。
+**设备只能 Full-Speed。** 先确认 Device Descriptor 与 Endpoint 是否只支持 FS，再检查 High-Speed chirp、PHY mode 和线材。若同一硬件在另一 Host 为 High-Speed，比较 Host PHY/port；若所有 Host 都为 FS，检查 Device PHY/固件。不要用 Bulk 吞吐反推速度，直接看拓扑和握手证据。
 
-## 四、interface 匹配和 probe
+**UVC 能列格式但开流失败。** 枚举和描述符层已基本通过，继续看 Probe/Commit 返回、所选 Alternate、`usb_set_interface()` 是否 `-ENOSPC`、Iso URB status 和 payload header。若 URB 完成但无 frame，检查 FID/EOF 和 V4L2 buffer；若 URB 不完成，回到 Endpoint/HCD。
 
-设备能被 `lsusb` 识别但没有功能节点，检查每个 interface 的 modalias 和 driver symlink：
+**压力下拔出偶发崩溃。** 记录 disconnect、URB completion、work/timer 和 file release 顺序，启用 KASAN。确认 disconnect 先置 disconnected 再阻止新提交，`usb_kill_anchored_urbs()` 后才释放 buffer，私有对象由 kref 延迟。单纯增加 sleep 只改变竞态概率。
 
-```bash
-find /sys/bus/usb/devices/1-2:1.* -maxdepth 1 -name modalias -o -name driver -ls
-lsusb -t
-modprobe -c | grep 'v1234p5678'
-```
+**参考资料**
 
-没有匹配可能是 id/class 不符；被错误驱动占用可以临时 unbind 验证；probe 返回错误则启用 dynamic debug：
+- [The Linux-USB Host Side API](https://docs.kernel.org/driver-api/usb/usb.html)
+- [Linux USB Power Management](https://docs.kernel.org/driver-api/usb/power-management.html)
+- [USB 2.0 Specification - USB-IF](https://www.usb.org/document-library/usb-20-specification)
 
-```bash
-echo 'file drivers/usb/* +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
-echo 'module demo_usb +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
-```
+## 八、小结
 
-日志应标出 endpoint 解析、buffer/URB 分配、上层节点注册和回滚的具体步骤，而不是只有一条失败信息。
+USB 排错的核心是证据分层：先证明连接和角色，再证明 EP0 与描述符，再证明 Interface 绑定、URB、Class 协议和用户消费，最后处理 PM、热插拔和持续压力。每种工具只覆盖部分边界，错误码也必须放回请求阶段解释。
 
-## 五、URB 是否进入 HCD 并正确完成
-
-驱动绑定后传输超时，使用 usbmon/Wireshark 对照驱动日志。先确认请求方向、endpoint、长度和类型，再看 completion status 与 `actual_length`。
-
-Bulk IN 短包可能是正常边界；STALL 需要按设备协议 clear halt/reset；持续 `-EPROTO/-EILSEQ` 更像链路或设备协议；`-ESHUTDOWN` 多发生在拔出或控制器关闭。若驱动日志显示提交成功但 usbmon 没有对应请求，应继续检查 HCD、runtime PM 和 endpoint 是否 enable。
-
-内核 USB tracepoint 和 ftrace 可以确认 submit/complete 时间。不同内核暴露事件名称可能不同，先查看：
-
-```bash
-find /sys/kernel/tracing/events/usb -maxdepth 2 -type f 2>/dev/null
-```
-
-不要在生产系统盲目打开所有 trace；选择 URB submit/complete 和目标 bus/device，控制日志量。
-
-### dynamic_debug 与 tracepoint 把“打印日志”升级成时间线
-
-Dynamic debug 可按 module/file/function开启 `pr_debug()`，适合看 probe、PM、completion和错误分支。Tracepoint/ftrace用于 submit/complete、IRQ、workqueue和调度时间；先查看 `/sys/kernel/tracing/events/usb` 当前内核实际提供的事件，再选择性启用。
-
-将 driver request id/URB 指针写入 trace，可把用户调用、URB submit、HCD completion、workqueue和 wake串起来。不要在高频 completion中无节制 printk，它会改变时序并制造新的 timeout。
-
-KASAN 发现 use-after-free/out-of-bounds，lockdep 检查锁顺序，kmemleak检查拔插后对象；这些工具解释软件内存/并发，不替代 usbmon 的协议证据。
-
-## 六、Class 协议和用户接口
-
-`/dev/ttyACM0` 存在但不能通信，继续检查 CDC line coding、control line state 和 bulk 数据；U 盘出现但 I/O 失败，要区分 BOT/UAS transport、SCSI sense 和文件系统；摄像头掉帧要检查 UVC Probe/Commit、altsetting、iso packet status、带宽和 V4L2 buffer。
-
-这时 usbmon 与类工具要一起使用：
-
-```bash
-v4l2-ctl --all -d /dev/video0
-arecord --dump-hw-params -D hw:1,0 /dev/null
-udevadm info /dev/ttyACM0
-```
-
-用户节点只证明上层子系统注册成功，不证明数据路径、协议状态和性能正确。
-
-## 七、HCD DMA、IOMMU 与 cache 是 Host 侧隐藏的数据层
-
-Interface driver提交 URB 后，HCD 可能为 transfer buffer建立 DMA mapping、构造 xHCI/EHCI descriptor并访问 IOMMU。出现 IOMMU fault、event ring不更新或 payload旧数据时，问题可能在 Host Controller DMA/cache，而非外接 Device协议。
-
-记录 fault requester/IOVA、HCD ring dequeue/enqueue、DMA direction和 buffer生命周期。非一致 cache平台的 HCD/UDC port必须使用 DMA API；禁用 IOMMU只能作为受控对比，不能把越界访问当成修复。
-
-Runtime autosuspend 还会停止 controller/device链路。恢复后第一条 URB失败时检查 Host controller runtime PM、PHY clock和driver resume重提，而不只增加 timeout。
-
-## 八、拔出、休眠和恢复是独立测试场景
-
-热拔出压力测试要覆盖 I/O 进行中拔出、反复打开关闭、进程退出、suspend/resume 和 runtime PM。KASAN、lockdep 和 kmemleak 能发现引用与锁问题；`usb_kill_urb`/anchor、kref 和 disconnect 标志是审计重点。
-
-恢复后设备地址和 interface 对象可能重建，应用不能永久缓存 sysfs 路径或 minor。设备固件 remote wakeup、Host autosuspend 与 class driver PM 回调也必须形成闭环。
-
-## 九、小结
-
-USB 排错是一条从物理连接到 class 协议的证据链：无连接日志先查硬件/角色，EP0 失败看 setup 与描述符，枚举成功后看 interface 匹配，驱动绑定后看 URB，节点出现后再看 class 协议。usbmon、Wireshark、dynamic_debug 和 tracepoint 各自回答不同层次的问题。下一篇进入 Host 控制器和设备树，解释为何 root hub 都没有出现时上述上层工具无从发挥。
+下一篇将把 Host 侧最底层展开，从 VBUS、PHY、设备树、Host Controller IP 和 HCD 一路走到 root hub。
