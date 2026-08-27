@@ -1,198 +1,430 @@
 ---
 title: "嵌入式知识体系 · USB 驱动开发实战 #05 · USB 设备驱动实践：从匹配到数据收发"
-description: "前面几篇已经把 USB 架构、描述符、Linux USB 驱动框架和 URB 讲过了。这一篇把这些知识串起来，完成一个最小可运行的 USB 设备驱动实践。"
+description: "本篇以一个 vendor-specific Bulk 设备为例，把 Interface 匹配、Endpoint 解析、URB、字符设备、read/poll、背压和 disconnect 串成一份可审计的 Linux USB 驱动。"
 pubDate: "2026-08-18"
 series: usb
 order: 5
 tags: ["USB", "Linux Driver"]
 draft: false
 ---
-前四篇分别建立了枚举、Linux 驱动对象、描述符和 URB。本篇把它们收束成一个可落地的自定义 bulk interface 驱动。目标不是给出“能编译的最长代码”，而是解释每个对象由谁拥有、异步请求何时停止，以及拔出设备和用户文件描述符并发时如何避免 use-after-free。
+前四篇已经分别说明 USB 如何识别设备、Linux 如何绑定 Interface、描述符如何定义 Endpoint，以及 URB 如何异步完成。本篇把这些机制组合成一个可工作的驱动模型。
 
-场景是一台包含 bulk IN 和 bulk OUT endpoint 的自定义设备，驱动向用户态暴露字符接口，写路径异步提交 URB，读路径维护持续接收请求。
+示例设备只有一个 vendor-specific Interface，包含一个 Bulk OUT 和一个 Bulk IN Endpoint。上层协议使用消息头 `{type, sequence, length}`，Host 发送命令，Device 异步返回响应或采样数据。明确协议很重要：驱动才能判断 short packet、消息边界、超时和背压，而不是把任意字节流都当成功。
 
-## 一、私有对象必须同时表达硬件状态和软件寿命
+## 一、先定义对象、协议和停止条件
+
+驱动私有对象必须同时回答三个问题：硬件是否仍连接、软件对象被谁引用、异步请求是否仍在飞行。只保存 `usb_device *` 和两个 Endpoint 地址远远不够。
 
 ```c
-struct demo_usb {
+struct demo_dev {
     struct usb_device *udev;
     struct usb_interface *intf;
     struct kref kref;
-    struct mutex io_mutex;
-    spinlock_t rx_lock;
+
+    u8 bulk_in_ep;
+    u8 bulk_out_ep;
+    size_t bulk_in_mps;
+
     struct usb_anchor submitted;
+    struct urb *rx_urb[4];
+    u8 *rx_buf[4];
+
+    spinlock_t rx_lock;
+    struct kfifo rx_fifo;
     wait_queue_head_t read_wait;
 
-    u8 bulk_in;
-    u8 bulk_out;
-    size_t in_maxp;
+    struct semaphore tx_slots;
+    struct mutex io_mutex;
     bool disconnected;
-
-    struct urb *rx_urb;
-    u8 *rx_buf;
-    size_t rx_len;
-    int rx_status;
+    bool suspended;
 };
 ```
 
-`usb_device` 引用保证驱动仍可使用设备对象；`kref` 让 disconnect 与最后一次 close 解耦；mutex 串行化可睡眠的 open/read/write/disconnect 状态；自旋锁只保护 completion 与 reader 共享的短接收状态；`usb_anchor` 管理所有在途异步 URB。
+`kref` 保护私有对象内存；`disconnected` 表示硬件可访问性；`usb_anchor` 跟踪动态发送 URB；固定 RX URB 数组维持持续接收；wait queue 把 completion 与阻塞 read/poll 连接起来；semaphore 限制并发 TX 数，形成最基本的背压。
 
-“设备已拔出”和“私有对象可释放”不是同一时刻。disconnect 先撤销硬件能力并停止 URB，用户仍持有文件描述符时对象继续存在；最后一个 `kref_put()` 才释放内存。
+协议停止条件也要明确：disconnect 后所有新文件操作返回 `-ENODEV`；suspend 期间不提交新 URB；某个消息长度超过上限返回 `-EMSGSIZE`；RX FIFO 满时记录丢弃或让设备停发，不能默默覆盖旧数据。
 
-## 二、probe 先验证 interface，再发布字符设备
+## 二、probe 按依赖顺序建立资源
 
-现代内核提供 endpoint helper，避免每个驱动手写遍历：
-
-```c
-struct usb_endpoint_descriptor *bulk_in;
-struct usb_endpoint_descriptor *bulk_out;
-
-ret = usb_find_common_endpoints(intf->cur_altsetting,
-                                &bulk_in, &bulk_out,
-                                NULL, NULL);
-if (ret)
-    return ret;
-```
-
-找到 endpoint 后取得地址和 `usb_endpoint_maxp()`，分配私有对象、RX URB 和 buffer，初始化 lock/anchor/waitqueue，并用 `usb_set_intfdata()` 绑定 interface。只有全部内部状态可用后才调用 `usb_register_dev()` 发布字符 minor。
-
-失败回滚按发布顺序反向执行：先撤销用户入口，再 kill 已提交 URB，释放 URB/buffer，清 intfdata，最后 `usb_put_dev()` 和释放对象。把 `usb_set_intfdata()` 放得过早又不在失败路径清空，会让 disconnect 取得半初始化对象。
-
-```mermaid
-flowchart LR
-    M[interface matched] --> E[find endpoints]
-    E --> O[allocate object URBs buffers]
-    O --> I[set intfdata]
-    I --> R[register char device]
-    R --> S[start RX URB]
-    S --> P[published to user space]
-```
-
-## 三、open 和 release 只管理引用，不重新初始化硬件
-
-open 根据 minor 找到 interface，取得 intfdata，在锁内检查 `disconnected`，成功后 `kref_get()` 并把对象放进 `file->private_data`。release 只执行 `kref_put()`。
-
-不要在 open 中保存裸 interface 指针后立即放掉所有引用，也不要在 release 中无条件关闭全局硬件：多个进程可能同时打开。同一设备是否只允许单开，应由明确的 open count 或 exclusive 标志控制。
-
-## 四、异步 write 的 buffer 必须由 completion 释放
+驱动用 VID/PID 或 Interface class 匹配后，先验证当前 Alternate 的 Endpoint。`usb_find_common_endpoints()` 能寻找常见 Bulk/Interrupt 组合，但结果仍需检查最大包长和厂商协议约束。
 
 ```c
-static ssize_t demo_write(struct file *file,
-                          const char __user *user,
-                          size_t count, loff_t *ppos)
+static int demo_probe(struct usb_interface *intf,
+                      const struct usb_device_id *id)
 {
-    struct demo_usb *dev = file->private_data;
-    struct urb *urb;
-    void *buf;
+    struct usb_endpoint_descriptor *ep_in;
+    struct usb_endpoint_descriptor *ep_out;
+    struct demo_dev *dev;
     int ret;
 
-    if (count == 0)
-        return 0;
-
-    buf = memdup_user(user, count);
-    if (IS_ERR(buf))
-        return PTR_ERR(buf);
-
-    urb = usb_alloc_urb(0, GFP_KERNEL);
-    if (!urb) {
-        kfree(buf);
-        return -ENOMEM;
-    }
-
-    usb_fill_bulk_urb(urb, dev->udev,
-        usb_sndbulkpipe(dev->udev, dev->bulk_out),
-        buf, count, demo_write_complete, dev);
-    urb->transfer_flags |= URB_FREE_BUFFER;
-    usb_anchor_urb(urb, &dev->submitted);
-    ret = usb_submit_urb(urb, GFP_KERNEL);
+    ret = usb_find_common_endpoints(intf->cur_altsetting,
+                                    &ep_in, &ep_out, NULL, NULL);
     if (ret)
-        usb_unanchor_urb(urb);
-    usb_free_urb(urb);
-    return ret ? ret : count;
+        return dev_err_probe(&intf->dev, ret,
+                             "bulk IN/OUT endpoints required\n");
+
+    dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+    if (!dev)
+        return -ENOMEM;
+
+    dev->udev = usb_get_dev(interface_to_usbdev(intf));
+    dev->intf = usb_get_intf(intf);
+    dev->bulk_in_ep = ep_in->bEndpointAddress;
+    dev->bulk_out_ep = ep_out->bEndpointAddress;
+    dev->bulk_in_mps = usb_endpoint_maxp(ep_in);
+    kref_init(&dev->kref);
+    init_usb_anchor(&dev->submitted);
+    spin_lock_init(&dev->rx_lock);
+    init_waitqueue_head(&dev->read_wait);
+    mutex_init(&dev->io_mutex);
+    sema_init(&dev->tx_slots, 8);
+
+    ret = kfifo_alloc(&dev->rx_fifo, 64 * 1024, GFP_KERNEL);
+    if (ret)
+        goto err_put;
+
+    ret = demo_alloc_rx_pool(dev);
+    if (ret)
+        goto err_fifo;
+
+    usb_set_intfdata(intf, dev);
+    ret = usb_register_dev(intf, &demo_class);
+    if (ret)
+        goto err_data;
+
+    ret = demo_start_rx(dev, GFP_KERNEL);
+    if (ret)
+        goto err_minor;
+
+    return 0;
+
+err_minor:
+    usb_deregister_dev(intf, &demo_class);
+err_data:
+    usb_set_intfdata(intf, NULL);
+    demo_free_rx_pool(dev);
+err_fifo:
+    kfifo_free(&dev->rx_fifo);
+err_put:
+    usb_put_intf(dev->intf);
+    usb_put_dev(dev->udev);
+    kfree(dev);
+    return ret;
 }
 ```
 
-`usb_free_urb()` 在提交后只释放驱动持有的引用，HCD 的引用仍让 URB 活到 completion。`URB_FREE_BUFFER` 让 core 在最终释放 URB 时释放 buffer。若不用该标志，completion 必须明确释放，不能在 write 返回前释放仍供 DMA 使用的内存。
+`usb_register_dev()` 为 Interface 分配 minor，并通过 `usb_class_driver` 创建字符设备入口。它应在私有状态和基础协议已经就绪后调用；若先发布 `/dev/demo_usb0`，用户可能在 probe 尚未完成时进入 `open()`。
 
-Completion 先从 anchor 自动脱离，再区分正常完成、主动取消和真实错误。若需要限制队列深度，可统计 anchor 中请求或使用 semaphore，在 write 入口施加背压。
-
-## 五、持续 bulk IN 用 completion 与 waitqueue 连接用户 read
-
-驱动通常预先提交一个或多个 RX URB。Completion 把 `actual_length` 和 status 提交到接收队列，唤醒 `read_wait`，再在未断开时重新提交。用户 read 睡眠等待“有数据或已断开”，醒后在锁保护下复制并消费。
-
-单一 RX buffer 只能在用户消费后重提，否则 completion 会覆盖尚未读取的数据。高吞吐实现应使用多个 buffer/ring，并定义 FREE、IN_FLIGHT、READY、USER_OWNED 等所有权状态，而不是只增加 URB 数量。
-
-Completion 不能调用 `copy_to_user()`，也不应获取可能睡眠的 mutex。它只做短状态提交，用户线程完成可睡眠操作。
-
-## 六、read、poll 和非阻塞语义必须共享同一个接收状态
-
-持续 RX 不应只保存一块 `rx_buf + rx_len`，否则 completion 在用户尚未读取时再次到来会覆盖数据。教学实现至少使用一个带 producer/consumer 的 ring，或多个 FREE/IN_FLIGHT/READY buffer。Completion 在 `rx_lock` 下把 buffer 从 IN_FLIGHT 移到 READY，随后唤醒 `wait_queue`。
-
-`read()` 的等待条件应是“READY 队列非空、设备断开或发生不可恢复错误”：
-
-```c
-ret = wait_event_interruptible(dev->read_wait,
-        demo_has_ready(dev) || READ_ONCE(dev->disconnected));
-if (ret)
-    return ret;
-if (READ_ONCE(dev->disconnected) && !demo_has_ready(dev))
-    return -ENODEV;
+```mermaid
+flowchart TD
+    M[Interface match] --> E[Validate Bulk IN and OUT endpoints]
+    E --> O[Allocate demo_dev, FIFO, locks, references]
+    O --> R[Allocate RX URB pool and buffers]
+    R --> D[usb_set_intfdata]
+    D --> C[usb_register_dev publishes minor]
+    C --> S[Submit RX URBs]
+    S --> READY[Driver ready]
+    READY -. failure or remove .-> U[Unwind in reverse order]
 ```
 
-若文件以 `O_NONBLOCK` 打开且当前无数据，返回 `-EAGAIN`，不能仍然睡眠。取得 READY buffer 后再 `copy_to_user()`；复制可能睡眠，因此不能持 completion 使用的自旋锁。通常先在锁内摘下 buffer并改为 USER_OWNED，解锁后复制，最后重新提交 RX。
+错误回滚必须与获取顺序镜像。特别是已提交 RX URB 后失败，需要先 kill URB，再释放 buffer；单纯 `usb_free_urb()` 不能取消正在 HCD 中的请求。
 
-`poll()` 注册同一个 waitqueue，并根据相同条件返回 `EPOLLIN`；断开返回 `EPOLLHUP`，错误返回 `EPOLLERR`。Read 与 poll 如果使用不同状态变量，会出现“poll 可读但 read 阻塞”或永久漏唤醒。
+## 三、持续 Bulk IN：completion、FIFO、read 和 poll
 
-## 七、异步写队列需要背压和取消策略
+持续接收不能每次用户 `read()` 才临时提交一个 URB，否则用户调度延迟会在总线上产生空档。probe 启动 4 个 RX URB，completion 把有效字节放入 FIFO，并立即重新提交空闲 URB。
 
-每次 write 分配 URB/buffer在低速应用中可接受，但高并发会无界占用内存。可以用 semaphore 限制在途 write 数，或维护固定 TX request pool。队列满时阻塞或 `O_NONBLOCK -> -EAGAIN`，语义与 read 一致。
+```c
+static void demo_rx_complete(struct urb *urb)
+{
+    struct demo_dev *dev = urb->context;
+    unsigned long flags;
+    bool resubmit;
 
-Completion 释放配额并唤醒写者。Disconnect 先阻止新 write，再 kill anchor；所有 completion 返回后配额和对象引用应回到初始值。错误重试要由设备协议决定，不能对所有 `-EPIPE/-EPROTO` 自动重提造成风暴。
+    if (urb->status == 0 && urb->actual_length) {
+        spin_lock_irqsave(&dev->rx_lock, flags);
+        if (kfifo_avail(&dev->rx_fifo) >= urb->actual_length)
+            kfifo_in(&dev->rx_fifo, urb->transfer_buffer,
+                     urb->actual_length);
+        else
+            dev->rx_dropped += urb->actual_length;
+        spin_unlock_irqrestore(&dev->rx_lock, flags);
+        wake_up_interruptible(&dev->read_wait);
+    }
 
-## 八、autosuspend 前后要停止并恢复数据流
+    resubmit = !READ_ONCE(dev->disconnected) &&
+               !READ_ONCE(dev->suspended) &&
+               urb->status != -ENOENT &&
+               urb->status != -ESHUTDOWN;
+    if (resubmit) {
+        int ret = usb_submit_urb(urb, GFP_ATOMIC);
+        if (ret)
+            dev->rx_submit_errors++;
+    }
+}
+```
 
-Interface driver 可使用 runtime PM。Open/首次 I/O 通过 `usb_autopm_get_interface()` 保证设备 active，空闲后 `usb_autopm_put_interface()`；每次成功 get 都必须在错误、release 和 disconnect 路径配对。
+FIFO 是 completion 与进程上下文之间的所有权边界。completion 在 spinlock 下复制字节后即可归还 URB buffer；read 在同一锁下把 FIFO 数据复制到临时内核 buffer，再调用 `copy_to_user()`，避免持有 spinlock 访问用户内存。
 
-Suspend 回调停止持续 RX 或让设备进入低功耗，resume 重新确认 altsetting/endpoint 状态并提交 request。设备支持 remote wakeup 时还要配置标准 feature 与 class 状态。物理仍连接不代表 URB 在 autosuspend 期间可继续提交。
+```c
+static ssize_t demo_read(struct file *file, char __user *buf,
+                         size_t count, loff_t *ppos)
+{
+    struct demo_dev *dev = file->private_data;
+    u8 *tmp;
+    unsigned int copied;
+    int ret;
 
-调试“空闲一段时间后第一次读失败”时，记录 runtime status、autosuspend delay、resume 回调和 RX 重提，而不是把错误归因于随机 USB timeout。
+    if (!count)
+        return 0;
 
-## 九、disconnect 的顺序决定是否安全
+    if (file->f_flags & O_NONBLOCK) {
+        if (kfifo_is_empty(&dev->rx_fifo))
+            return READ_ONCE(dev->disconnected) ? -ENODEV : -EAGAIN;
+    } else {
+        ret = wait_event_interruptible(dev->read_wait,
+                !kfifo_is_empty(&dev->rx_fifo) ||
+                READ_ONCE(dev->disconnected));
+        if (ret)
+            return ret;
+    }
+
+    if (kfifo_is_empty(&dev->rx_fifo) &&
+        READ_ONCE(dev->disconnected))
+        return -ENODEV;
+
+    tmp = kmalloc(min_t(size_t, count, 4096), GFP_KERNEL);
+    if (!tmp)
+        return -ENOMEM;
+
+    spin_lock_irq(&dev->rx_lock);
+    copied = kfifo_out(&dev->rx_fifo, tmp,
+                       min_t(size_t, count, 4096));
+    spin_unlock_irq(&dev->rx_lock);
+
+    if (copy_to_user(buf, tmp, copied))
+        ret = -EFAULT;
+    else
+        ret = copied;
+    kfree(tmp);
+    return ret;
+}
+```
+
+`poll()` 必须与 read 使用同一状态条件，否则用户会收到“可读”通知却读不到数据：
+
+```c
+static __poll_t demo_poll(struct file *file, poll_table *wait)
+{
+    struct demo_dev *dev = file->private_data;
+    __poll_t mask = 0;
+
+    poll_wait(file, &dev->read_wait, wait);
+    if (!kfifo_is_empty(&dev->rx_fifo))
+        mask |= EPOLLIN | EPOLLRDNORM;
+    if (READ_ONCE(dev->disconnected))
+        mask |= EPOLLHUP | EPOLLERR;
+    if (down_trylock(&dev->tx_slots) == 0) {
+        up(&dev->tx_slots);
+        mask |= EPOLLOUT | EPOLLWRNORM;
+    }
+    return mask;
+}
+```
+
+生产驱动通常不用 `down_trylock()` 探测可写性，而维护原子计数或 wait queue；示例强调的是 poll 与 TX slot 状态必须一致。
+
+## 四、异步 Bulk OUT 与发送背压
+
+`write()` 不能把用户指针直接交给 USB。驱动先限制消息长度和并发数量，再分配内核 buffer/URB，`copy_from_user()`，anchor，submit；completion 释放 buffer、URB，并归还 TX slot。
+
+```c
+static ssize_t demo_write(struct file *file,
+                          const char __user *buf,
+                          size_t count, loff_t *ppos)
+{
+    struct demo_dev *dev = file->private_data;
+    struct urb *urb;
+    u8 *kbuf;
+    int ret;
+
+    if (count > DEMO_MAX_MESSAGE)
+        return -EMSGSIZE;
+    if (READ_ONCE(dev->disconnected))
+        return -ENODEV;
+
+    if (file->f_flags & O_NONBLOCK) {
+        if (down_trylock(&dev->tx_slots))
+            return -EAGAIN;
+    } else if (down_interruptible(&dev->tx_slots)) {
+        return -ERESTARTSYS;
+    }
+
+    urb = usb_alloc_urb(0, GFP_KERNEL);
+    kbuf = kmalloc(count, GFP_KERNEL);
+    if (!urb || !kbuf) {
+        ret = -ENOMEM;
+        goto err_alloc;
+    }
+    if (copy_from_user(kbuf, buf, count)) {
+        ret = -EFAULT;
+        goto err_alloc;
+    }
+
+    usb_fill_bulk_urb(urb, dev->udev,
+                      usb_sndbulkpipe(dev->udev, dev->bulk_out_ep),
+                      kbuf, count, demo_tx_complete, dev);
+    urb->transfer_flags |= URB_FREE_BUFFER;
+    usb_anchor_urb(urb, &dev->submitted);
+    ret = usb_submit_urb(urb, GFP_KERNEL);
+    if (ret) {
+        usb_unanchor_urb(urb);
+        goto err_submit;
+    }
+
+    usb_free_urb(urb); /* Drop submitter reference. */
+    return count;
+
+err_submit:
+    urb->transfer_flags &= ~URB_FREE_BUFFER;
+err_alloc:
+    kfree(kbuf);
+    usb_free_urb(urb);
+    up(&dev->tx_slots);
+    return ret;
+}
+```
+
+```c
+static void demo_tx_complete(struct urb *urb)
+{
+    struct demo_dev *dev = urb->context;
+
+    usb_unanchor_urb(urb);
+    if (urb->status && urb->status != -ENOENT &&
+        urb->status != -ESHUTDOWN)
+        dev->tx_errors++;
+    up(&dev->tx_slots);
+    wake_up_interruptible(&dev->write_wait);
+}
+```
+
+此处 `URB_FREE_BUFFER` 让 usbcore 在 URB 最终释放时释放 transfer buffer。提交成功后立即 `usb_free_urb()` 只放弃调用者引用，HCD 引用仍保持 URB 有效。提交失败路径必须撤销 `URB_FREE_BUFFER` 或避免再次手工 `kfree()`，否则会 double free。
+
+发送 slot 既限制内存，也限制 disconnect 的停止成本。无限接收用户 write 并堆积 URB 不是高吞吐，而是把背压隐藏在内核内存中。协议若支持 flow-control，还应把设备 credit 与本地 slot 联动。
+
+## 五、open、release 与字符设备引用关系
+
+`usb_class_driver` 通过 minor 把 `/dev/demo_usbN` 连接到 Interface。`open()` 使用 `usb_find_interface()` 找到 Interface，再从 `usb_get_intfdata()` 取得私有对象。取得指针和增加 `kref` 必须与 disconnect 串行，通常使用全局/对象锁或框架提供的稳定查找窗口。
+
+```c
+static int demo_open(struct inode *inode, struct file *file)
+{
+    struct usb_interface *intf;
+    struct demo_dev *dev;
+    int subminor = iminor(inode);
+
+    intf = usb_find_interface(&demo_driver, subminor);
+    if (!intf)
+        return -ENODEV;
+
+    dev = usb_get_intfdata(intf);
+    if (!dev || READ_ONCE(dev->disconnected))
+        return -ENODEV;
+
+    kref_get(&dev->kref);
+    file->private_data = dev;
+    return 0;
+}
+
+static int demo_release(struct inode *inode, struct file *file)
+{
+    struct demo_dev *dev = file->private_data;
+    kref_put(&dev->kref, demo_delete);
+    return 0;
+}
+```
+
+真实驱动应使用 mutex 保护“检查 disconnected + kref_get”的原子性。若 disconnect 在两步之间释放最后引用，open 会取得悬空指针。`demo_delete()` 只在 Interface 引用和所有 open file 引用都释放后执行，负责 `usb_put_intf()`、`usb_put_dev()`、FIFO 和最终对象内存。
+
+用户接口语义也要明确：Device 拔出后，FIFO 中已收到的数据是否允许继续读完；poll 返回 HUP 还是 ERR；阻塞 read 是返回 `-ENODEV` 还是 0。选择必须一致并写进 API 契约。
+
+## 六、disconnect、autosuspend 与 reset 统一停止数据路径
+
+disconnect 的顺序是整个驱动最容易出错的部分：
 
 ```c
 static void demo_disconnect(struct usb_interface *intf)
 {
-    struct demo_usb *dev = usb_get_intfdata(intf);
+    struct demo_dev *dev = usb_get_intfdata(intf);
 
     usb_set_intfdata(intf, NULL);
+    usb_deregister_dev(intf, &demo_class);
+
     mutex_lock(&dev->io_mutex);
     dev->disconnected = true;
     mutex_unlock(&dev->io_mutex);
-    wake_up_all(&dev->read_wait);
 
-    usb_deregister_dev(intf, &demo_class);
+    wake_up_interruptible_all(&dev->read_wait);
+    wake_up_interruptible_all(&dev->write_wait);
     usb_kill_anchored_urbs(&dev->submitted);
-    usb_kill_urb(dev->rx_urb);
-    kref_put(&dev->kref, demo_delete);
+    demo_kill_rx_pool(dev);
+
+    kref_put(&dev->kref, demo_delete); /* Interface ownership. */
 }
 ```
 
-先清 intfdata 阻止新 open，设置断开标志让现有 file operation 返回 `-ENODEV`，唤醒睡眠 reader，再撤销字符节点并同步停止 URB。最后释放 interface 拥有的 kref。用户仍打开时，`demo_delete()` 会推迟到 release。
-
-若 completion 会重提 RX，必须让它在看到 disconnected 后停止，否则 kill 完成一次回调，回调又提交新 URB，disconnect 永远无法收敛。
-
-## 十、调试一条完整数据路径
-
-先确认 interface driver 绑定和 endpoint：
-
-```bash
-lsusb -t
-cat /sys/bus/usb/devices/1-2:1.0/uevent
-sudo cat /sys/kernel/debug/usb/usbmon/1u
+```mermaid
+stateDiagram-v2
+    [*] --> READY
+    READY --> ACTIVE: open and submit RX/TX
+    ACTIVE --> SUSPENDING: runtime autosuspend
+    SUSPENDING --> SUSPENDED: kill or park URBs
+    SUSPENDED --> ACTIVE: resume and restart RX
+    READY --> DISCONNECTING: unplug
+    ACTIVE --> DISCONNECTING: unplug
+    SUSPENDED --> DISCONNECTING: unplug
+    DISCONNECTING --> QUIESCENT: block IO, deregister, kill URBs
+    QUIESCENT --> FREED: last kref released
+    FREED --> [*]
 ```
 
-写无返回时检查 OUT URB 是否提交、completion status、设备是否 STALL；读卡住时检查 IN URB 是否在 anchor/HCD、completion 是否到达、waitqueue 条件是否提交。拔出崩溃则重点审计 intfdata、kref、anchor 和 buffer 的释放顺序，而不是只给 disconnect 加延时。
+runtime autosuspend 与 disconnect 的共同点是停止 I/O，不同点是 suspend 后硬件仍存在并可能恢复。驱动访问设备前用 `usb_autopm_get_interface()`，完成后 `usb_autopm_put_interface()`；suspend callback 阻止 resubmit 并等待当前 URB，resume 恢复协议状态和 RX pool。
 
-## 十一、小结
+reset 还要考虑设备内部状态丢失。USB reset 可能保留软件对象却清空设备配置或厂商协议状态；pre_reset/post_reset 或 reset_resume 应与同一停止状态机协作，不能在旧 URB 未收敛时重新初始化。
 
-一个可用的 USB bulk 驱动不是 probe 加两个 `usb_bulk_msg()`，而是一套对象寿命协议：`usb_find_common_endpoints` 建立通道，kref 管理拔出后的软件对象，`usb_anchor` 管理在途 URB，completion 与 waitqueue 连接异步 I/O，disconnect 依次关闭入口、停止请求和释放引用。下一篇转到 Device 侧，解释 Linux 如何通过 Gadget/UDC 主动成为 USB 外设。
+## 七、从最小功能到压力测试的验证顺序
+
+不要一开始就跑多线程吞吐。按以下顺序建立证据：
+
+1. `lsusb -v` 验证 Interface 和 Bulk Endpoint。
+2. 加载驱动，确认 probe、minor 和 RX pool 数量。
+3. 单线程发送一个有 sequence 的命令，usbmon 中确认 OUT/IN 和长度。
+4. 验证阻塞 read、`O_NONBLOCK`、poll timeout 和 HUP。
+5. 并发 write 超过 slot，确认阻塞或 `-EAGAIN`，内存不增长。
+6. I/O 过程中反复拔插，确认 completion、work 和 kref 收敛。
+7. 打开 autosuspend，测试 idle、resume 和 Device reset。
+8. 运行长时间校验，比较 submitted/completed/dropped/error 计数守恒。
+
+配合工具：
+
+```bash
+dmesg -w
+lsusb -t
+cat /proc/interrupts
+sudo cat /sys/kernel/debug/usb/usbmon/0u
+stress-ng --class io --timeout 60s
+```
+
+KASAN 用于发现 use-after-free，lockdep 用于锁顺序，dynamic debug/tracepoint 用于时序，usbmon 用于协议证据。它们回答不同问题，不能用大量 `printk()` 代替分层观测。
+
+**参考资料**
+
+- [Writing USB Device Drivers](https://docs.kernel.org/driver-api/usb/writing_usb_driver.html)
+- [The Linux-USB Host Side API](https://docs.kernel.org/driver-api/usb/usb.html)
+- [Linux USB Power Management](https://docs.kernel.org/driver-api/usb/power-management.html)
+
+## 八、小结
+
+完整 USB Interface Driver 是一套并发所有权系统：probe 建立 Endpoint、私有对象和用户入口；RX completion 与 read/poll 通过 FIFO 协作；TX slot 把用户速度转换为有限 in-flight URB；disconnect、autosuspend 和 reset 通过统一停止顺序收敛异步请求；kref 让软件对象寿命独立于物理连接。
+
+驱动能够“传一次数据”只是起点。只有阻塞/非阻塞语义一致、背压有效、错误回滚完整、热插拔不泄漏不崩溃，才算真正可用。
