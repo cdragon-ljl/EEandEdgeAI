@@ -7,737 +7,373 @@ order: 3
 tags: ["USB", "Linux Driver"]
 draft: false
 ---
-做 USB 驱动时，很多问题表面看是 `probe()` 没进、端点找不到、bulk 传输超时、摄像头没有 `/dev/videoX`，但往根上追，往往都能回到同一个基础问题：**描述符没有看懂**。
+USB Host 在设备接入时面对的最初事实只有电气连接和 EP0。它不知道对面是键盘、摄像头还是复合设备，也不知道有哪些数据端点。描述符就是 Device 通过控制传输返回的自描述字节流，Host 据此创建软件对象并选择驱动。
 
-USB 设备不是通过设备树描述能力，也不是像片上外设那样固定挂在某个寄存器地址上。USB 的特点是即插即用，Host 端必须在设备插入以后，主动向设备询问：你是谁？你支持什么配置？有几个接口？每个接口有哪些端点？端点方向是什么？传输类型是什么？最大包长是多少？
+描述符不是供人阅读的配置文件，而是有严格长度、类型、字节序和包含关系的二进制协议。一个字段错误可能让后续所有字节失去边界，因此“设备能返回一些数据”不代表描述符合法。本文从原始字节开始，逐层映射到 Linux 内核对象和真实排错证据。
 
-这些答案全部来自 USB 描述符。
+## 一、描述符是一串可跳过、可扩展的 TLV 记录
 
-如果把 USB 设备理解成一个“可插拔外设模块”，那么描述符就是它交给 Host 的硬件说明书、驱动匹配表和数据通道地图。驱动开发者只有把这张地图看清楚，后面写 `usb_driver`、找 endpoint、提交 URB、处理热插拔才不会迷路。
+大多数标准描述符都以两个字节开头：`bLength` 表示当前记录总长度，`bDescriptorType` 表示记录类型。解析器先检查剩余长度是否至少包含这两个字节，再用 `bLength` 跳到下一条记录。未知类型可以跳过，这让新 Class 或新 Capability 能与旧 Host 共存。
 
-## 一、描述符解决的核心问题
-
-USB Host 面对一个刚插入的设备时，不能提前假设设备类型。它看到的只是 D+ / D- 或 SuperSpeed 差分线上的电气连接变化。至于这是鼠标、U 盘、USB 转串口、摄像头、声卡还是厂商自定义设备，都需要通过标准请求读取描述符来确认。
-
-描述符主要解决四类问题。
-
-第一，**身份识别**。
-
-设备需要告诉系统自己的厂商 ID、产品 ID、USB 协议版本、设备类、字符串信息等。Linux 里的 `lsusb`、`dmesg`、驱动 `id_table` 匹配，都依赖这些信息。
-
-第二，**功能组织**。
-
-一个 USB 设备不一定只有一个功能。例如一个开发板通过 USB 接到 PC 后，可能同时暴露虚拟串口、USB 网卡、Mass Storage、ADB 调试接口。每个功能通常对应一个或多个 Interface，Host 必须知道这些 Interface 如何组织。
-
-第三，**数据通道描述**。
-
-真正传输数据的是 Endpoint。描述符会告诉 Host：哪个端点是 IN，哪个端点是 OUT；是 bulk、interrupt 还是 isochronous；最大包长是多少；轮询间隔是多少。
-
-第四，**驱动匹配依据**。
-
-Linux USB 驱动可以按 VID/PID 匹配，也可以按 class/subclass/protocol 匹配。匹配所需的信息，本质上也来自描述符。
-
-可以把 USB 描述符的作用总结成一句话：
-
-> USB 描述符不是附属信息，而是 Host 认识设备、配置设备、绑定驱动、建立传输通道的唯一标准入口。
-
-## 二、USB 描述符的层次结构
-
-常见 USB 描述符不是平铺的一堆字段，而是有清晰层次关系。
-
-```mermaid
-flowchart LR
-    A[Device Descriptor\n设备身份] --> B[Configuration Descriptor\n配置方案]
-    B --> C1[Interface 0\n功能接口]
-    B --> C2[Interface 1\n功能接口]
-    C1 --> D1[Endpoint 0 IN/OUT\n默认控制端点]
-    C1 --> D2[Endpoint Descriptor\n数据端点]
-    C2 --> D3[Endpoint Descriptor\n数据端点]
-    A --> E[String Descriptor\n厂商/产品/序列号]
+```text
+offset +0: bLength
+offset +1: bDescriptorType
+offset +2: type-specific fields ...
 ```
 
-这张图里有几个重点。
+`bLength` 不能小于该描述符的最小长度，也不能超过当前 buffer 剩余长度；等于 0 会让遍历停在原地。Device 固件中最危险的错误之一，是修改结构体字段却忘记同步总长度，导致 Host 把下一条记录中间的某个字节误认为 `bLength`。
 
-Device Descriptor 位于最顶层，描述整个设备的基本身份。一个 USB Device 只有一个 Device Descriptor。
+USB 多字节整数采用 little-endian。Linux 头文件将 `idVendor`、`idProduct`、`bcdUSB`、`wTotalLength`、`wMaxPacketSize` 等声明为 `__le16`，驱动读取时使用 `le16_to_cpu()` 或已有 helper，而不是假设 CPU 一定是小端。
 
-Configuration Descriptor 描述设备的一种工作配置。很多简单设备只有一个配置，但 USB 规范允许设备提供多个配置。
+配置描述符集合形成如下树：
 
-Interface Descriptor 描述具体功能。Linux USB 驱动很多时候绑定的是 Interface，而不是整个 USB Device。
+```mermaid
+flowchart TD
+    DEV[Device Descriptor] --> CFG0[Configuration 0]
+    DEV --> CFG1[Configuration 1 optional]
+    CFG0 --> IAD[IAD optional function group]
+    CFG0 --> IF0[Interface 0]
+    CFG0 --> IF1A0[Interface 1 Alternate 0]
+    CFG0 --> IF1A1[Interface 1 Alternate 1]
+    IF0 --> C0[Class-specific descriptors]
+    IF0 --> EP1[Endpoint Descriptor]
+    IF1A1 --> EP2[Endpoint Descriptor]
+    DEV --> STR[String descriptors by index]
+    DEV --> BOS[BOS and Device Capabilities]
+```
 
-Endpoint Descriptor 描述除默认控制端点 0 以外的数据通道。bulk、interrupt、isochronous 等传输类型都在这里体现。
+树中只有一个层次关系，但在线上传输时它们仍是连续字节。Configuration 的 `wTotalLength` 给出从 Configuration 头开始到该配置最后一条 subordinate descriptor 的总长度。
 
-String Descriptor 提供可读字符串，例如厂商名、产品名、序列号。它不是驱动正常工作的必要条件，但对调试非常有用。
+## 二、Device Descriptor 定义设备级身份和 EP0 能力
 
-## 三、从枚举流程看描述符读取顺序
+Device Descriptor 固定 18 字节。Linux 对应结构是 `struct usb_device_descriptor`：
 
-USB 设备插入后，Host 并不是一次性读取所有描述符，而是按枚举流程逐步读取。
+```c
+struct usb_device_descriptor {
+    __u8  bLength;
+    __u8  bDescriptorType;
+    __le16 bcdUSB;
+    __u8  bDeviceClass;
+    __u8  bDeviceSubClass;
+    __u8  bDeviceProtocol;
+    __u8  bMaxPacketSize0;
+    __le16 idVendor;
+    __le16 idProduct;
+    __le16 bcdDevice;
+    __u8  iManufacturer;
+    __u8  iProduct;
+    __u8  iSerialNumber;
+    __u8  bNumConfigurations;
+} __attribute__((packed));
+```
+
+`bcdUSB` 表示设备遵循的 USB 规范版本，采用 BCD 编码，例如 `0x0200` 表示 USB 2.00。它不是当前链路协商速度；一个声明 USB 2.0 的设备仍可能只支持 Full-Speed。
+
+`bMaxPacketSize0` 描述默认控制端点。在 USB 2.0 Low/Full/High-Speed 设备中，它直接给出 EP0 最大 packet size；SuperSpeed 使用编码值表达固定集合。Host 枚举早期先取 Device Descriptor 前 8 字节，核心目的就是获得这个字段。
+
+VID/PID 是常见匹配条件，但不是功能协议。相同芯片在不同产品中可能使用不同 PID；同一 VID/PID 的固件版本也可能暴露不同 Interface。驱动即使按 `USB_DEVICE()` 匹配，仍应检查实际描述符和 endpoint 组合。
+
+Class 字段可以位于 Device 层，也可以位于 Interface 层。`bDeviceClass == 0` 表示每个 Interface 自己声明 class，这在复合设备中很常见。若 Device 层声明 Miscellaneous/IAD 等 class，仍需继续解析 Interface 才能知道具体功能。
+
+三个 `i*` 字段不是字符串，而是 String Descriptor 索引；0 表示没有对应字符串。`bNumConfigurations` 表示设备提供多少套 Configuration，Host 最终只激活其中一套。
+
+## 三、Configuration Descriptor 划定一套完整工作方案
+
+Configuration Descriptor 固定头部为 9 字节，但 `wTotalLength` 覆盖完整配置树。Host 通常先读取 9 字节，再按 `wTotalLength` 申请 buffer 并读取全部内容：
 
 ```mermaid
 sequenceDiagram
-    participant H as USB Host
-    participant D as USB Device
-    H->>D: Bus Reset
-    H->>D: GET_DESCRIPTOR(Device, first 8 bytes)
-    D-->>H: bMaxPacketSize0 等基础字段
-    H->>D: SET_ADDRESS
-    H->>D: GET_DESCRIPTOR(Device, full)
-    D-->>H: 完整 Device Descriptor
-    H->>D: GET_DESCRIPTOR(Configuration, header)
-    D-->>H: wTotalLength
-    H->>D: GET_DESCRIPTOR(Configuration, full tree)
-    D-->>H: Configuration + Interface + Endpoint
-    H->>D: SET_CONFIGURATION
-    H->>H: 根据描述符匹配驱动
+    participant H as Host
+    participant D as Device EP0
+    H->>D: GET_DESCRIPTOR Device first 8 bytes
+    H->>D: GET_DESCRIPTOR Device full 18 bytes
+    H->>D: GET_DESCRIPTOR Configuration index N length 9
+    D-->>H: Header with wTotalLength
+    H->>D: GET_DESCRIPTOR Configuration index N length wTotalLength
+    D-->>H: Config + IAD + Interfaces + Class data + Endpoints
 ```
 
-这里有一个细节很重要：Host 会先读取 Device Descriptor 的前 8 字节，因为其中包含 `bMaxPacketSize0`。这个字段决定默认控制端点 0 的最大包长，后续控制传输需要用到它。
+头部关键字段包括：
 
-完整配置描述符也不是只读一个固定结构体。Host 通常先读 Configuration Descriptor 头部，拿到 `wTotalLength`，然后再按这个总长度读取完整的配置树。这个完整配置树里会连续包含 Interface Descriptor、Endpoint Descriptor 以及各种 class-specific descriptor。
+- `bNumInterfaces`：Interface 编号的数量，不是 Descriptor 记录数量。多个 Alternate Setting 共用一个 Interface 编号。
+- `bConfigurationValue`：`SET_CONFIGURATION` 使用的值，不一定等于描述符索引加一。
+- `bmAttributes`：bit7 必须为 1，另有 self-powered 与 remote wakeup 属性。
+- `bMaxPower`：USB 2.0 单位为 2 mA，SuperSpeed 的解释不同，不能直接把原始数值当 mA。
 
-所以使用 `lsusb -v` 时看到的一大段输出，本质上就是 Host 在枚举阶段读取到的结构化结果。
+`wTotalLength` 小于实际记录长度会截断后续 Interface/Endpoint；大于设备实际返回长度会导致 short response 或解析失败。`bNumInterfaces` 与实际不同也会造成 Interface 缺失。Device 固件应在生成描述符后进行静态长度校验，而不是手工维护多处常量。
 
-## 四、Device Descriptor：设备身份首页
+Linux 将每个已读取配置保存为 `struct usb_host_config`。其中 `desc` 是标准 Configuration 头，`interface[]` 指向按 Interface 编号组织的 `usb_interface_cache`，还保存 IAD 和配置级 extra descriptor。选择配置后，`usb_device->actconfig` 指向当前激活的 `usb_host_config`。
 
-Device Descriptor 是 USB 设备的身份首页。它说明这个设备遵循哪个 USB 版本、属于什么设备类、厂商和产品 ID 是什么、有多少个配置。
+多 Configuration 不等同于 Alternate Setting。Configuration 改变整个设备功能组合和供电方案，通过 `SET_CONFIGURATION` 切换；Alternate Setting 只改变一个 Interface 的端点布局，通过 `SET_INTERFACE` 切换。
 
-Linux 内核中对应结构体是 `struct usb_device_descriptor`，定义在 `include/uapi/linux/usb/ch9.h`。
+### 从一段十六进制字节手算配置树
 
-典型字段如下：
-
-| 字段 | 含义 | 驱动开发关注点 |
-|---|---|---|
-| `bLength` | 描述符长度 | Device Descriptor 固定为 18 字节 |
-| `bDescriptorType` | 描述符类型 | Device Descriptor 类型值为 1 |
-| `bcdUSB` | USB 规范版本 | 判断 USB 2.0 / 3.x 能力时有参考意义 |
-| `bDeviceClass` | 设备类 | 可能为 0，表示类信息在接口级描述 |
-| `bDeviceSubClass` | 设备子类 | 与 class 一起用于类驱动匹配 |
-| `bDeviceProtocol` | 协议号 | 与 class/subclass 组合使用 |
-| `bMaxPacketSize0` | 端点 0 最大包长 | 控制传输基础参数 |
-| `idVendor` | 厂商 ID | 专用驱动匹配常用字段 |
-| `idProduct` | 产品 ID | 专用驱动匹配常用字段 |
-| `bcdDevice` | 设备版本 | 区分硬件或固件版本 |
-| `iManufacturer` | 厂商字符串索引 | 调试辅助 |
-| `iProduct` | 产品字符串索引 | 调试辅助 |
-| `iSerialNumber` | 序列号字符串索引 | 区分同型号多个设备 |
-| `bNumConfigurations` | 配置数量 | 多配置设备需要关注 |
-
-在 Linux 驱动里可以这样读取 Device Descriptor：
-
-```c
-static int demo_probe(struct usb_interface *intf,
-                      const struct usb_device_id *id)
-{
-    struct usb_device *udev = interface_to_usbdev(intf);
-    struct usb_device_descriptor *desc = &udev->descriptor;
-
-    dev_info(&intf->dev, "VID:PID = %04x:%04x\n",
-             le16_to_cpu(desc->idVendor),
-             le16_to_cpu(desc->idProduct));
-
-    dev_info(&intf->dev, "USB version = %x.%02x, configs = %u\n",
-             desc->bcdUSB >> 8,
-             desc->bcdUSB & 0xff,
-             desc->bNumConfigurations);
-
-    return 0;
-}
-```
-
-注意 `idVendor`、`idProduct`、`bcdUSB` 等多字节字段是 little-endian，内核代码中应使用 `le16_to_cpu()` 转换。很多示例为了简洁直接打印，在跨平台或严谨驱动里不建议省略。
-
-### 1. bDeviceClass 为什么经常是 0
-
-初学者看 `lsusb -v` 时经常会疑惑：为什么有些设备的 `bDeviceClass` 是 `0x00`？这是不是说明设备没有类型？
-
-不是。
-
-`bDeviceClass = 0` 常见含义是：**设备级不声明统一 class，每个 Interface 自己声明 class**。
-
-这在复合设备里非常常见。例如一个 USB 设备同时包含虚拟串口和厂商自定义调试接口，那么整个 Device 很难用一个 class 概括，因此 class 信息下放到 Interface Descriptor。
-
-驱动匹配时也要注意这一点。不能只看 Device Descriptor 的 class 字段，还要看 Interface Descriptor 的 `bInterfaceClass`、`bInterfaceSubClass`、`bInterfaceProtocol`。
-
-### 2. VID/PID 匹配与 class 匹配
-
-专用设备驱动常使用 VID/PID 匹配：
-
-```c
-static const struct usb_device_id demo_table[] = {
-    { USB_DEVICE(0x1234, 0x5678) },
-    { }
-};
-MODULE_DEVICE_TABLE(usb, demo_table);
-```
-
-通用类驱动则可能使用 interface class 匹配，例如 HID、CDC ACM、Mass Storage、UVC 等。这样同一类设备即使来自不同厂商，也能被通用驱动接管。
-
-## 五、Configuration Descriptor：设备工作方案
-
-Configuration Descriptor 描述设备的一种工作配置。大部分常见 USB 设备只有一个配置，但规范允许一个设备提供多个配置，由 Host 选择其中一个。
-
-对应结构体是 `struct usb_config_descriptor`。
-
-| 字段 | 含义 | 驱动开发关注点 |
-|---|---|---|
-| `bLength` | 描述符长度 | Configuration Descriptor 自身长度 |
-| `bDescriptorType` | 描述符类型 | 类型值为 2 |
-| `wTotalLength` | 该配置完整描述符总长度 | 包括接口、端点、类特定描述符 |
-| `bNumInterfaces` | 接口数量 | 判断该配置下有几个功能接口 |
-| `bConfigurationValue` | 配置编号 | `SET_CONFIGURATION` 使用 |
-| `iConfiguration` | 配置字符串索引 | 调试辅助 |
-| `bmAttributes` | 属性 | 自供电、远程唤醒等 |
-| `bMaxPower` | 最大功耗 | 单位通常是 2mA |
-
-`wTotalLength` 是非常关键的字段。Host 读取完整配置树时，就是根据它决定要读多少字节。
-
-在 `lsusb -v` 中经常可以看到类似输出：
+假设 usbmon 或固件数组中出现下面这段简化数据：
 
 ```text
-Configuration Descriptor:
-  wTotalLength       85
-  bNumInterfaces      2
-  bConfigurationValue 1
-  bmAttributes     0x80
-  MaxPower          500mA
+09 02 20 00 01 01 00 80 32
+09 04 00 00 02 ff 01 01 00
+07 05 81 02 00 02 00
+07 05 02 02 00 02 00
 ```
 
-这里说明该配置包含 2 个接口，最大申请电流为 500mA。
+第一条记录的 `09 02` 表示长度 9、类型 Configuration。紧随其后的 `20 00` 是 little-endian `wTotalLength = 0x0020 = 32`，表示从第一个 `09` 起一共 32 字节。`bNumInterfaces = 1`、`bConfigurationValue = 1`、`bmAttributes = 0x80`，`bMaxPower = 0x32`，在 USB 2.0 语义下表示 100 mA。
 
-### 1. bmAttributes 与供电问题
+第二条 `09 04` 是 Interface Descriptor：Interface 0、Alternate 0、两个 Endpoint，class `0xff` 表示 vendor-specific。第三、四条 `07 05` 是 Endpoint Descriptor。`0x81` 表示 Endpoint 1 IN，`0x02` 表示 Endpoint 2 OUT；两者 `bmAttributes = 0x02`，因此都是 Bulk；`00 02` 按小端解释为 `wMaxPacketSize = 512`。
 
-`bmAttributes` 里会体现设备是否 self-powered、是否支持 remote wakeup。虽然驱动开发时很少直接处理这个字段，但在板级调试时它有参考意义。
+这个例子可以做四项一致性检查：四条记录长度相加必须等于 32；Interface 声明的 Endpoint 数必须等于后续归属它的两条 Endpoint；Endpoint 地址在当前 Alternate 内不能重复；High-Speed Bulk 的 512 字节最大包长与设备速度相符。任一项不成立，都应在提交 URB 前拒绝该布局。
 
-例如某些设备枚举不稳定，看起来像协议问题，实际可能是 VBus 供电不足。`bMaxPower` 能帮助判断设备声明的功耗需求。嵌入式板卡 USB Host bring-up 时，VBus regulator、电流限制、USB Hub 供电能力都要一起看。
-
-### 2. 多配置设备怎么处理
-
-多配置设备不算最常见，但不能假设永远只有一个配置。Linux USB core 通常会选择合适配置并设置当前 configuration。普通接口驱动多数情况下只需要处理已经选好的 interface，但在做 Gadget、厂商自定义设备或调试异常枚举时，要知道 configuration 是更高一层的组织单位。
-
-## 六、Interface Descriptor：Linux USB 驱动最常绑定的对象
-
-Interface Descriptor 描述设备里的一个功能接口。Linux USB 驱动的 `probe()` 参数是：
+下面的边界检查展示 Host 或测试工具如何安全遍历 TLV。真实内核 parser 还会处理重复 Endpoint、无效 Alternate、extra descriptor 和分配失败：
 
 ```c
-static int demo_probe(struct usb_interface *intf,
-                      const struct usb_device_id *id)
-```
-
-这里传进来的就是一个 `struct usb_interface`，而不是单纯的 `struct usb_device`。这说明 Linux USB 驱动框架的核心设计是：**驱动通常绑定到接口，而不是整个设备**。
-
-对应描述符结构体是 `struct usb_interface_descriptor`。
-
-| 字段 | 含义 | 驱动开发关注点 |
-|---|---|---|
-| `bInterfaceNumber` | 接口编号 | 复合设备中定位具体接口 |
-| `bAlternateSetting` | alternate setting 编号 | UVC、USB Audio 等高带宽设备常用 |
-| `bNumEndpoints` | 端点数量 | 遍历 endpoint 的边界 |
-| `bInterfaceClass` | 接口类 | 类驱动匹配关键字段 |
-| `bInterfaceSubClass` | 接口子类 | 与 class/protocol 组合判断 |
-| `bInterfaceProtocol` | 协议 | 区分同类下具体协议 |
-| `iInterface` | 接口字符串索引 | 调试辅助 |
-
-在驱动中读取当前接口描述符：
-
-```c
-static int demo_probe(struct usb_interface *intf,
-                      const struct usb_device_id *id)
+static int walk_descriptors(const u8 *buf, size_t len)
 {
-    struct usb_host_interface *alt = intf->cur_altsetting;
-    struct usb_interface_descriptor *idesc = &alt->desc;
+    size_t off = 0;
 
-    dev_info(&intf->dev,
-             "interface=%u alt=%u class=%02x subclass=%02x protocol=%02x endpoints=%u\n",
-             idesc->bInterfaceNumber,
-             idesc->bAlternateSetting,
-             idesc->bInterfaceClass,
-             idesc->bInterfaceSubClass,
-             idesc->bInterfaceProtocol,
-             idesc->bNumEndpoints);
+    while (off < len) {
+        u8 bLength;
+        u8 bDescriptorType;
 
-    return 0;
+        if (len - off < 2)
+            return -EINVAL;
+
+        bLength = buf[off];
+        bDescriptorType = buf[off + 1];
+        if (bLength < 2 || bLength > len - off)
+            return -EINVAL;
+
+        pr_debug("descriptor type=%u offset=%zu length=%u\n",
+                 bDescriptorType, off, bLength);
+        off += bLength;
+    }
+
+    return off == len ? 0 : -EINVAL;
 }
 ```
 
-### 1. 为什么复合设备容易让人看错
+这段代码故意不把 `buf + off` 直接转换为任意长结构体：只有确认当前类型和最小长度后才能读取类型字段；多字节值还要用 unaligned/little-endian helper，避免未对齐访问和越界。
 
-一个复合设备可能长这样：
+### Linux usbcore 如何取得并解析配置
+
+内核主线源码把配置读取和解析放在 `drivers/usb/core/config.c` 一带。`usb_get_configuration()` 根据 Device Descriptor 的 `bNumConfigurations` 循环获取配置，先请求固定头，再根据 `wTotalLength` 读取完整字节流。解析过程由配置、Interface、Endpoint 等函数分层完成，并把无法识别的标准外记录保留为 `extra`。
+
+可以把稳定逻辑概括为：
+
+```text
+usb_get_configuration
+  -> GET_DESCRIPTOR(Configuration, header)
+  -> validate wTotalLength and allocate buffer
+  -> GET_DESCRIPTOR(Configuration, full length)
+  -> usb_parse_configuration
+       -> discover interface numbers and alternates
+       -> parse each usb_host_interface
+       -> parse endpoint descriptors and companions
+       -> preserve class/vendor extra descriptors
+```
+
+解析阶段只建立 Host 侧对象，不会自动激活所有 Alternate。`SET_CONFIGURATION` 后每个 Interface 通常处于 Alternate 0；class driver 根据业务协商结果再调用 `usb_set_interface()`。因此 sysfs 中“能看到 Alternate 1”与“当前正在使用 Alternate 1”是两件事。
+
+usbcore 会容忍部分可跳过扩展，但不能容忍破坏边界的长度。驱动也不能因为内核已经解析成功就跳过协议级校验：内核保证结构安全，class driver 仍负责验证 subtype、版本、Endpoint 组合以及厂商协议约束。
+
+## 四、Interface、Alternate Setting 与 IAD 组织功能
+
+Interface Descriptor 固定 9 字节，包含 `bInterfaceNumber`、`bAlternateSetting`、`bNumEndpoints` 和 class/subclass/protocol。Linux Interface Driver 的匹配通常发生在这一层。
+
+同一个 `bInterfaceNumber` 可以有多个 Alternate Setting。Alternate 0 通常是默认状态，可能没有数据 Endpoint；高带宽 Alternate 则提供 Isochronous Endpoint。UVC/UAC 驱动先在控制面协商参数，再用 `usb_set_interface()` 选择合适 Alternate，设备才开始占用周期带宽。
+
+Linux 使用 `struct usb_host_interface` 保存一个 Alternate Setting：
+
+```c
+struct usb_host_interface {
+    struct usb_interface_descriptor desc;
+    int extralen;
+    unsigned char *extra;
+    struct usb_host_endpoint *endpoint;
+    char *string;
+};
+```
+
+`usb_interface->altsetting[]` 包含所有 Alternate，`cur_altsetting` 指向当前选择。驱动不能假设 `altsetting[0]` 的 `bAlternateSetting` 一定为 0，也不能把数组下标当协议中的 Alternate 值，应读取 `desc.bAlternateSetting`。
+
+Interface Association Descriptor，简称 IAD，用于说明多个连续 Interface 属于同一个功能。CDC ACM 的 Communication/Data Interface、UVC 的 VideoControl/VideoStreaming Interface 都可能通过 IAD 组合。IAD 包含 `bFirstInterface`、`bInterfaceCount` 和 function class 信息，但它不替驱动自动 claim 伙伴 Interface；Linux 驱动仍需按框架规则管理绑定关系。
+
+复合设备排错时，先画出 Interface 编号、Alternate 和 IAD 范围，再看驱动绑定。只盯 VID/PID 很容易把“某个功能 Interface 没有匹配”误判成“整个 Device 驱动失败”。
+
+### CDC ACM 如何用多个 Interface 表示一个串口功能
+
+一个典型 CDC ACM 功能不是“一个 Interface 加两个 Bulk Endpoint”这么简单。描述符常按以下顺序排列：
+
+```text
+IAD: first interface 0, count 2, CDC function
+  Interface 0: Communication Class
+    Header Functional Descriptor
+    Call Management Functional Descriptor
+    ACM Functional Descriptor
+    Union Functional Descriptor: master 0, slave 1
+    Interrupt IN Endpoint: serial-state notification
+  Interface 1: CDC Data Class
+    Bulk OUT Endpoint
+    Bulk IN Endpoint
+```
+
+IAD 从功能层说明 Interface 0 和 1 属于一组；Union Functional Descriptor 从 CDC 协议层说明 master/slave 关系。Linux `cdc_acm` 需要同时理解两者以及实际 Endpoint。如果固件只修改 Interface 编号却未更新 Union descriptor，Device 仍可能完成标准枚举，但驱动无法正确找到 Data Interface。
+
+控制请求如 `SET_LINE_CODING` 发往 Communication Interface，实际串口 payload 走 Data Interface 的 Bulk Endpoint，状态变化则通过 Interrupt IN 上报。描述符把控制面和数据面拆开，驱动也必须分别建立对象和错误处理路径。
+
+### UVC/UAC 为什么依赖 Alternate Setting
+
+视频和音频流需要周期带宽。设备无法在尚未协商格式时长期占用最大带宽，因此 Streaming Interface 的 Alternate 0 常常不含数据 Endpoint，表示停止流；Alternate 1、2、3 等提供不同 `wMaxPacketSize`、burst 或 service interval。
+
+UVC Host 先在 VideoControl/VideoStreaming class descriptor 中获得格式、frame 和 endpoint 能力，通过 Probe/Commit 控制请求确定参数，再选择能够容纳 payload 的 Alternate。若应用关闭视频，驱动切回 Alternate 0 释放带宽。
+
+UAC 也会用 Alternate 区分采样格式和通道数，并通过 Clock Source、Format Type 与 feedback endpoint 描述同步关系。只打印当前 `cur_altsetting` 会遗漏设备支持的其他流模式，排错时必须遍历整个 `altsetting[]`。
+
+Interface 数组下标、`bInterfaceNumber` 和 `bAlternateSetting` 是三个不同概念。驱动应按 descriptor 字段查找目标，而不是假定它们连续且等于数组下标。
+
+## 五、Endpoint Descriptor 决定实际数据通道
+
+Endpoint Descriptor 对应 `struct usb_endpoint_descriptor`，关键字段如下：
+
+- `bEndpointAddress`：bit7 是方向，低 4 bit 是端点号。
+- `bmAttributes`：低 2 bit 表示 Control、Isochronous、Bulk 或 Interrupt；高位对 Isochronous 同步/用途有额外含义。
+- `wMaxPacketSize`：低 11 bit 是最大 packet payload；High-Speed 周期端点还使用高位编码每个 microframe 的附加 transaction 数。
+- `bInterval`：服务周期，解释取决于速度和 transfer 类型，不能统一按毫秒读取。
+
+Linux 将标准 Endpoint Descriptor 包装在 `struct usb_host_endpoint` 中，并附加 SuperSpeed companion、HCD 状态和 endpoint-specific extra 数据。驱动通常使用 helper 判断类型和方向：
+
+```c
+struct usb_host_interface *alt = intf->cur_altsetting;
+
+for (int i = 0; i < alt->desc.bNumEndpoints; i++) {
+    struct usb_endpoint_descriptor *ep = &alt->endpoint[i].desc;
+
+    if (usb_endpoint_is_bulk_in(ep))
+        dev->bulk_in = ep->bEndpointAddress;
+    else if (usb_endpoint_is_bulk_out(ep))
+        dev->bulk_out = ep->bEndpointAddress;
+}
+```
+
+`bNumEndpoints` 不包括 EP0。Direction 站在 Host 视角：Bulk IN 是设备到 Host，Bulk OUT 是 Host 到设备。`wMaxPacketSize` 是 packet 上限，不是一次 URB 的最大长度；一个大 URB 会被 HCD 分解为多个 packet。
+
+SuperSpeed Endpoint 后通常跟随 SuperSpeed Endpoint Companion Descriptor。`bMaxBurst`、mult 和 `wBytesPerInterval` 进一步描述 burst 与周期服务能力。只读取传统 Endpoint Descriptor 会低估 SuperSpeed 周期端点需求。
+
+### wMaxPacketSize 与 bInterval 必须结合速度解释
+
+最大 packet size 的合法范围由速度和 transfer 类型共同决定。常见值可以作为排错基线，但最终应以对应版本规范为准：
+
+| Speed / Transfer | 常见或最大 packet 语义 |
+| --- | --- |
+| Full-Speed Bulk | 最大 64 字节 |
+| High-Speed Bulk | 固定最大 512 字节 |
+| SuperSpeed Bulk | 最大 1024 字节，并结合 `bMaxBurst` |
+| Full-Speed Isochronous | 每 frame 最大 1023 字节 |
+| High-Speed Isochronous | 每 microframe 可编码最多 3 次 transaction |
+| Interrupt | 上限和周期编码随速度变化 |
+
+看到 High-Speed Bulk Endpoint 声明 64 字节并不一定违反规范，但会降低每次 transaction 的利用率；看到 1024 字节则明显不符合 High-Speed Bulk。驱动通常不应擅自“修正”描述符，而应拒绝无法支持的布局并给出字段证据。
+
+`bInterval` 最容易被误读。在 Full-Speed Interrupt 中它接近以 frame 为单位的轮询间隔；High-Speed/SuperSpeed 周期端点采用指数编码，服务间隔是若干个 125 us microframe。直接把原始值打印成“毫秒”会得出错误结论。
+
+Host 根据 Endpoint 能力和总线预算决定能否启用某个 Alternate。`usb_set_interface()` 返回 `-ENOSPC` 时，可能是周期带宽不足，而不是控制请求无法到达。此时需要同时观察整个拓扑中其他周期 Endpoint 的占用。
+
+### Endpoint 地址、halt 与 toggle 属于运行时状态
+
+Descriptor 只定义 Endpoint 静态能力。运行时还存在 halt/stall、data toggle、stream ID、队列和 HCD 私有状态。Control Endpoint 可以通过 `CLEAR_FEATURE(ENDPOINT_HALT)` 清除 halt，usbcore/HCD 还要同步重置软件 toggle；只让 Device 清状态而 Host 继续使用旧 toggle，会造成后续 packet 无法正确确认。
+
+Interface 切换 Alternate 时，旧 Alternate 的 Endpoint 会被禁用，正在排队的 URB 必须完成或取消，新 Alternate 的 Endpoint 才进入可用状态。驱动不能缓存一个 Endpoint 指针后跨 `usb_set_interface()` 永久使用而不重新核对当前布局。
 
 ```mermaid
 flowchart LR
-    D[USB Device] --> C[Configuration 1]
-    C --> I0[Interface 0\nCDC Control]
-    C --> I1[Interface 1\nCDC Data]
-    C --> I2[Interface 2\nVendor Debug]
-    I0 --> E0[Interrupt IN]
-    I1 --> E1[Bulk IN]
-    I1 --> E2[Bulk OUT]
-    I2 --> E3[Bulk IN/OUT]
+    RAW[Raw configuration byte stream] --> HC[usb_host_config]
+    HC --> CACHE[usb_interface_cache per interface number]
+    CACHE --> HI0[usb_host_interface alternate 0]
+    CACHE --> HI1[usb_host_interface alternate N]
+    HI0 --> HE0[usb_host_endpoint]
+    HI1 --> HE1[usb_host_endpoint + SS companion]
+    CACHE --> INTF[usb_interface with cur_altsetting]
+    INTF --> DRV[Interface Driver probe]
 ```
 
-如果驱动只按 VID/PID 匹配，但没有检查当前传入的是哪个 Interface，就可能把 CDC Control 接口误当成数据接口，然后发现找不到 bulk IN/OUT 端点。
+## 六、String、BOS 与 Class-specific Descriptor 扩展标准模型
 
-所以 `probe()` 中不能只打印 VID/PID 后就开始收发，必须确认当前 interface 的 class、number、endpoint 结构符合预期。
+String Descriptor 使用 UTF-16LE。Host 先读取 string index 0 得到支持的语言 ID，再以语言 ID 读取 Manufacturer、Product、Serial Number 等字符串。字符串便于人类识别和设备稳定命名，但驱动不应把可变产品字符串当唯一协议标识。
 
-### 2. Alternate Setting 是高带宽设备的关键
+Binary Object Store，简称 BOS，是 USB 2.01 及以后用于承载 Device Capability 的容器。USB 2.0 Extension、SuperSpeed Capability、Container ID、Platform Capability 等都通过 BOS 扩展。BOS 不属于某个 Configuration，Host 在设备级读取它。
 
-Alternate Setting 可以理解为同一个接口的不同工作档位。它常见于 USB Audio、UVC 摄像头等设备。
+BOS 头中的 `wTotalLength` 和 `bNumDeviceCaps` 与 Configuration 的总长度/子记录数量起类似作用。常见 Capability 包括：
 
-例如一个 UVC 摄像头的视频流接口可能有多个 altsetting：
+- **USB 2.0 Extension**：例如 Link Power Management 能力。
+- **SuperSpeed USB Device Capability**：支持的速度、U1/U2 exit latency 等。
+- **SuperSpeedPlus Capability**：更细的 sublink speed attribute。
+- **Container ID**：把多个功能或多种连接方式标识为同一个物理设备容器。
+- **Platform Capability**：由 UUID 区分平台扩展，例如 WebUSB 或 Microsoft OS 2.0 descriptor set 的入口。
 
-- alt 0：不传输数据，端点数量为 0
-- alt 1：低带宽视频流
-- alt 2：中等带宽视频流
-- alt 3：高带宽视频流
+Platform Capability 只提供发现入口，具体平台描述符可能需要 vendor request 读取。Host 看到 BOS 并不表示自动理解所有 UUID；未知 Capability 应按 `bLength` 安全跳过。
 
-如果驱动或类框架没有选择正确 altsetting，就可能出现接口存在但没有可用数据端点的现象。
+String Descriptor 的语言表也需要边界处理。index 0 返回一个或多个 16-bit LANGID，后续请求同时携带 string index 和 language ID。设备若只支持某个语言却对任意 LANGID 返回数据，会掩盖固件错误；Host 工具应按语言表发请求。
 
-切换 altsetting 通常使用：
+Class-specific Descriptor 没有统一结构，具体格式由 HID、CDC、UVC、UAC 等 Class 规范定义。Linux parser 会把无法归入标准结构的字节保存在 `extra/extralen`。驱动可以使用 `usb_get_extra_descriptor()` 按类型寻找记录，但仍要校验 class subtype 和最小长度：
 
 ```c
-int usb_set_interface(struct usb_device *dev,
-                      int interface_number,
-                      int alternate_setting);
+const void *raw;
+int ret;
+
+ret = usb_get_extra_descriptor(intf->cur_altsetting,
+                               USB_DT_CS_INTERFACE, &raw);
+if (ret)
+    return ret;
+
+/* Cast only after validating class-specific length and subtype. */
 ```
 
-对普通厂商自定义 bulk 设备，很多时候只有 alt 0。但写驱动时仍然不要忽略这个概念，尤其是分析摄像头、声卡这类设备时。
+HID Report Descriptor 是通过控制请求单独读取的，不一定直接嵌在 Configuration 字节流中；UVC/UAC 则会在 Interface extra 中放置多种 class descriptor。不能因为它们都叫“Class Descriptor”就使用同一个解析方式。
 
-### Linux 如何保存配置与 Alternate Setting
+Class parser 还要处理“同一类型、不同 subtype”的情况。CDC 的 Header、Union、ACM 都使用 `CS_INTERFACE` 类型；UVC 的 Input Terminal、Processing Unit、Format、Frame 也共享 class-specific 类型。只用 `usb_get_extra_descriptor(..., USB_DT_CS_INTERFACE, ...)` 只能找到第一条，完整解析需要在 extra buffer 中继续遍历并检查 subtype。
 
-usbcore 读取完整配置树后建立 `struct usb_host_config`，其中保存 Configuration Descriptor、interface cache、IAD 和 extra descriptor。每个 `usb_interface` 指向当前 `struct usb_host_interface`，其 altsetting 数组保存同一 interface number 的不同 Alternate Setting。
+安全解析通常保留两个层次：通用 walker 只负责长度和边界，class parser 在确认 subtype 后检查对应最小结构长度、版本和交叉引用。例如 UVC Frame Descriptor 引用的 format index、CDC Union 引用的 Interface 编号，都必须落在当前配置实际对象内。
 
-类驱动切换高带宽模式时调用 `usb_set_interface()`，成功后 `cur_altsetting` 改变，endpoint 能力也随之改变。驱动不能在 probe 时缓存一个 endpoint descriptor 后无视后续 altsetting 切换。
+## 七、从 lsusb 字节到驱动匹配和故障证据
 
-## 七、Endpoint Descriptor：真正的数据通道地图
-
-Endpoint 是 USB 数据传输的通道。除了默认控制端点 0 以外，普通数据端点都通过 Endpoint Descriptor 描述。
-
-对应结构体是 `struct usb_endpoint_descriptor`。
-
-| 字段 | 含义 | 驱动开发关注点 |
-|---|---|---|
-| `bEndpointAddress` | 端点地址和方向 | 判断 IN/OUT 与端点号 |
-| `bmAttributes` | 端点属性 | 判断 bulk/interrupt/isochronous |
-| `wMaxPacketSize` | 最大包长 | 影响一次事务的数据大小 |
-| `bInterval` | 轮询间隔 | interrupt/isochronous 重点关注 |
-
-### 1. 端点方向：IN/OUT 是站在 Host 视角
-
-USB 里的 IN/OUT 方向一定要站在 Host 角度理解：
-
-- IN：设备到 Host
-- OUT：Host 到设备
-
-这点非常容易弄反。比如 USB 鼠标把按键数据发给电脑，它使用的是 Interrupt IN 端点；USB bulk 设备把采集数据上传给主机，也使用 Bulk IN 端点。
-
-判断方向可以看 `bEndpointAddress` 的最高位：
-
-- bit7 = 1：IN
-- bit7 = 0：OUT
-
-端点号是低 4 位。
-
-### 2. 端点类型：决定传输语义
-
-`bmAttributes` 的低两位表示传输类型：
-
-| 类型 | 含义 | 典型设备 |
-|---|---|---|
-| Control | 控制传输 | 端点 0，标准请求 |
-| Isochronous | 等时传输 | 摄像头、音频 |
-| Bulk | 批量传输 | U 盘、自定义高速数据设备 |
-| Interrupt | 中断传输 | 鼠标、键盘、状态通知 |
-
-驱动中不要手动解析 bit，优先使用内核提供的辅助函数：
-
-```c
-if (usb_endpoint_is_bulk_in(ep)) {
-    /* device -> host bulk endpoint */
-}
-
-if (usb_endpoint_is_bulk_out(ep)) {
-    /* host -> device bulk endpoint */
-}
-
-if (usb_endpoint_is_int_in(ep)) {
-    /* interrupt input endpoint */
-}
-
-if (usb_endpoint_xfer_isoc(ep)) {
-    /* isochronous endpoint */
-}
-```
-
-### 3. probe 中遍历端点的标准写法
-
-一个厂商自定义 bulk 设备通常至少需要一个 bulk IN 和一个 bulk OUT。驱动可以在 `probe()` 中这样查找：
-
-```c
-struct demo_usb_dev {
-    struct usb_device *udev;
-    struct usb_interface *intf;
-    unsigned char bulk_in_ep;
-    unsigned char bulk_out_ep;
-    size_t bulk_in_size;
-};
-
-static int demo_find_endpoints(struct usb_interface *intf,
-                               struct demo_usb_dev *dev)
-{
-    struct usb_host_interface *alt = intf->cur_altsetting;
-    struct usb_endpoint_descriptor *ep;
-    int i;
-
-    for (i = 0; i < alt->desc.bNumEndpoints; i++) {
-        ep = &alt->endpoint[i].desc;
-
-        if (!dev->bulk_in_ep && usb_endpoint_is_bulk_in(ep)) {
-            dev->bulk_in_ep = ep->bEndpointAddress;
-            dev->bulk_in_size = usb_endpoint_maxp(ep);
-            continue;
-        }
-
-        if (!dev->bulk_out_ep && usb_endpoint_is_bulk_out(ep)) {
-            dev->bulk_out_ep = ep->bEndpointAddress;
-            continue;
-        }
-    }
-
-    if (!dev->bulk_in_ep || !dev->bulk_out_ep)
-        return -ENODEV;
-
-    return 0;
-}
-```
-
-这段代码体现了几个工程习惯：
-
-- 不假设 endpoint 顺序固定。
-- 不通过端点号硬编码判断功能。
-- 使用 `usb_endpoint_is_bulk_in()` 等辅助函数。
-- 找不到必要端点时返回错误，避免后续空指针或错误 pipe。
-
-## 八、String Descriptor：调试时很有用的可读信息
-
-String Descriptor 用于保存厂商名、产品名、序列号等字符串。Device Descriptor 和 Interface Descriptor 中的 `iManufacturer`、`iProduct`、`iSerialNumber`、`iInterface` 都不是字符串本身，而是字符串索引。
-
-在 Linux 里，很多字符串已经被 USB core 读取并放进 `struct usb_device`：
-
-```c
-struct usb_device *udev = interface_to_usbdev(intf);
-
-dev_info(&intf->dev, "manufacturer: %s\n",
-         udev->manufacturer ? udev->manufacturer : "unknown");
-dev_info(&intf->dev, "product: %s\n",
-         udev->product ? udev->product : "unknown");
-dev_info(&intf->dev, "serial: %s\n",
-         udev->serial ? udev->serial : "unknown");
-```
-
-序列号在工程现场尤其重要。假设一台设备上接了 4 个同型号 USB 模块，它们 VID/PID 完全一样，只有序列号不同。如果用户态需要稳定区分每一个模块，就不能只依赖 `/dev` 枚举顺序，而要结合序列号或物理端口路径做规则绑定。
-
-可以通过 udev 规则按序列号生成稳定设备名，这是 Linux 产品化中很常见的做法。
-
-## 九、Class-Specific Descriptor：类驱动背后的关键扩展
-
-除了标准描述符，很多 USB 类协议还定义了自己的 class-specific descriptor。它们仍然混在 Configuration Descriptor 的完整树里，只是 `bDescriptorType` 和字段格式由具体类规范定义。
-
-常见例子包括：
-
-- HID Descriptor
-- UVC VideoControl Descriptor
-- UVC VideoStreaming Descriptor
-- USB Audio Descriptor
-- CDC Functional Descriptor
-
-以 UVC 摄像头为例，普通 Endpoint Descriptor 只能说明某个端点用于视频流传输，但摄像头支持哪些分辨率、帧率、格式、控制单元、处理单元，这些需要 UVC class-specific descriptor 描述。
-
-所以分析 USB 摄像头时，不能只看 endpoint，还要看 VideoControl 和 VideoStreaming 相关描述符。`uvcvideo` 驱动正是根据这些描述符构建 V4L2 设备能力。
-
-### IAD 说明多个 Interface 属于同一个功能
-
-Interface Association Descriptor（IAD）用 first interface 和 count 把连续 interface 组合为一个 function。CDC ACM 常由 Communication interface 与 Data interface 组成，UVC 也把 VideoControl 与 VideoStreaming 组织在同一功能中。IAD 应出现在关联的第一个 Interface Descriptor 之前，范围必须连续且真实存在。
-
-IAD 不会让 Linux 只创建一个 interface；usbcore 仍创建多个 `usb_interface`，类驱动再根据 IAD、CDC Union 等关系找到伙伴。IAD 缺失或编号错误时，单个 interface 可能出现，却无法形成完整 class 功能。
-
-### BOS 承载固定 Device Descriptor 放不下的能力
-
-BOS（Binary Object Store）由 BOS header 与多个 Device Capability 组成，可描述 USB 2.0 Extension、SuperSpeed、Container ID 和 Platform Capability。WebUSB、Microsoft OS 2.0 等常借助 Platform Capability 给出 UUID、vendor code 或 descriptor set 信息。
-
-Host 是否读取 BOS 与设备 USB 版本、平台能力有关。排查 SuperSpeed 或平台 descriptor 时，不能只检查 Configuration tree；还要核对 BOS 的总长度、每个 capability 的 `bLength` 和后续 vendor request 是否一致。
-
-### 在 extra 字节中安全寻找 Class Descriptor
-
-Class-specific descriptor 常保存在 `usb_host_interface->extra` 或 endpoint extra 中。驱动可以用 `usb_get_extra_descriptor()` 按类型查找，但返回前仍需验证 class 版本、`bLength`、引用的 interface/entity ID 和剩余长度。
-
-直接把 `extra` 强转成目标结构并信任 `wTotalLength` 会把外部设备输入变成越界读取。CDC Union、UVC/UAC entity 链等还要检查引用对象确实存在，避免形成环或悬空 ID。
-
-## 十、使用 lsusb -v 读懂真实设备
-
-学习描述符最有效的方法不是背字段，而是拿真实设备分析。
-
-常用命令：
+先用 `lsusb -v` 观察层次，再回到原始字节或 usbmon：
 
 ```bash
-lsusb
-lsusb -v -d 1234:5678
-usb-devices
-dmesg -w
+lsusb -d 1234:5678 -v
+lsusb -t
+sudo cat /sys/kernel/debug/usb/usbmon/0u
 ```
 
-如果没有权限读取完整描述符，可以加 `sudo`：
+阅读顺序应是 Device -> Configuration -> IAD -> Interface/Alternate -> Endpoint -> Class-specific。每次看到 `bNumEndpoints`，确认后面属于该 Alternate 的 Endpoint 数量；看到 `wTotalLength`，确认整组记录没有越界或截断；看到 driver bind，确认它绑定的是哪个 `bus-port:config.interface`。
 
-```bash
-sudo lsusb -v -d 1234:5678
-```
-
-一个典型分析顺序是：
-
-```text
-1. 先看 idVendor / idProduct，确认设备身份
-2. 看 bDeviceClass，判断类信息在设备级还是接口级
-3. 看 bNumConfigurations，确认配置数量
-4. 进入 Configuration Descriptor，看 bNumInterfaces
-5. 逐个 Interface 看 class/subclass/protocol
-6. 在目标 Interface 下找 Endpoint
-7. 确认 endpoint 方向、类型、wMaxPacketSize、bInterval
-8. 对 UVC/HID/Audio/CDC 等设备继续看 class-specific descriptor
-```
-
-可以把 `lsusb -v` 输出保存下来，便于分析：
-
-```bash
-sudo lsusb -v -d 1234:5678 > usb-desc.txt
-```
-
-如果正在写驱动，建议把驱动里打印出的 interface 和 endpoint 信息与 `lsusb -v` 对照。两边一致，说明你找对了接口和端点；如果不一致，优先怀疑当前驱动绑定的 interface 不是你以为的那个。
-
-## 十一、驱动中打印描述符的完整示例
-
-下面给一个更完整的 `probe()` 调试模板，适合在写 USB 驱动早期使用。
+驱动匹配后仍要二次校验。以下 ID 表只表达“可能支持”：
 
 ```c
-static int demo_probe(struct usb_interface *intf,
-                      const struct usb_device_id *id)
-{
-    struct usb_device *udev = interface_to_usbdev(intf);
-    struct usb_host_interface *alt = intf->cur_altsetting;
-    struct usb_device_descriptor *ddesc = &udev->descriptor;
-    struct usb_interface_descriptor *idesc = &alt->desc;
-    struct usb_endpoint_descriptor *ep;
-    int i;
-
-    dev_info(&intf->dev, "USB device matched\n");
-    dev_info(&intf->dev, "VID:PID = %04x:%04x\n",
-             le16_to_cpu(ddesc->idVendor),
-             le16_to_cpu(ddesc->idProduct));
-
-    dev_info(&intf->dev, "manufacturer=%s product=%s serial=%s\n",
-             udev->manufacturer ? udev->manufacturer : "unknown",
-             udev->product ? udev->product : "unknown",
-             udev->serial ? udev->serial : "unknown");
-
-    dev_info(&intf->dev,
-             "interface=%u alt=%u class=%02x subclass=%02x protocol=%02x endpoints=%u\n",
-             idesc->bInterfaceNumber,
-             idesc->bAlternateSetting,
-             idesc->bInterfaceClass,
-             idesc->bInterfaceSubClass,
-             idesc->bInterfaceProtocol,
-             idesc->bNumEndpoints);
-
-    for (i = 0; i < idesc->bNumEndpoints; i++) {
-        ep = &alt->endpoint[i].desc;
-
-        dev_info(&intf->dev,
-                 "ep[%d] addr=0x%02x attr=0x%02x maxp=%u interval=%u\n",
-                 i,
-                 ep->bEndpointAddress,
-                 ep->bmAttributes,
-                 usb_endpoint_maxp(ep),
-                 ep->bInterval);
-
-        if (usb_endpoint_is_bulk_in(ep))
-            dev_info(&intf->dev, "  -> bulk IN\n");
-        else if (usb_endpoint_is_bulk_out(ep))
-            dev_info(&intf->dev, "  -> bulk OUT\n");
-        else if (usb_endpoint_is_int_in(ep))
-            dev_info(&intf->dev, "  -> interrupt IN\n");
-        else if (usb_endpoint_xfer_isoc(ep))
-            dev_info(&intf->dev, "  -> isochronous\n");
-    }
-
-    return 0;
-}
-```
-
-这个模板不直接做业务逻辑，只做描述符观察。实际项目里，早期先把这些信息打印清楚，比一上来写复杂读写逻辑更稳。
-
-## 十二、描述符与驱动匹配的关系
-
-Linux USB 驱动匹配依赖 `struct usb_device_id` 表。它可以表达多种匹配方式。
-
-### 1. 匹配指定设备
-
-```c
-static const struct usb_device_id demo_table[] = {
+static const struct usb_device_id ids[] = {
     { USB_DEVICE(0x1234, 0x5678) },
+    { USB_INTERFACE_INFO(USB_CLASS_VENDOR_SPEC, 0x01, 0x01) },
     { }
 };
-MODULE_DEVICE_TABLE(usb, demo_table);
 ```
 
-这种方式适合厂商自定义设备。只要 VID/PID 匹配，USB core 就可能调用驱动的 `probe()`。
+`probe()` 中还应验证 Interface 数量、所需 Endpoint、最大包长和 class-specific version。固件升级后描述符变化时，驱动应明确拒绝不兼容布局，而不是在第一个 URB 超时后才暴露问题。
 
-### 2. 匹配接口类
+常见故障可以直接对应到描述符边界：
 
-```c
-static const struct usb_device_id demo_table[] = {
-    { USB_INTERFACE_INFO(USB_CLASS_VENDOR_SPEC, 0xff, 0xff) },
-    { }
-};
-MODULE_DEVICE_TABLE(usb, demo_table);
-```
+- `probe()` 不进入：检查目标 Interface 的 class/modalias、ID 表和竞争驱动。
+- 找不到 Endpoint：检查当前 Alternate、`bNumEndpoints`、方向和 transfer 类型。
+- UVC 能识别但无法出图：检查 Probe/Commit、VideoStreaming Alternate 和周期带宽。
+- CDC 只有控制接口：检查 IAD、Union Functional Descriptor 和伙伴 Data Interface。
+- 配置读取 short packet：检查 `wTotalLength` 与设备实际返回长度。
+- Linux 报 malformed descriptor：检查 `bLength`、记录顺序和 buffer 边界。
 
-这种方式更关注 interface class/subclass/protocol。很多标准类驱动就是按接口类匹配的。
+**参考资料**
 
-### 3. 匹配后仍要二次校验
+- [USB 2.0 Specification - USB-IF](https://www.usb.org/document-library/usb-20-specification)
+- [The Linux-USB Host Side API](https://docs.kernel.org/driver-api/usb/usb.html)
+- [USB Descriptor APIs in Linux](https://docs.kernel.org/driver-api/usb/usb.html#usb-standard-devices)
 
-即使 `id_table` 匹配成功，`probe()` 里也应该再次检查 endpoint 是否符合预期。原因很简单：匹配成功只说明“这个接口大概率属于我”，不代表硬件固件版本、altsetting、endpoint 数量完全满足当前驱动假设。
+## 八、小结
 
-可靠驱动应该在 `probe()` 中做完整校验：
+USB 描述符是一棵通过线性 TLV 字节流编码的能力树。Device Descriptor 建立全局身份和 EP0 参数，Configuration 用 `wTotalLength` 划定完整方案，Interface/Alternate 组织功能和带宽模式，Endpoint 定义数据通道，IAD/BOS/Class-specific Descriptor 负责跨 Interface 或新能力扩展。
 
-```text
-VID/PID 或 class 匹配
-    ↓
-确认 interface number / class / subclass / protocol
-    ↓
-确认 endpoint 数量和类型
-    ↓
-确认 max packet size、方向、interval
-    ↓
-分配资源并进入工作状态
-```
-
-## 十三、常见问题排查
-
-### 1. probe 没有进入
-
-优先检查：
-
-```bash
-lsusb
-lsusb -v -d VID:PID
-dmesg | grep -i usb
-modinfo your_driver.ko
-```
-
-重点看：
-
-- VID/PID 是否写错。
-- 驱动是否正确加载。
-- `MODULE_DEVICE_TABLE(usb, xxx_table)` 是否存在。
-- 设备是否已被其他驱动绑定。
-- 匹配方式是 device 级还是 interface 级。
-
-查看当前绑定驱动：
-
-```bash
-ls -l /sys/bus/usb/devices/*/driver
-```
-
-如果设备已经被通用类驱动绑定，专用驱动可能不会接管。可以临时解绑再绑定：
-
-```bash
-echo '1-1:1.0' | sudo tee /sys/bus/usb/drivers/usbhid/unbind
-echo '1-1:1.0' | sudo tee /sys/bus/usb/drivers/your_driver/bind
-```
-
-实际路径要以 `/sys/bus/usb/devices/` 下看到的接口名为准。
-
-### 2. probe 进了但找不到端点
-
-常见原因：
-
-- 驱动绑定到了错误 interface。
-- 当前 altsetting 没有数据端点。
-- 端点类型不是你以为的 bulk，而是 interrupt 或 isochronous。
-- 端点方向看反了。
-- 固件版本变更导致端点布局变化。
-
-排查方法：
-
-```bash
-sudo lsusb -v -d VID:PID
-```
-
-同时在驱动里打印 `bInterfaceNumber`、`bAlternateSetting`、`bNumEndpoints` 和每个 endpoint 的 `bEndpointAddress`、`bmAttributes`。
-
-### 3. bulk 传输超时
-
-描述符层面重点看：
-
-- 是否选择了正确 bulk IN/OUT endpoint。
-- endpoint 地址是否传给了正确 pipe。
-- IN/OUT 方向是否反了。
-- 最大包长是否符合设备固件设计。
-
-Linux 中构造 pipe 常用：
-
-```c
-usb_rcvbulkpipe(udev, endpoint_address);
-usb_sndbulkpipe(udev, endpoint_address);
-```
-
-不要把 OUT endpoint 用到 `usb_rcvbulkpipe()`，也不要把 IN endpoint 用到 `usb_sndbulkpipe()`。
-
-### 4. UVC 摄像头能识别但不能出图
-
-描述符层面需要看：
-
-- VideoControl Interface 是否正常。
-- VideoStreaming Interface 是否存在。
-- 是否有合适的 format/frame descriptor。
-- 选择的分辨率和帧率是否超过 USB 带宽。
-- isochronous endpoint 的 altsetting 是否正确。
-
-常用命令：
-
-```bash
-v4l2-ctl --list-devices
-v4l2-ctl -d /dev/video0 --list-formats-ext
-v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=100
-```
-
-如果是 USB 2.0 摄像头，高分辨率未压缩 YUYV 很容易超过带宽，此时需要选择 MJPEG 或降低分辨率/帧率。
-
-## 十四、工程验证清单
-
-写 USB 驱动或调试 USB 设备时，可以按下面清单确认描述符相关问题。
-
-| 检查项 | 命令/方法 | 预期结果 |
-|---|---|---|
-| 设备是否枚举 | `lsusb` | 能看到 VID/PID |
-| 设备描述符是否完整 | `sudo lsusb -v -d VID:PID` | Device Descriptor 可读 |
-| 配置数量是否正常 | `bNumConfigurations` | 至少一个配置 |
-| 接口数量是否符合预期 | `bNumInterfaces` | 与设备功能一致 |
-| 驱动绑定对象是否正确 | `/sys/bus/usb/devices/*/driver` | 绑定到目标 interface |
-| endpoint 类型是否正确 | `lsusb -v` + 驱动打印 | bulk/int/isoc 与设计一致 |
-| endpoint 方向是否正确 | `bEndpointAddress` bit7 | IN/OUT 不反 |
-| altsetting 是否正确 | `bAlternateSetting` | 高带宽设备选择合适档位 |
-| 字符串是否可读 | `udev->product` 等 | 便于区分设备 |
-| 热插拔是否稳定 | 反复插拔测试 | 无崩溃、无泄漏、无野指针 |
-
-## 十五、小结
-
-读完并完成实验后，你应该能做到：
-
-- 解释 Device / Configuration / Interface / Endpoint / String Descriptor 的层次关系。
-- 看懂 `lsusb -v` 中最关键的描述符字段。
-- 明确 Linux USB 驱动为什么经常绑定到 Interface。
-- 在 `probe()` 中打印当前 interface 和 endpoint 信息。
-- 判断 bulk IN、bulk OUT、interrupt IN、isochronous endpoint。
-- 排查 `probe()` 不进、端点找不到、方向看反、altsetting 选择错误等问题。
-
-USB 描述符是后续 URB、数据传输、Gadget、UVC 摄像头和 USB Host bring-up 的共同基础。把这部分打牢，后面看到任何 USB 设备时，就不会只停留在“插上能不能识别”，而是能进一步判断它为什么这样枚举、驱动为什么这样匹配、数据应该从哪个端点走。
-
-> 🏷️ USB驱动 / USB描述符 / Linux内核 / Endpoint / Interface / 枚举流程 / 嵌入式Linux
+Linux 把这串字节解析为 `usb_host_config`、`usb_host_interface`、`usb_host_endpoint` 和 `usb_interface`，然后才进行驱动匹配。下一篇会在这些 Endpoint 之上构造 URB，解释实际 packet 如何由 HCD 调度、完成和取消。
