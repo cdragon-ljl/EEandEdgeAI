@@ -1,104 +1,151 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #05 · PCIe 中断：INTx、MSI 与 MSI-X"
-description: "PCIe 设备要想高效地通知主机，离不开中断机制。对于驱动开发来说，中断不是附属功能，而是设备和主机同步状态、完成任务、提交新工作的重要通道。"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #05 · INTx、MSI 与 MSI-X"
+description: "从设备为什么需要异步通知开始，解释 INTx 共享电平、MSI Memory Write、MSI-X Table/PBA、多队列 vector、ordering、affinity 和中断合并。"
 pubDate: "2026-08-18"
 series: pcie
 order: 5
 tags: ["PCIe", "Linux Driver"]
 draft: false
 ---
-PCIe 设备通常用中断通知 DMA 完成、队列事件和错误。INTx、MSI、MSI-X 最终都进入 Linux IRQ 子系统，但硬件语义、共享方式、mask 能力和队列扩展完全不同。驱动若只会 `request_irq()`，仍可能遭遇共享中断风暴、vector 分配降级或数据尚未可见。
-
-本篇从设备发出通知的方式开始，沿 `pci_alloc_irq_vectors()` 到 handler、affinity 和中断丢失排查。
+CPU 不能持续轮询每个 PCIe 设备寄存器。设备完成 DMA、收到网络包或发生错误时，需要异步通知 CPU。PCIe 兼容传统 INTx，同时提供 MSI 和 MSI-X。三者最终都会进入 Linux IRQ 子系统，但设备侧触发、共享关系和多队列能力不同。
 
 ## 一、INTx 是需要设备撤销的共享电平事件
 
-传统 INTx 在 PCIe 中以 Message TLP 模拟引脚 assert/deassert，仍保留电平和共享语义。多个设备可以共享同一 Linux IRQ，handler 必须读取本设备 status，若没有 pending 返回 `IRQ_NONE`。
+传统 PCI 定义 INTA#..INTD#。在 PCIe 上，INTx 可被编码成 Message TLP 穿过 fabric，但软件仍看到共享、level-triggered 语义。设备置 pending/status 并 assert INTx；Handler 必须确认事件属于本设备、处理/记录状态，再让设备 deassert。
 
-设备 handler 要先确认并清除/ack 本设备中断源，使 INTx deassert。只清 Host IRQ controller 而不清设备 status，会立即再次进入中断形成 storm。读取 status 还要遵守设备的 write-one-to-clear 或 read-clear 语义。
-
-INTx 兼容性好，但共享、单 vector 和电平处理不适合多队列高吞吐设计。
-
-## 二、MSI 是设备发出的一次 Memory Write
-
-MSI Capability 由系统配置 message address/data。设备触发时发送 Memory Write TLP，Root Complex 将其转换为 CPU interrupt。没有共享物理线，也不存在传统 deassert；设备仍需在自己的 status/queue 中记录待处理工作。
-
-MSI 可以支持多个 message，但数量和对齐受 capability 约束。Linux vector 分配可能少于设备最大值，驱动必须按实际返回值配置硬件，不能假设请求 8 就一定得到 8。
-
-设备写 completion 数据和 MSI 的先后仍要符合协议/设备设计。Host handler 收到中断时 descriptor/completion 必须已经对 DMA 可见；设备端硬件需要保证写数据先于 MSI，驱动端还要用 DMA barrier 正确读取 ownership。
-
-### MSI Capability 中的 message 与 mask
-
-系统在 MSI Capability中写 Message Address/Data，设备触发时发一条 posted Memory Write TLP。64-bit capable设备有高地址寄存器；per-vector masking是否存在由 capability bit决定。Multiple Message Capable/Enable编码支持与实际启用数量，通常要求 2 的幂。
-
-MSI没有电平 deassert，但设备自己的 completion/status仍需消费和清除。若同一 vector聚合多个原因，handler循环读取 pending bitmap直到稳定，避免新事件落在 ack窗口。
-
-设备写 payload/CQE 必须先于 MSI对 Host可见。PCIe ordering与设备实现要保证这一点，Host handler读取 DMA completion前执行 `dma_rmb()`。否则可能出现 IRQ先到、CQE仍旧的“伪丢中断”。
-
-## 三、MSI-X 用 BAR 中的表把 vector 分开配置
-
-MSI-X Capability 指向 MSI-X Table 与 Pending Bit Array（PBA）所在 BAR/offset。每个 table entry 有 message address、data 和 vector control，可独立 mask。PBA 记录被 mask 时到达的 pending vector。
-
-设备常让每个 RX/TX queue 或 completion queue 对应一个 MSI-X vector，再为管理/错误保留独立 vector。这样 handler 只服务关联队列，并可设置不同 CPU affinity。
-
-Table 是设备 BAR 资源的一部分，不应被普通寄存器映射代码误覆盖。Linux PCI/MSI core 负责配置 message，驱动只申请 vector 并将队列映射到返回的 Linux IRQ。
-
-### MSI-X Table 和 PBA 是设备内存结构
-
-每个 MSI-X Table entry含 Message Address、Message Data和 Vector Control Mask bit；Capability给出 table与 Pending Bit Array（PBA）的 BIR/offset，它们位于某个 BAR。Function Mask可一次屏蔽全部 vector。
-
-Vector被 mask时事件应在 PBA保留 pending，unmask后触发；table写入和设备内部 queue-vector映射必须同步。驱动不直接随意改 table内容，PCI/MSI core负责配置；设备固件/FPGA要正确实现 BIR、大小、mask与pending。
-
-多队列常将 RX/TX/management/error分配不同 vector。实际 `pci_alloc_irq_vectors()` 返回少于请求时，驱动要重建 queue-vector映射，而不是假设 table全部启用。
-
-## 四、Linux 统一 vector 申请并允许降级
+多个设备共享 IRQ 时，handler 收到调用不能假设自己有事件：
 
 ```c
-int nvec = pci_alloc_irq_vectors(pdev, 1, wanted,
+static irqreturn_t demo_intx(int irq, void *data)
+{
+    struct demo_dev *dev = data;
+    u32 status = readl(dev->bar0 + REG_IRQ_STATUS);
+
+    if (!(status & DEMO_IRQ_MASK))
+        return IRQ_NONE;
+
+    writel(status, dev->bar0 + REG_IRQ_STATUS); /* W1C */
+    readl(dev->bar0 + REG_IRQ_STATUS);          /* Flush if required. */
+    demo_schedule_poll(dev, status);
+    return IRQ_HANDLED;
+}
+```
+
+若先返回而未清 source，level line 持续有效，CPU 形成 interrupt storm。若读 status 有 read-clear side effect，shared handler 还要遵守设备规范，不能为判断归属破坏状态。
+
+## 二、MSI 是一笔由设备发起的 Memory Write
+
+Message Signaled Interrupt（MSI）不使用共享电平线。系统在 MSI Capability 中为设备编程 message address 和 data；设备触发时发一笔 Memory Write Request，RC/中断控制器把它解释为目标 vector。
+
+```mermaid
+flowchart LR
+    EVT[Device event and status] --> GEN[MSI generation logic]
+    GEN --> TLP[PCIe Memory Write with message address and data]
+    TLP --> RC[Root Complex]
+    RC --> IR[Interrupt remapping or APIC/GIC ITS]
+    IR --> V[Linux IRQ vector]
+    V --> H[Driver handler]
+    H --> ACK[Consume completion/status]
+```
+
+MSI 写是 posted TLP。PCIe ordering 要保证设备在发 MSI 前已经按设备协议发布 completion/data；Host handler 看到通知后仍可能需要 `dma_rmb()` 再读取 DMA memory。若硬件先发 MSI 再写 completion，软件 barrier 无法修复硬件顺序。
+
+MSI vector 是连续的 power-of-two 集合，设备 Capability 表示最大数量。MSI 不共享传统线，handler 无需返回 `IRQ_NONE` 判断其他设备，但仍要确认设备队列/状态并处理 spurious event。
+
+### MSI Capability 如何表达地址宽度和多消息数量
+
+MSI Capability 的 Message Control 包含 64-bit Address Capable、Per-Vector Masking、Multiple Message Capable/Enable。32-bit 设备只有一个 Message Address dword；64-bit 设备再增加 upper address。Message Data 的低位可能被平台用于 vector 编码，驱动不应自行填写。
+
+设备声明最多 8 条 MSI 时，Multiple Message Capable 编码能力，系统在 Enable 中选择实际数量。MSI 多消息通常要求 message data 连续/按位选择，灵活性低于 MSI-X，因此现代多队列设备更常使用 MSI-X。
+
+启用顺序要避免早到事件：先让设备内部 source 保持 mask，PCI/MSI Core 编程 message 和 enable，request handler，清 stale status，最后解除设备 source mask。若设备在 message 尚未完整编程时发 MSI，事件可能丢失或指向错误 vector。
+
+Per-vector mask 存在时，设备必须在 masked 期间保留 pending，unmask 后补发。没有该能力时，驱动需要先在设备业务寄存器关闭 source，再操作 MSI 状态。
+
+## 三、MSI-X 用 Table 和 PBA 支持独立多队列
+
+MSI-X 支持更多 vector，每项可独立 message address/data 和 mask。MSI-X Capability 指向某个 BAR 内的 Table 和 Pending Bit Array（PBA）：
+
+- Table entry 包含 message address low/high、data、vector control mask。
+- PBA 在 vector 被 mask 时记录 pending。
+- Function Mask 可以一次 mask 全部 vector。
+
+Driver 不应直接 ioremap Table 后手写 message，Linux MSI Core 负责平台中断 remapping、安全和 affinity。设备硬件根据 queue/event 选择 table entry 并发 Memory Write。
+
+MSI-X Table 每项 16 字节，Table BIR/offset 指明它位于哪个 BAR；PBA 也由 BIR/offset 定位。Table/PBA 是设备内部 MSI-X 功能的规范窗口，不等于普通业务寄存器。BAR sizing 必须包含它们，设备实现要阻止业务 DMA 与 Table 地址冲突。
+
+Vector Control 的 mask bit 只阻止对应 message 发出，不应清除业务事件。mask 期间发生事件时，PBA 置 pending；unmask 后设备重新评估并发送。若硬件只置 PBA 却不在 unmask 后补发，会出现“压力下偶发丢中断”。
+
+Function Mask 适合初始化/reset 批量隔离。正确 reset 顺序通常是 function/vector mask -> 停止 queue -> 清/记录 source -> 重新编程 queue/vector -> 解除 function mask；直接清 PBA 可能丢掉尚未消费的完成。
+
+MSI-X 适合多队列：每个 RX/TX/completion queue 一个 vector，管理/错误单独 vector。这样 IRQ、poll worker 和 buffer 可以按 CPU/NUMA 对齐，减少共享锁。
+
+## 四、Linux 统一申请 vector 并允许能力降级
+
+```c
+int nvec;
+
+nvec = pci_alloc_irq_vectors(pdev, 1, desired,
         PCI_IRQ_MSIX | PCI_IRQ_MSI | PCI_IRQ_LEGACY);
 if (nvec < 0)
     return nvec;
 
-for (i = 0; i < nvec; i++) {
+dev->num_vec = nvec;
+for (int i = 0; i < nvec; i++) {
     int irq = pci_irq_vector(pdev, i);
-    ret = request_irq(irq, demo_irq, 0, "demo", &dev->q[i]);
+    int ret = request_threaded_irq(irq, demo_irq, demo_irq_thread,
+                                   0, dev_name(&pdev->dev),
+                                   &dev->queues[i]);
     if (ret)
-        goto err_irq;
+        goto err_irqs;
 }
 ```
 
-返回值是实际 vector 数。只得到 1 个时，驱动需要让多个 queue 共享 handler 或减少 queue；不能继续访问不存在的 `pci_irq_vector(pdev, 3)`。
+`pci_alloc_irq_vectors()` 返回实际数量，可能小于 desired。驱动必须根据返回值重新安排 queue-vector mapping；不能仍按 16 queue 访问只分到 4 个 vector。
 
-释放时先 mask/停止设备产生中断，`synchronize_irq()`，再 free_irq，最后 `pci_free_irq_vectors()`。先释放 vector 后设备继续 MSI，可能产生 stray interrupt 或触发未知目标。
+若要求每个 queue 独立 vector，可把 min/max 都设为要求值，失败则拒绝或切换明确的共享策略。`pci_irq_vector()` 把逻辑索引转换为 Linux IRQ，不能假设 IRQ 连续。
 
-Managed API `pci_alloc_irq_vectors_affinity()` 可按 pre/post vector 与 queue 数给出 affinity 方案。驱动也可用 `irq_set_affinity_hint()` 提示目标 CPU，但需在 remove 时清除；新设计优先使用 IRQ affinity descriptor/managed affinity，避免与用户 irqbalance 策略冲突。
+释放顺序：先 mask/stop device，`free_irq()`（内部等待 handler），再 `pci_free_irq_vectors()`。若先 free vector 而设备仍发 MSI，可能送到已重分配的中断目标。
 
-### Threaded IRQ、poll budget 与 interrupt moderation
+## 五、Handler、threaded IRQ、NAPI/poll 和 affinity
 
-需要睡眠或较重控制处理时可用 `request_threaded_irq()`：top half确认来源、mask设备并返回 `IRQ_WAKE_THREAD`，thread handler处理后 unmask。高吞吐 queue更常借鉴 NAPI：IRQ只关闭通知，poll按 budget批量消费 CQ，清空后重新打开。
+硬中断上半部只做最少工作：读/屏蔽原因、ack 必要状态、安排 poll/thread。大量 completion 回收放 NAPI、irq thread 或 workqueue，限制 budget，避免一次 IRQ 长时间占 CPU。
 
-Interrupt moderation按 completion计数或时间聚合。阈值大降低 IRQ/CPU开销但增加尾延迟；阈值小改善延迟但可能形成 storm。设备/驱动应暴露 packet/completion per interrupt、moderation timer和P99延迟一起调优。
-
-Affinity按 queue、worker和NUMA内存布置。`pci_alloc_irq_vectors_affinity()` 可生成 managed affinity；`irq_set_affinity_hint()` 只是提示且 remove时要清除，不能与 irqbalance策略互相覆盖。
-
-## 五、Handler、threaded IRQ 与轮询之间如何分工
-
-硬中断 handler 应读取/ack 原因、屏蔽需要延后处理的 queue，并安排 NAPI、tasklet、work 或 threaded IRQ。大量 completion 不应在 hardirq 中逐个进行复杂用户通知。
-
-网络驱动常在中断后关闭 queue IRQ，用 NAPI 轮询一批 descriptor，再重新 unmask；NVMe/存储则按 completion queue 批量回收。中断合并通过计数/时间阈值降低 IRQ 率，但会增加尾延迟。
-
-## 六、中断“丢失”要区分设备、PCIe、IRQ 和软件队列
-
-```bash
-lspci -s BDF -vv | grep -A5 -E 'MSI|MSI-X'
-cat /proc/interrupts
-cat /sys/bus/pci/devices/BDF/msi_irqs/* 2>/dev/null
+```mermaid
+flowchart LR
+    Q0[Queue 0] --> V0[MSI-X vector 0] --> I0[Hard IRQ] --> P0[Poll queue 0] --> C0[CPU 0]
+    Q1[Queue 1] --> V1[MSI-X vector 1] --> I1[Hard IRQ] --> P1[Poll queue 1] --> C1[CPU 1]
+    AQ[Admin and error] --> AV[Admin vector] --> TH[Threaded IRQ]
 ```
 
-Capability Disabled 表示设备没有启用相应模式；msi_irqs 存在但计数不涨，检查设备 vector table/program、mask 与硬件 event；计数涨但业务不动，检查 handler status、descriptor ownership 和 wakeup；计数异常高，检查中断源未清、empty queue 仍触发或 moderation。
+Affinity 让 IRQ 靠近消费 CPU/NUMA memory。驱动可使用 `irq_set_affinity_hint()` 提供提示，但要与 irqbalance/系统策略协调；现代代码也可使用 managed affinity 描述。不能把提示当作硬保证。
 
-AER Unsupported Request/Completer Abort 可能说明 MSI write 地址被设备/平台错误处理，IOMMU interrupt remapping 配置也会影响虚拟化场景。不要直接轮询替代中断掩盖根因。
+Queue 与 vector 不必一一对应。若只分到少量 vector，可以多个 queue 共享一个 vector，但 handler/poll 必须遍历共享 completion queue status；若每个 queue 一个 vector，仍可能让多个 vector 映射同一 CPU。设计时分别记录 queue count、vector count、IRQ affinity、worker affinity 和 buffer NUMA node。
+
+多 Function/SR-IOV 中，PF 和每个 VF 拥有各自 MSI-X capability/Table，平台还受总 vector 与 interrupt-remapping 资源限制。创建 VF 成功不保证每个 VF 都能得到期望 vector，VF driver 同样必须接受 `pci_alloc_irq_vectors()` 实际返回值。
+
+中断合并（interrupt moderation/coalescing）按 completion 数或 timer 触发。更大阈值降低 IRQ/CPU、提高 batch，却增加平均和 P99 延迟。实时管理 queue 与高吞吐数据 queue 应使用不同策略。
+
+## 六、丢中断必须沿设备、PCIe、IRQ、队列四层检查
+
+`/proc/interrupts` 不增长：检查设备 event/status、vector enable/mask、MSI-X Table mapping、PCI Capability、Memory Write 是否发出、IOMMU/interrupt remapping 和 Linux IRQ registration。
+
+IRQ 增长但任务不完成：handler 是否读错 queue、completion 是否写回、`dma_rmb()` 与 phase bit 是否正确、poll 是否因 budget/状态漏掉事件。此时“中断正常”只证明通知到达，不证明数据路径完成。
+
+计数暴涨：INTx source 未清、MSI-X event condition 一直成立、completion queue 未消费或 W1C 语义错误。先 mask vector 停止风暴，再读取设备内部原因；不要仅在 Linux disable IRQ 而让设备无限累积 pending。
+
+MSI-X 在虚拟化/IOMMU 下失败而 INTx 可用，检查 interrupt remapping、VF/PF vector 配置和平台固件。降级到 INTx 可用于对比，但不能隐藏生产配置错误。
+
+Teardown 时还要处理“迟到 MSI”。设备停止条件必须保证不再产生 message，随后 mask source、flush posted write、`synchronize_irq()`/`free_irq()`，最后释放 vector。若先释放 Linux IRQ，旧 message 可能命中已重用 vector；若只 mask PCI MSI-X 而 DMA queue 继续完成，PBA 会累积并在未来 unmask 形成错误事件。
+
+**参考资料**
+
+- [The MSI Driver Guide HOWTO](https://docs.kernel.org/PCI/msi-howto.html)
+- [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
+- [PCI-SIG Specifications](https://pcisig.com/specifications)
 
 ## 七、小结
 
-INTx 是共享电平事件，需要设备 deassert；MSI 用 Memory Write 触发；MSI-X 通过 BAR table 提供大量独立可 mask vector。Linux 用 `pci_alloc_irq_vectors` 统一申请并可能降级，`pci_irq_vector` 映射实际 IRQ，affinity 与队列设计共同决定扩展性。下一篇进入 DMA，解释中断到来前 descriptor 和数据如何在 CPU 与设备之间交接所有权。
+INTx 是共享电平语义，必须识别并撤销 source；MSI/MSI-X 是设备发出的 Memory Write，MSI-X 通过 Table/PBA 为多队列提供独立 vector。Linux 用 `pci_alloc_irq_vectors()` 和 `pci_irq_vector()` 统一管理能力与平台映射。
+
+可靠中断路径还依赖设备先发布 DMA completion、Host 使用正确内存屏障、handler 与 poll 分工、vector affinity 和 teardown 顺序。下一篇将深入中断前后的 DMA buffer 与 descriptor ownership。
