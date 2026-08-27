@@ -1,4 +1,4 @@
-export type SeriesId = 'cuda' | 'ee-system' | 'freertos' | 'rknn' | 'riscv' | 'fpga' | 'zephyr' | 'bsp' | 'usb' | 'pcie' | 'video-audio' | 'deep-learning';
+export type SeriesId = 'cuda' | 'ee-system' | 'freertos' | 'rknn' | 'riscv' | 'fpga' | 'zephyr' | 'bsp' | 'linux-driver' | 'usb' | 'pcie' | 'video-audio' | 'deep-learning';
 
 export interface SeriesMeta {
   id: SeriesId;
@@ -97,6 +97,16 @@ export const SERIES: Record<SeriesId, SeriesMeta> = {
     label: '板级开发',
     cover: { src: '/covers/bsp.webp', width: 1942, height: 809, alt: 'Linux BSP 开发实战系列封面' },
   },
+  'linux-driver': {
+    id: 'linux-driver',
+    title: 'Linux 驱动开发实战',
+    shortTitle: 'Linux Driver',
+    description: '从设备模型、内核资源与总线驱动，到存储、网络、USB、V4L2、ASoC 和驱动可靠性。',
+    accent: 'cyan',
+    href: '/linux-driver/',
+    label: '内核驱动',
+    cover: { src: '/covers/linux-driver.webp', width: 1942, height: 809, alt: 'Linux 驱动开发实战系列封面' },
+  },
   usb: {
     id: 'usb',
     title: 'USB 驱动开发实战',
@@ -139,4 +149,4 @@ export const SERIES: Record<SeriesId, SeriesMeta> = {
   },
 };
 
-export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'freertos', 'rknn', 'riscv', 'fpga', 'zephyr', 'bsp', 'usb', 'pcie', 'video-audio', 'deep-learning'];
+export const SERIES_ORDER: SeriesId[] = ['cuda', 'ee-system', 'freertos', 'rknn', 'riscv', 'fpga', 'zephyr', 'bsp', 'linux-driver', 'usb', 'pcie', 'video-audio', 'deep-learning'];

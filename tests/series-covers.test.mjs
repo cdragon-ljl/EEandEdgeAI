@@ -12,6 +12,7 @@ const covers = {
   fpga: [1921, 819],
   zephyr: [1923, 818],
   bsp: [1942, 809],
+  'linux-driver': [1942, 809],
   usb: [1919, 820],
   pcie: [1919, 820],
   'video-audio': [1920, 819],

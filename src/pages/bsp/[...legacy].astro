@@ -1,0 +1,71 @@
+---
+import { withBase } from '../../lib/paths';
+
+export function getStaticPaths() {
+  const redirects = {
+  'bsp-15-platform-device-model-and-probe': '/linux-driver/linux-driver-01-platform-device-model-and-probe/',
+  'bsp-16-first-kernel-module-and-char-device': '/linux-driver/linux-driver-02-first-kernel-module-and-char-device/',
+  'bsp-17-misc-sysfs-procfs-debugfs': '/linux-driver/linux-driver-03-misc-sysfs-procfs-debugfs/',
+  'bsp-18-gpio-led-subsystem': '/linux-driver/linux-driver-04-gpio-led-subsystem/',
+  'bsp-19-keys-interrupt-input-subsystem': '/linux-driver/linux-driver-05-keys-interrupt-input-subsystem/',
+  'bsp-20-timers-workqueues-delayed-work': '/linux-driver/linux-driver-06-timers-workqueues-delayed-work/',
+  'bsp-21-kernel-synchronization-primitives': '/linux-driver/linux-driver-07-kernel-synchronization-primitives/',
+  'bsp-22-i2c-regmap-sensor-driver': '/linux-driver/linux-driver-08-i2c-regmap-sensor-driver/',
+  'bsp-23-spi-driver-transfers': '/linux-driver/linux-driver-09-spi-driver-transfers/',
+  'bsp-24-uart-tty-console-driver': '/linux-driver/linux-driver-10-uart-tty-console-driver/',
+  'bsp-25-pwm-adc-watchdog': '/linux-driver/linux-driver-11-pwm-adc-watchdog/',
+  'bsp-26-dma-cache-coherency': '/linux-driver/linux-driver-12-dma-cache-coherency/',
+  'bsp-27-driver-debugging-methodology': '/linux-driver/linux-driver-13-driver-debugging-methodology/',
+  'bsp-28-linux-device-model-lifecycle': '/linux-driver/linux-driver-14-linux-device-model-lifecycle/',
+  'bsp-29-driver-memory-io-mapping': '/linux-driver/linux-driver-15-driver-memory-io-mapping/',
+  'bsp-30-pinctrl-gpio-irq-subsystem': '/linux-driver/linux-driver-16-pinctrl-gpio-irq-subsystem/',
+  'bsp-31-clock-reset-regulator-power-sequence': '/linux-driver/linux-driver-17-clock-reset-regulator-power-sequence/',
+  'bsp-32-iommu-dma-address-translation': '/linux-driver/linux-driver-18-iommu-dma-address-translation/',
+  'bsp-33-firmware-remoteproc-rpmsg': '/linux-driver/linux-driver-19-firmware-remoteproc-rpmsg/',
+  'bsp-34-rtc-nvmem-eeprom-efuse': '/linux-driver/linux-driver-20-rtc-nvmem-eeprom-efuse/',
+  'bsp-35-block-storage-emmc-sd': '/linux-driver/linux-driver-21-block-storage-emmc-sd/',
+  'bsp-36-mtd-ubi-nor-nand': '/linux-driver/linux-driver-22-mtd-ubi-nor-nand/',
+  'bsp-37-ethernet-mac-phy-netdev': '/linux-driver/linux-driver-23-ethernet-mac-phy-netdev/',
+  'bsp-38-usb-host-device-otg': '/linux-driver/linux-driver-24-usb-host-device-otg/',
+  'bsp-39-v4l2-imx415-mipi-csi': '/linux-driver/linux-driver-25-v4l2-imx415-mipi-csi/',
+  'bsp-40-alsa-asoc-i2s-audio': '/linux-driver/linux-driver-26-alsa-asoc-i2s-audio/',
+  'bsp-41-thermal-cpufreq-devfreq-pm': '/linux-driver/linux-driver-27-thermal-cpufreq-devfreq-pm/',
+  'bsp-42-reliability-performance-debug': '/linux-driver/linux-driver-28-reliability-performance-debug/',
+  'bsp-43-buildroot-rootfs-integration': '/bsp/bsp-15-buildroot-rootfs-integration/',
+  'bsp-44-startup-services-logs': '/bsp/bsp-16-startup-services-logs/',
+  'bsp-45-power-management-watchdog-hardening': '/bsp/bsp-17-power-management-watchdog-hardening/',
+  'bsp-46-kernel-maintenance-patch-management': '/bsp/bsp-18-kernel-maintenance-patch-management/',
+  'bsp-47-partition-ota-version-manufacturing': '/bsp/bsp-19-partition-ota-version-manufacturing/',
+  'bsp-48-end-to-end-product-demo': '/bsp/bsp-20-end-to-end-product-demo/',
+  } as const;
+
+  return Object.entries(redirects).map(([legacy, targetPath]) => ({
+    params: { legacy },
+    props: { targetPath, title: '文章已迁移' },
+  }));
+}
+
+interface Props { targetPath: string; title: string; }
+const { targetPath, title } = Astro.props;
+const target = withBase(targetPath);
+const canonicalURL = new URL(target, Astro.site);
+---
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="refresh" content={`0;url=${target}`} />
+    <link rel="canonical" href={canonicalURL} />
+    <title>{title}</title>
+    <script is:inline define:vars={{ target }}>window.location.replace(target);</script>
+  </head>
+  <body><main><h1>{title}</h1><p>文章已迁移到新的系列或编号。</p><a href={target}>前往新地址</a></main></body>
+</html>
+<style>
+  :global(body) { margin: 0; background: #fafafa; color: #111827; font-family: Inter, "Microsoft YaHei", sans-serif; }
+  main { margin: 18vh auto 0; max-width: 42rem; padding: 0 1.5rem; text-align: center; }
+  h1 { font-size: 1.5rem; line-height: 1.45; }
+  p { color: #6b7280; line-height: 1.7; }
+  a { color: #007aff; font-weight: 600; }
+</style>
