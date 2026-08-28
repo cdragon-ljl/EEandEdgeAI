@@ -7,87 +7,95 @@ order: 14
 tags: ["USB", "PCIe", "Linux Driver"]
 draft: false
 ---
-Linux USB 与 PCI 驱动都接入 driver core，也都有 probe/remove，但传给驱动的对象、可用资源和异步停止方式不同。把两套 API 强行一一对应容易误解；更有效的是比较对象生命周期。
+Linux USB 与 PCI 驱动都接入 Driver Core，也都有 ID table、probe 和 teardown callback。但传给驱动的对象、异步请求和硬件停止条件不同。有效比较应关注对象与所有权，而不是把 API 名字排成对照表。
 
 ## 一、被匹配的对象不同
 
-USB interface driver 的 probe 得到 `struct usb_interface`，通过 `interface_to_usbdev()` 访问共享 `usb_device`，再从 altsetting/endpoint 构造 URB。复合设备的不同 interface 可以绑定不同驱动。
+USB Interface Driver 的 probe 接收 `struct usb_interface *`。一个物理 `usb_device` 可包含多个 Interface，并由不同驱动分别绑定。驱动解析当前 Alternate 的 Endpoint，再提交 URB。
 
-PCI driver 的 probe 得到 `struct pci_dev`，代表一个 PCI function。它直接包含 Configuration Space、BAR resource、IRQ capability 和 DMA device。Multifunction device 的每个 function 有独立 `pci_dev`。
+PCI Driver 的 probe 接收 `struct pci_dev *`，通常对应一个 PCI Function。它拥有配置空间、BAR resource、MSI/MSI-X Capability 和 DMA requester identity。
 
-```text
-USB: usb_device -> usb_interface -> endpoint -> URB
-PCI: pci_bus -> pci_dev -> BAR / IRQ / DMA ring
+```mermaid
+flowchart TD
+    UI[USB Interface match] --> UP[USB probe]
+    UP --> UE[Parse endpoints and class descriptors]
+    UE --> UU[Submit URBs and publish class/userspace API]
+    UU --> UD[disconnect: stop resubmit and kill URBs]
+    PI[PCI Function pci_dev match] --> PP[PCI probe]
+    PP --> PR[Enable BAR, DMA, vectors and rings]
+    PR --> PU[Publish subsystem/userspace API]
+    PU --> PD[remove/reset: stop DMA and IRQ]
 ```
 
-## 二、probe 发布顺序体现总线资源
+因此 USB Driver 不能默认独占整个 Device；PCI Function Driver 也不能默认拥有同一 slot 的其他 Function/PF/VF。
 
-USB probe 的中心是 endpoint 与异步 request：解析 interface、分配 URB/buffer、建立私有对象、注册 class/char interface、开始接收。设备已由 usbcore 配置，driver 不负责 Host Controller enable。
+## 二、probe 的输入前提和发布顺序不同
 
-PCI probe 要显式 `pci_enable_device()`、request BAR、设置 DMA mask、`pci_set_master()`、iomap、分配 ring、vector/IRQ、启动设备。硬件仍可能 bus master访问内存，因此 stop 顺序更严格。
+USB probe 前，Host 已完成 EP0 枚举、设置 Configuration、解析 descriptor 并创建 Interface。probe 主要验证 Class/vendor 布局、Endpoint 和协议状态。
 
-两者共同原则是：内部状态完整后才发布用户入口，失败按反序回滚。
+PCI probe 前，Link/config scan、BDF、BAR sizing/resource 已完成，但 device decode、bus master、DMA mask、mapping、vector 和内部 ring 仍需驱动启用。
 
-## 三、URB 与 DMA descriptor 的所有权边界
+两者都应最后发布用户入口。USB 在 URB pool/设备协议就绪后 `usb_register_dev()`/注册子系统；PCI 在 BAR/DMA/IRQ/hardware READY 后注册 misc/net/block/accelerator。
 
-USB driver `usb_submit_urb()` 后，URB/buffer 归 usbcore/HCD 异步使用，completion 或 kill 后才能复用。Host Controller决定事务调度。
+| probe 阶段 | USB Interface Driver | PCI Function Driver |
+| --- | --- | --- |
+| 进入前 | 地址/配置/Interface 已建立 | BDF/BAR resource 已建立 |
+| 驱动验证 | Descriptor、Endpoint、Class/Vendor 协议 | Revision、BAR size、Capability、设备 ID |
+| 异步资源 | URB pool、anchor、wait queue | DMA ring、mapping、MSI-X、request table |
+| 硬件启动 | Class request/提交接收 URB | reset、ring base、queue enable、doorbell |
+| 发布入口 | tty/V4L2/block/char 等 | net/block/char/accelerator 等 |
 
-PCI driver 把 DMA descriptor 交给 Endpoint，`dma_wmb()` 后写 doorbell；设备写 completion并 MSI-X，Host `dma_rmb()` 后回收。DMA API 管地址/cache，设备 queue协议管 ownership。
+USB `probe()` 失败通常不影响其他 Interface；PCI Function probe 失败则该 Function 整体无驱动。复合设备/多 Function 的错误域不同。
 
-USB 的 anchor 与 PCIe request/ring table 都管理 in-flight 工作，但 anchor 由 USB core理解 URB；PCI ring 是设备专有 ABI，驱动必须自行定义 full、generation 和 reset。
+## 三、URB 与 DMA Descriptor 的所有权边界
 
-## 四、disconnect 与 remove 的硬件停止差异
+USB Interface Driver 把 URB 交给 usbcore/HCD，HCD 管理 Host Controller DMA。提交后 URB/buffer 直到 completion/kill 才归驱动。
 
-USB 拔出时 usbcore/HCD 会让 URB 以 shutdown/cancel 完成，driver disconnect 仍要阻止重提、kill anchors、撤销节点并等待 kref。设备已经物理消失，通常无法再发总线事务。
+PCI Driver 直接使用 DMA API map payload，把 DMA address 写入设备 descriptor，doorbell 后 Device 成为 owner，completion 后 unmap/recycle。
 
-PCIe remove 可能来自 unbind/hotplug，Endpoint 可能仍在 Link 上且 Bus Master Enable 打开。驱动必须先命令设备停止 DMA、mask IRQ、确认 quiescent，再清 bus master、释放 DMA/BAR。Surprise removal 时硬件无法响应，驱动仍要让软件 mapping/IRQ 收敛。
+USB 取消使用 unlink/kill/anchor；PCI 通常使用 queue abort/reset/generation。共同原则是：异步对象未收敛前不能释放 buffer/context。
 
-## 五、同步对象由回调上下文决定
+## 四、disconnect 与 remove/reset 的停止语义
 
-USB completion 和 PCI hardirq 都不能睡眠，适合自旋锁、状态提交和 wake/work；probe/disconnect/remove 与 file operation 可用 mutex。两者都需要引用计数管理用户打开对象，但 PCI mmap/DMA pinned pages 往往增加更长寿命。
+USB 外部拔出很常见。disconnect 清 intfdata、撤销用户入口、置 disconnected、`usb_kill_anchored_urbs()`、停止 RX pool，再由 kref/reference count 等待 open file。
 
-`usb_interface` 的 intfdata 与 `pci_dev` 的 drvdata只是找到私有对象，不自动保证对象还活着。kref/refcount、dead/disconnected 标志和停止异步工作仍需显式设计。
+PCI remove 需要先撤销入口、停止 queue/DMA、flush posted write、synchronize IRQ/work、unmap/free ring，再释放 BAR/device。AER/FLR 可能保留 `pci_dev` 并要求重建硬件，不一定执行 remove。
 
-## 六、Reference count 保护软件对象，不代表硬件仍可用
+两者的 reference count 都只保护软件内存，不证明硬件可访问。open fd 持有对象时，I/O 仍要检查 disconnected/dead/generation。
 
-USB driver常用 `usb_get_dev()/usb_put_dev()` 保护 `usb_device`，对私有对象用 `kref`；interface disconnect后对象可因open file继续存在，但所有 I/O检查 disconnected。URB anchor负责在途请求，不等于用户引用。
+一个容易混淆的迁移是“保留 open fd 穿过 reset”。USB reset 后同一个 `usb_interface` 可能继续存在，但 Endpoint/协议状态需恢复；PCI FLR 后 `pci_dev` 仍存在，但 BAR/queue/MSI-X 设备状态可能丢失。文件对象可保留，硬件请求必须在 READY 重新建立后才恢复。
 
-PCIe driver的 `pci_dev` 由device core管理，私有对象仍需 reference count保护open/VMA/work。Remove后即使内存还在，BAR已解除、DMA/IRQ已停，file operation必须返回dead。VMA引用只能延长payload内存，不能延长已拔出的硬件。
+## 五、同步、runtime PM 和错误回滚
 
-Reference count解决“何时释放软件内存”，stop/kill/synchronize解决“硬件何时不再访问”，两者缺一不可。
+USB completion 常在不可睡眠上下文，disconnect 与 completion/resubmit 竞争；PCI hard IRQ/poll 与 reset/remove 竞争。锁和状态机应围绕资源 ownership，而不是围绕 API 函数名。
 
-## 七、错误回滚与 managed resource 的边界
+USB runtime PM 常用 Interface autopm get/put，suspend 停 URB、resume 重提；PCI runtime PM 可能进入 D-state，保存/恢复配置与 ring。两者都必须阻止用户请求跨越未恢复硬件。
 
-USB probe失败反向释放endpoint buffer/URB、intfdata、注册节点和device引用；PCIe probe反向停止硬件、IRQ、DMA、BAR/region、master和enable。每个goto label只撤销已成功阶段。
+错误回滚均按获取逆序。devm/managed API 可以减少释放代码，但不能代替硬件 quiesce。测试要注入 probe 每个阶段失败，检查已取得资源是否收敛。
 
-`devm_*`/`pcim_*`减少机械释放，但不会自动让设备DMA quiescent；USB interface managed action同样不能阻止completion重提。Managed resource释放前仍要执行总线特定stop顺序。
+## 六、源码阅读入口与设计迁移
 
-错误注入应覆盖每个分配/注册阶段，确认没有残留sysfs节点、IRQ、URB、DMA mapping和reference。
+USB 从 `drivers/usb/core/driver.c`、`urb.c`、目标 class driver 进入；PCI 从 `drivers/pci/pci-driver.c`、`probe.c`、MSI/DMA/IOMMU 和目标驱动进入。
 
-## 八、电源管理和 reset 入口不同但目标相同
+把 USB 驱动迁到 PCIe 时，不能把 URB 换成 descriptor 就结束，还要新增 BAR/BusMaster/IOMMU/reset；把 PCIe 迁到 USB 时，不能让 Device 主动 DMA Host memory，要适应 Host schedule/Endpoint/Class。
 
-USB runtime PM 可能 autosuspend Device/interface、停止 URB并支持 remote wakeup；resume 后 endpoint/interface配置由 core/class协同。
+### 一份统一的 teardown 审计表
 
-PCI PM 保存 PCI state、设置 D-state，并在 resume/reset 后重建 BAR 内 queue/IRQ/DMA状态。FLR/AER recovery 可在 `pci_dev` 不消失时重置 function。
+1. 是否先撤销用户/子系统入口，阻止新 open/submit？
+2. 是否设置 dead/disconnected，并唤醒阻塞线程？
+3. 是否停止硬件产生新事件？
+4. 是否同步取消 URB 或停止 DMA queue？
+5. 是否等待 IRQ/completion/work/timer？
+6. 是否在最后异步访问结束后才释放 buffer/mapping/BAR？
+7. open fd/reference 最终是否收敛？
 
-两者都应把 start/stop/reinitialize 抽成内部状态机供 probe、resume、reset共享，避免每个回调复制不同资源顺序。
+USB 与 PCIe 的 API 不同，但这七项都必须回答。测试应在每个步骤插入延迟/故障，覆盖 teardown 竞态。
 
-## 九、用户接口和权限模型不能照搬
+**参考资料**
 
-USB标准Class通常通过TTY、Block、Input、V4L2、ALSA子系统提供成熟权限/ABI；Vendor设备可用usbfs/libusb或自定义driver。用户不能直接控制HCD ring。
+- [Linux USB Host Side API](https://docs.kernel.org/driver-api/usb/usb.html)
+- [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
 
-PCIe自定义设备常使用char/ioctl/mmap或VFIO。BAR/doorbell和DMA ring直接暴露会允许任意设备访问，必须限制offset、buffer ownership、IOMMU mapping和reset。VFIO以IOMMU group为安全边界。
+## 七、小结
 
-对两种总线，ABI都要定义版本、timeout、取消、拔出/reset后返回值和兼容性；“mmap零拷贝”不能替代权限与生命周期设计。
-
-## 十、代码阅读时从哪些入口进入
-
-USB：先找 `struct usb_driver`、id table、probe/disconnect，再追 endpoint helper、URB completion、anchor 和 file operation。
-
-PCIe：先找 `struct pci_driver`、probe/remove，再追 BAR register、DMA ring、MSI-X handler、timeout/reset 和用户接口。
-
-只看注册结构体只能证明驱动“挂上总线”，数据路径和寿命要沿回调闭合。
-
-## 十一、小结
-
-USB 驱动围绕 `usb_interface`、endpoint 和 URB，PCIe 驱动围绕 `pci_dev`、BAR、DMA 与 IRQ。两者共享 driver core 的 probe/remove 模式，却在硬件启用、异步所有权和拔出/停机上有不同责任。真正可迁移的能力是发布/回滚、引用计数和状态机思维，不是把一套 API 名称替换成另一套。
+USB 驱动围绕 `usb_interface`、Endpoint、URB 和 disconnect；PCIe 驱动围绕 `pci_dev`、BAR、DMA Ring、IRQ 和 remove/reset。两者共享 Driver Core 和“先停止异步硬件再释放对象”的原则，但资源和恢复单位不同。

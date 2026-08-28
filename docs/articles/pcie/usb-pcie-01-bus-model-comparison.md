@@ -7,92 +7,96 @@ order: 13
 tags: ["USB", "PCIe", "Linux Driver"]
 draft: false
 ---
-USB 和 PCIe 都由主机侧建立拓扑、发现设备并绑定驱动，但它们解决的问题不同。USB 面向可插拔外设和标准 Class，以 Host 调度 endpoint 传输；PCIe 面向内存语义的高速互连，以 Root Complex 路由 TLP、BAR、DMA 和消息中断。
+USB 和 PCIe 都能连接高速外设，也都支持设备发现、驱动绑定、热插拔和电源管理，但它们暴露给软件的基本抽象不同。USB 是 Host 调度的设备/Endpoint 传输总线；PCIe 是 Root Complex 路由、接近内存语义的点对点互连。
 
-本篇不重复两条主线细节，而是比较同一个工程问题在两种总线中由什么对象和协议承担。
+比较的目的不是判断谁“更先进”，而是理解为什么同一个工程问题在两条总线上要使用不同协议和驱动结构。
 
-## 一、Host 与 Root Complex 都是根，但控制粒度不同
+## 一、根节点的控制方式不同
 
-USB Host 控制总线时间。Device 不能任意发送事务，Host Controller 根据 control/bulk/interrupt/isochronous endpoint 调度 token。Hub 扩展端口，Device 是树叶。
+USB Host 拥有总线调度权，Device 只能响应 token。即使键盘“主动”上报，仍是 Host 周期性轮询 Interrupt Endpoint。Hub 扩展树，但不改变 Host 控制权。
 
-PCIe Root Complex 连接 CPU/内存与 fabric。Link 进入 L0 后，Endpoint 可以作为 requester 发 Memory Read/Write、MSI 等 TLP，Switch 按地址/BDF 路由。RC 不为每个 DMA packet轮询 endpoint。
+PCIe Root Complex 建立 fabric 与地址路由，Endpoint 可以作为 requester 主动发 DMA Memory Read/Write，也可以响应 CPU/RC 的 Memory/Configuration Request。PCIe Link 全双工并允许多个 outstanding transaction。
 
 ```mermaid
 flowchart LR
-    subgraph USB
-      UH[Host] --> HUB[Hub]
-      HUB --> UD[Device]
+    subgraph USB[USB control model]
+        UH[Host schedule] --> UE[Endpoint transaction]
+        UE --> UD[USB Device]
+        UD --> UE
     end
-    subgraph PCIe
-      RC[Root Complex] --> SW[Switch]
-      SW --> EP[Endpoint]
+    subgraph PCIE[PCIe transaction model]
+        RC[Root Complex] <--> EP[Endpoint]
+        RC <--> MEM[Host Memory]
+        EP <--> MEM
     end
 ```
 
-两者都支持 hotplug，但 USB 从设计上普遍假设频繁插拔；PCIe hotplug 需要 slot controller、power、PERST#、attention 与 OS 协同，很多嵌入式链路实际固定连接。
+因此 USB Device 无法任意选择总线发送时刻；PCIe Endpoint 则可在 credit/tag/ordering 允许时发起事务。
 
-## 二、枚举输入：描述符与配置空间
+## 二、发现输入是描述符与 Configuration Space
 
-USB Device 通过 EP0 `GET_DESCRIPTOR` 返回变长描述符树，Host 分配 USB address、选择 Configuration，并为 Interface 注册驱动对象。设备功能由 Device/Interface/Endpoint/Class descriptor 表达。
+USB Device 从地址 0 的 EP0 返回 Device/Configuration/Interface/Endpoint descriptor，Host 发送 `SET_ADDRESS`、`SET_CONFIGURATION`，再按 Interface class/ID 绑定驱动。
 
-PCIe function 的 Configuration Space 可由 BDF 访问，包含 VID/DID/Class、BAR 和 Capability。RC/PCI core 递归 bridge、分配 bus number 与 resource，再为 `pci_dev` 匹配驱动。
+PCIe Endpoint 在独立 Configuration Space 中提供 Vendor/Device/Class、Header、BAR 和 Capability。RC 按 BDF 探测，递归扫描 Bridge，分配 bus number、BAR 和 bridge window，再创建 `pci_dev`。
 
-USB 描述符由 Device 固件在控制传输中返回，可能短包/STALL；PCIe 配置空间由硬件/Endpoint Controller 响应 Configuration TLP。两者都会因格式错误无法绑定，但故障证据完全不同。
+USB 描述符更多表达功能协议与 Endpoint；PCIe 配置空间更多表达 Function 身份、地址资源和总线能力。USB Class 可直接决定用户 API，PCIe BAR 内部业务协议通常由设备/厂商定义。
 
-## 三、数据通道：Endpoint/URB 与 BAR/DMA Queue
+## 三、数据通道是 URB 与 BAR + DMA Queue
 
-USB endpoint 是由描述符声明的协议通道。Host driver 构造 URB 交给 usbcore/HCD，控制器按总线调度完成后回调。即使是 USB Device 向 Host 发数据，也要等 Host IN token。
+USB Host Driver 创建 URB，指定 pipe/Endpoint、buffer、length 和 completion，HCD 把它调度为 Control/Bulk/Interrupt/Isochronous transaction。带宽由 Host schedule 和 Endpoint 类型决定。
 
-PCIe BAR 是 Host 到设备的 MMIO 窗口，DMA 是 Endpoint 到内存的主动 transaction。高吞吐驱动常用 descriptor ring、doorbell、completion queue 和 MSI-X；设备在获得 DMA 地址后可主动读写。
+PCIe Driver 用 BAR/MMIO 配置设备，通过 DMA descriptor ring 发布 buffer，doorbell 通知设备，MSI-X 通知 completion。数据主体通常直接在 Host memory 与 Device 间搬运。
 
-因此 USB “interrupt endpoint”不是 CPU interrupt；PCIe MSI/MSI-X 才是设备通过 Memory Write 触发 IRQ。USB URB buffer 与 PCIe DMA buffer都需要异步生命周期，但 ownership 的调度者不同。
+USB 也可能使用 Host Controller DMA，但 DMA 地址由 HCD 管理，Interface Driver 看到 URB；PCIe Function 自己是 DMA requester，Function Driver 直接使用 Linux DMA API 管理 mapping。
 
-## 四、资源模型：带宽调度与地址空间
+## 四、资源、带宽和错误恢复单位不同
 
-USB periodic endpoint 受 frame/microframe 带宽、interval 和 max packet约束，Hub/TT 和 Host Controller 参与调度。Bulk 使用剩余带宽，追求可靠但无固定延迟。
+USB 资源包括 Device address、Interface、Endpoint、周期带宽、URB 和 Host Controller schedule。拔出时 `disconnect()` 需要 kill URB；reset/clear halt 常以 Device/Endpoint 为单位。
 
-PCIe 主要分配 bus number、BAR/bridge window、MSI vector 和 DMA IOVA。性能受 Link width/speed、MPS/MRRS、credit、outstanding 和内存系统影响。它不把每个 endpoint 带宽写成 Host 周期表。
+PCIe 资源包括 BDF、BAR/window、vector、DMA mapping、tag/credit 和 queue。remove/reset/AER recovery 需要停止 bus mastering/DMA、同步 IRQ、重建 ring/generation。
 
-USB 配置错误常见 endpoint/altsetting带宽不足；PCIe 资源错误常见 BAR aperture、MSI vector、DMA mask/IOMMU mapping。
+USB error recovery 常见 EP0 reset、Endpoint stall/clear、Class reset；PCIe error recovery 常见 Link retrain、FLR/hot reset、AER callback。两者都要求异步请求收敛，但硬件边界不同。
 
-## 五、调度与流控体现总线哲学
+## 五、hotplug、电源与安全模型不同
 
-USB Host Controller为 endpoint安排 frame/microframe，Device不能主动发 transaction。Bulk使用剩余带宽，interrupt/iso按 interval和bandwidth预留；NAK让 Host稍后重试。Hub/TT还会影响低全速设备调度。
+USB 从设计上强调外部热插拔和标准 Class。供电、端口 reset、suspend/resume、remote wakeup 是常见路径；用户随时拔线必须是驱动正常生命周期。
 
-PCIe Endpoint可主动发 Memory Read/Write，credit和tag限制 outstanding，Data Link replay保证相邻链路可靠。Queue/doorbell由设备协议定义，RC不逐请求轮询。PCIe backpressure表现为 credit、ring full、Completion延迟，USB则表现为 NAK、periodic带宽和URB调度。
+PCIe 也支持 hotplug，但很多嵌入式 Endpoint 固定焊接。Surprise removal 更危险，因为 Endpoint 可能正在 DMA。IOMMU group/IOVA 为 PCIe requester 提供隔离；USB Interface Driver 的 DMA 通常由 HCD 隔离管理。
 
-因此同样是“设备有数据”，USB Device准备IN endpoint等待Host token，PCIe Endpoint可DMA写Host内存后MSI-X。软件架构不能直接互换。
+USB Device 只能在 Host 安排的 buffer/transaction 中传输；PCIe Endpoint 具备更直接的 memory requester 能力，因此错误/恶意 DMA 的安全影响更大。
 
-## 六、功耗、安全和可访问范围
+## 六、如何选择
 
-USB设备通常受Host端口供电/功耗声明、autosuspend和remote wakeup控制，外接设备可频繁更换，Host应把描述符和payload当不可信输入。
+选择 USB：外部可插拔、跨平台标准 Class、线缆距离/供电/成本重要、Device 不需要共享内存式访问。选择 PCIe：板内/机内高吞吐低延迟、设备需要主动 DMA、多队列并发、BAR/MMIO 控制和高带宽扩展。
 
-PCIe设备常有更强DMA权限。IOMMU/domain/group、ACS和reset决定隔离；Bus Master Enable打开后，错误descriptor可直接破坏内存。PCIe runtime PM/ASPM/D-state也比单纯断电复杂。
+| 维度 | USB | PCIe |
+| --- | --- | --- |
+| 根控制者 | Host Controller 调度所有 transaction | RC 建立 fabric，Endpoint 可主动请求 |
+| 发现 | EP0 descriptor 与 Configuration | BDF、Configuration Space、Bridge scan |
+| 数据抽象 | Endpoint + Transfer + URB | Address + TLP + DMA Queue |
+| 通知 | Host 周期调度/URB completion | INTx/MSI/MSI-X message |
+| 资源 | Address、Interface、Endpoint、周期带宽 | BAR、window、tag/credit、vector、IOVA |
+| 热插拔 | 常规设计目标 | 平台可选，surprise removal 风险更高 |
+| 标准功能 | HID/CDC/MSC/UVC/UAC 等 Class | 配置机制标准，业务协议多由设备定义 |
+| 安全边界 | Device 只能响应 Host 安排传输 | Endpoint 可主动 DMA，需要 IOMMU 隔离 |
 
-MCU USB Device通过协议栈限制endpoint/buffer，Linux PCIe加速器则需要完整IOMMU和用户ABI安全模型。选择总线也要考虑攻击面和固件更新，不只看接口速率。
+### 同一个 AI/FPGA 设备如何做选择
 
-## 七、错误与恢复的基本单位不同
+若设备每次上传少量配置、下载结果，要求外接/跨平台且无需内核专用驱动，USB Bulk + vendor protocol/libusb 可能足够。Host 控制所有传输，固件实现 EP0 和有限 Endpoint，系统集成成本较低。
 
-USB 可在单个 URB 上报告 STALL、short packet、protocol error，也可 reset endpoint/device；拔出后 interface disconnect、在途 URB 被 shutdown/cancel。
+若设备持续访问大块 Host memory、需要多 queue/低 P99 和并行 outstanding，PCIe 更合适。它需要 BAR、DMA descriptor、MSI-X、IOMMU/reset 协议，硬件/驱动复杂度更高。
 
-PCIe 通过 Completion Status、AER、Link state、IOMMU fault 和设备 queue status报告。恢复可能是 queue reset、FLR、hot reset、secondary bus reset 或 slot power cycle。
+还可将 USB 用于维护/升级，PCIe 用于运行时数据；但两条通路必须有一致的 reset/firmware ownership，避免 USB 正在升级时 PCIe DMA 仍运行。
 
-USB 类协议常有自己的 reset（如 MSC BOT reset）；PCIe driver 也有设备自定义 reset。总线可靠不替代设备协议恢复。
+控制面可以 USB、数据面 PCIe；也可以 PCIe 控制 + 网络数据。关键是业务语义、带宽/延迟、拓扑、软件生态、热插拔和安全边界，而不是只比较峰值数字。
 
-### Error recovery 的触发和影响范围
+**参考资料**
 
-USB可针对 endpoint clear halt、取消单个URB、reset Device或重置Host端口；class还可执行BOT reset/UVC重新协商。拔出后对象重建，旧address/interface不能继续使用。
+- [USB 2.0 Specification - USB-IF](https://www.usb.org/document-library/usb-20-specification)
+- [PCI-SIG Specifications](https://pcisig.com/specifications)
 
-PCIe可进行queue abort、FLR、Function error recovery、Secondary Bus/Hot Reset或slot power cycle；AER回调可能在同一 `pci_dev` 上恢复。Reset范围可能影响同桥其他function/device，必须评估。
+## 七、小结
 
-两者都要求先停止异步访问、让completion/IRQ/work收敛，再释放/重建资源。固定sleep不是error recovery，恢复后要验证generation、mapping和用户状态。
+USB 以 Host/Endpoint/Transfer 为核心，PCIe 以 RC/Endpoint/Transaction/Address 为核心。Descriptor 与 Configuration Space、URB 与 DMA Ring、disconnect 与 remove/reset 不能机械一一对应。
 
-## 八、选择总线看设备行为，不只看峰值带宽
-
-需要低成本外接、线缆供电、标准 HID/MSC/UVC/UAC、跨 OS 即插即用，USB 更合适。需要低延迟 MMIO、大量主动 DMA、多队列和高带宽板内连接，PCIe 更合适。
-
-MCU 作为 Device/Host 常使用 USB，因为控制器和协议栈资源可控；NPU/FPGA/高速 NIC/SSD 常使用 PCIe。某些设备同时提供 USB 控制/兼容接口和 PCIe 高速数据接口，驱动要定义一致的固件与 reset 协议。
-
-## 九、小结
-
-USB Host 与 PCIe Root Complex 都建立主机侧拓扑，但 USB 用描述符、Interface、Endpoint 和 URB 实现 Host 调度的外设接入；PCIe 用配置空间、BAR、TLP、DMA 和 MSI-X 实现内存语义高速互连。比较两者时应围绕枚举、资源、数据所有权、hotplug 和错误恢复，而不是只用“USB 慢、PCIe 快”概括。
+下一篇从 Linux Driver Core 视角比较两类驱动对象和所有权迁移。
