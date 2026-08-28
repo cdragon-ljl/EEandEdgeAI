@@ -8,11 +8,11 @@ tags: ["Linux BSP", "miscdevice", "sysfs", "debugfs"]
 draft: false
 ---
 
-这一篇继续使用前两篇的板级设备，但任务从“让驱动工作”变为“让人能正确观察和控制它”。目标是给 `boardctl` 建立两层用户接口：量产服务只依赖稳定的控制/状态 ABI；开发人员在 debugfs 中查看详细统计和寄存器快照。
+cdev 是字符设备接入 VFS 的通用机制，miscdevice（misc）是在其上简化 minor/class/节点管理的便捷封装。sysfs 导出少量设备属性，debugfs 提供不稳定的开发诊断，procfs 主要表达进程/内核全局信息，不应成为任意驱动私有 ABI 的默认容器。
 
-把所有内容都塞进 `/proc`、sysfs 或 debugfs 是常见的早期做法。它通常能短期解决问题，却会混淆稳定性、权限和生命周期。本篇会先确定每种信息的去向，再逐步实现和验证。
+本篇继续使用 `boardctl`，先按消费者、数据形态、稳定性和权限选择接口，再实现用户操作和生命周期。量产服务只能依赖明确承诺的 ABI；临时寄存器/统计放在 debugfs，不能反向成为产品依赖。
 
-## 1. 先把每一类信息放到正确的位置
+## 一、为控制、数据、属性和诊断选择正确接口
 
 开始写文件前，列出用户态真正需要的内容。下面的表是本例的接口清单，后续代码都围绕它实现。
 
@@ -50,7 +50,7 @@ mount | rg 'sysfs|proc|debugfs'
 find /sys/kernel/debug -maxdepth 2 -type d | head -100 2>/dev/null
 ```
 
-## 2. 第一步：实现量产可用的 sysfs 控制面
+## 二、设计稳定、单值且有权限边界的 sysfs 属性
 
 本例为 `boardctl` 提供 `enabled`、`status`、`error_count` 三个属性。读者应把它们视为一组状态机接口，而不是几个独立文本文件：`enabled=1` 必须在资源、互斥关系和硬件允许时才成功；`status` 只报告当前快照；`error_count` 只报告累计结果。
 
@@ -139,7 +139,7 @@ static const struct attribute_group boardctl_group = {
 
 当前内核若未提供 `devm_device_add_group()`，使用工程已有的 `sysfs_create_group()`/`sysfs_remove_group()` 配对方式。无论哪种 API，属性回调与 remove 并发时都必须能识别 `dead` 状态，不能访问已经关闭的硬件。
 
-## 3. 第二步：为需要文件操作的场景选择 miscdevice 或 cdev
+## 三、用 cdev 或 miscdevice 承载专有文件操作
 
 第 16 篇已用 cdev 展示完整设备号路径。若一个驱动只需要单个小型字符设备，`miscdevice` 能省去 major/minor 和 class 的注册样板；它不会替你设计 read/write/poll、用户指针和离线语义。
 
@@ -191,7 +191,7 @@ sequenceDiagram
     M-->>U: 后续 I/O 得到 HUP 或 -ENODEV
 ```
 
-## 4. 第三步：只把诊断信息放进 debugfs/procfs
+## 四、把 debugfs/procfs 限制在诊断边界
 
 稳定控制面完成后，才添加调试面。debugfs 特意不承诺稳定 ABI，适合寄存器命名转储、队列深度、统计计数和受限故障注入；它不适合作为量产服务的依赖。
 
@@ -247,7 +247,7 @@ static int boardctl_regs_show(struct seq_file *s, void *unused)
 
 procfs 只在确实需要系统级或历史兼容输出时使用。长输出同样使用 `seq_file`，并让入口名、格式和生命周期被清楚记录；不要因为“/proc 很方便”就为每个设备复制一个私有目录。
 
-## 5. 第四步：在板端验证稳定性和生命周期
+## 五、验证 ABI、权限、并发和设备离线
 
 现在按照控制面、诊断面、离线三层完成测试，而不是只检查文件是否出现。
 
@@ -338,5 +338,15 @@ printf '0\n' > "$DEV/enabled"
 完成这篇后，驱动的用户出口就有了清晰边界：sysfs 负责少量、稳定、可脚本化的设备属性；字符设备负责专有 I/O；debugfs/procfs 提供诊断而不污染产品协议。以后增加接口时，先回到开头的表格判断归属，再动手写代码。
 
 提交前再次检查稳定接口的权限、默认值和错误码，确保用户态服务不依赖调试入口。
+
+**参考资料**
+
+- [sysfs - The filesystem for exporting kernel objects](https://docs.kernel.org/filesystems/sysfs.html)
+- [DebugFS](https://docs.kernel.org/filesystems/debugfs.html)
+- [The seq_file Interface](https://docs.kernel.org/filesystems/seq_file.html)
+
+## 六、小结
+
+字符设备适合 read/write/ioctl/poll 数据与命令，sysfs 适合少量稳定属性，debugfs 适合当前内核的开发诊断，procfs 只在其语义确实属于进程或全局内核信息时使用。接口的格式、权限、并发和离线行为一旦被用户依赖，就属于 ABI 设计。
 
 > 🏷️ 标签：Linux BSP、miscdevice、sysfs、procfs、debugfs、seq_file、驱动 ABI、设备生命周期

@@ -8,11 +8,11 @@ tags: ["Linux BSP", "Mutex", "Spinlock", "Completion", "Concurrency"]
 draft: false
 ---
 
-并发问题的难点不是记住 `mutex_lock()` 或 `spin_lock_irqsave()` 的名字，而是明确三个事实：数据可能被谁同时访问，当前上下文能不能睡眠，以及这次操作需要“互斥”“等待事件”还是“只保护一个计数”。
+同步设计先定义共享数据及其不变量，再选择原语。进程上下文中的长临界区通常使用 mutex；与硬中断共享的短状态使用 spinlock；独立计数/标志可使用 atomic，但 atomic 不会自动保护复合状态；一次性硬件就绪适合 completion；等待持续条件和事件队列使用 waitqueue。
 
-本篇构造一个共享设备状态：用户态可以读取/更新配置，IRQ 会产生事件，workqueue 读取硬件并更新缓存，启动路径还要等待一次硬件 ready。读者沿着这条路径选择同步原语，并用 lockdep、压力测试和退出测试验证。
+本篇用“用户配置 + IRQ 事件 + workqueue 状态 + 启动 ready”一个对象贯穿。每把锁都必须说明保护字段、可用上下文、锁顺序和 remove 时如何让等待者退出。
 
-## 1. 先画出共享数据和上下文
+## 一、从共享状态和执行上下文定义不变量
 
 在写锁之前先列出对象。假设设备私有结构如下：
 
@@ -54,7 +54,7 @@ flowchart TD
 
 不要用一个“大锁”把所有字段都包住。大锁可能让硬 IRQ 等待可睡眠锁，也会把不相关的快速统计和慢速总线访问串行化。先按上下文划分，再决定锁的粒度。
 
-## 2. 第一步：为进程上下文的配置选择 mutex
+## 二、用 mutex 保护可睡眠配置事务
 
 `mutex` 适合保护会睡眠、执行时间不可预测或需要保持一致性的配置事务。sysfs store、ioctl 和 worker 都可在进程上下文执行，可以用同一把 mutex 保护 `mode` 与相关硬件动作。
 
@@ -94,7 +94,7 @@ static int sync_demo_set_mode(struct sync_demo *demo, u32 mode)
 
 常见错误是使用 spinlock 保护整个寄存器访问，因为“驱动需要快”。如果寄存器访问可能睡眠，spinlock 会导致警告甚至死锁；如果只是保护一个已经读到内核内存的短状态，才考虑把硬件访问移出自旋锁。
 
-## 3. 第二步：为 IRQ 与事件队列选择 spinlock、atomic 和 waitqueue
+## 三、用 spinlock、atomic 与 waitqueue 连接 IRQ 和进程
 
 硬 IRQ 需要在不睡眠的前提下更新事件状态。自旋锁只保护短临界区，拿锁后不能调用 mutex、`copy_to_user()`、`msleep()` 或可能访问慢速总线的函数。
 
@@ -146,7 +146,7 @@ static ssize_t sync_demo_read(struct file *file, char __user *buf,
 
 waitqueue 可能被虚假唤醒，因此条件必须在返回后重新检查；事件标志的清除要与事件消费在同一个同步保护下完成。若用 poll/epoll，也应返回同一条件，不能另写一套“看起来可读”的判断。
 
-## 4. 第三步：用 completion 表达一次性硬件完成
+## 四、用 completion 表达一次性完成而非持续状态
 
 设备上电后等待 firmware、PLL 或外设发送一次 ready 信号，适合 `completion`。它表达的是“某件一次性事件完成”，不是通用互斥锁，也不适合代替持续状态条件。
 
@@ -184,7 +184,7 @@ static void sync_demo_ready_event(struct sync_demo *demo)
 
 必须在启动硬件前重置 completion，避免上一次使用留下的完成状态；等待必须有超时和退出错误。若同一设备可能多轮启动，要定义一轮 completion 对应哪个 generation，不能让旧 IRQ 完成新一轮等待。
 
-## 5. 第四步：验证锁顺序、退出路径和并发行为
+## 五、验证锁顺序、内存可见性和退出路径
 
 先画锁顺序图。假设配置路径持有 `config_lock` 后访问硬件，IRQ 只持有 `event_lock`；worker 可能先取得 event 状态再进入 config。必须统一顺序，避免 A 等 B、B 等 A。
 
@@ -349,5 +349,15 @@ cat /proc/interrupts
 这样并发问题才有可比较的边界。
 
 所有结论都应关联到一次可重放的测试。
+
+**参考资料**
+
+- [Locking lessons](https://docs.kernel.org/locking/locktypes.html)
+- [Atomic types](https://docs.kernel.org/core-api/wrappers/atomic_t.html)
+- [Completions](https://docs.kernel.org/scheduler/completion.html)
+
+## 六、小结
+
+同步原语不是性能偏好，而是共享状态、执行上下文和等待语义的结果。Mutex、spinlock、atomic、completion 与 waitqueue 不能互相机械替换；可靠性来自明确的不变量、统一锁顺序、正确内存可见性，以及 remove 时所有持锁者和等待者最终收敛。
 
 > 🏷️ 标签：Linux BSP、mutex、spinlock、atomic、completion、waitqueue、lockdep、并发

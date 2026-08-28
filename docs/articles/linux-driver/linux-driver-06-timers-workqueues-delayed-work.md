@@ -8,11 +8,11 @@ tags: ["Linux BSP", "Timer", "Workqueue", "Delayed Work"]
 draft: false
 ---
 
-定时器和 workqueue 不是“延时函数的不同写法”。它们解决的是两个先后问题：什么时候再次执行，以及在哪种执行上下文执行。一个中断处理函数需要读取可能睡眠的 I2C 传感器，一个驱动需要每秒刷新状态，一个设备 remove 时必须停止尚未执行的任务，这些场景都要求先回答上下文和生命周期问题。
+file_operations、probe 和普通内核线程通常运行在进程上下文，可以在规则允许时睡眠；硬中断必须快速且不能调用睡眠 API。timer 在软中断相关上下文触发，只适合短小、不可睡眠动作；workqueue 把工作放到内核 worker 的进程上下文；delayed work 则把延时触发与可睡眠执行组合起来。
 
-本篇完成一个小实验：收到硬件事件后只在 IRQ 中记录事实，把耗时处理交给 workqueue；同时用 delayed work 周期性读取状态；最后在 suspend/remove 时安全取消全部任务。
+本篇以 IRQ 事件和周期状态采样为例，说明 context 转换、排队、重入、取消以及 suspend/remove 收敛。选择机制前先回答“谁调用、能否睡眠、允许多大延迟、退出时谁等待”。
 
-## 1. 先确定任务发生在哪个上下文
+## 一、执行上下文决定允许的操作
 
 先把动作按“能否睡眠、是否要求精确时间、是否需要周期执行”分类。不要看到延迟需求就直接创建 timer。
 
@@ -52,7 +52,7 @@ struct demo_task {
 
 同一个状态可能同时被 IRQ、timer、worker 和用户态 sysfs 访问。先列出写者，再选择锁和原子变量；不要把 `volatile` 当并发保护。
 
-## 2. 第一步：把中断事件移到可睡眠的 workqueue
+## 二、从硬中断把耗时工作移到 workqueue
 
 假设设备 IRQ 到来后需要读取一个可能睡眠的状态寄存器，并更新用户态可读的计数。硬 IRQ 只确认事件、清除设备侧 pending 并排队工作。
 
@@ -111,7 +111,7 @@ flowchart TD
 
 选择专用 workqueue 还是 `system_wq` 也要有理由：普通、短小、不需要隔离的任务可使用系统队列；可能长时间占用 worker、需要顺序保证或需要限制并发的设备，创建专用队列并说明 `max_active`、是否 unbound。
 
-## 3. 第二步：用 delayed work 做周期任务，而不是在回调里忙等
+## 三、用 timer 或 delayed work 表达周期和超时
 
 周期读取适合 `delayed_work`：到期后由 timer 触发排队，真正的 work callback 在线程上下文运行。回调结束后根据设备状态重新安排下一次执行。
 
@@ -161,7 +161,7 @@ flowchart TD
 
 不要在 timer 回调中 `msleep()`、不要用 `while` 轮询等待硬件 ready，也不要用 workqueue 递归立即重排制造忙循环。每次重排都应有有限的延迟、停止条件和异常计数。
 
-## 4. 第三步：建立取消、suspend 和 remove 的退出协议
+## 四、取消、suspend 与 remove 的同步语义
 
 异步任务最容易出错的地方是退出。调用 `cancel_delayed_work()` 只保证尚未开始的任务被取消，已经在 worker 中运行的回调可能仍未结束；需要等待回调退出时使用同步版本。
 
@@ -192,7 +192,7 @@ static void demo_stop(struct demo_task *task)
 
 如果 timer/work 回调会重新排队，`stopping` 需要在每个重排点检查。硬件侧中断源也必须先关闭，否则 remove 在等待旧任务时仍会不断制造新任务。对共享 IRQ，先让设备停止产生中断，再同步 Linux handler，不能只依靠 `free_irq()`。
 
-## 5. 第四步：板端实验、并发观察与故障定位
+## 五、用 trace 和负载验证排队、重入与退出
 
 编写一个最小实验，让同一设备同时具备 IRQ work 和周期 delayed work。给每条路径打印单调递增计数、时间戳和当前停止状态，便于判断是事件丢失、周期漂移还是退出竞态。
 
@@ -351,5 +351,15 @@ static int demo_set_polling(struct demo_task *task, bool enable)
 再用实测结果确定周期预算。
 
 再决定周期是否需要调整。
+
+**参考资料**
+
+- [Workqueue](https://docs.kernel.org/core-api/workqueue.html)
+- [Driver Basics - Delays and sleeps](https://docs.kernel.org/driver-api/basics.html)
+- [Timer interfaces](https://docs.kernel.org/timers/index.html)
+
+## 六、小结
+
+timer 决定何时触发但不能承载睡眠工作，workqueue 提供可调度的进程上下文，delayed work 组合二者。可靠驱动还必须定义是否允许并发/重排，并在 suspend/remove 中使用同步取消证明所有 callback 已退出。
 
 > 🏷️ 标签：Linux BSP、timer、workqueue、delayed work、IRQ、异步任务、生命周期
