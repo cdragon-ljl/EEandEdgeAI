@@ -76,7 +76,7 @@ sequenceDiagram
     H->>E: SETUP: bmRequestType, bRequest, wValue, wIndex, wLength
     alt Request has data stage
         H->>E: OUT data packets
-        or Device returns data
+    else Device returns data
         E-->>H: IN data packets
     end
     H->>E: Status stage in opposite direction
