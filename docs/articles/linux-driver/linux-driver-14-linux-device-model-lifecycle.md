@@ -8,19 +8,13 @@ tags: ["Linux BSP", "Device Model", "sysfs", "devm"]
 draft: false
 ---
 
-前面的驱动实验已经使用过 platform_driver、probe、设备树和 sysfs。
+Linux Driver Core 用 `struct device` 表示一个被内核管理的设备实例，用 `struct device_driver` 表示可绑定的软件实现，再由 `struct bus_type` 管理同类设备与驱动。Bus 的 `match` 判断二者能否配对，成功后进入驱动 `probe`，解绑或设备消失时进入 remove。
 
-但如果只把这些 API 当作固定模板，遇到“节点存在却没有 driver link”“解绑后资源仍被占用”或“用户接口出现在意外目录”时，仍然无法判断问题属于哪一层。
+这组对象解决的是通用生命周期，不属于某一种硬件总线。Platform、I2C、SPI、USB、PCI 都建立在同一 Driver Core 上。sysfs 将对象关系导出，kobject/reference 维护内存寿命，class 从功能视角组织用户接口，devres 把资源释放绑定到 device。
 
-Linux 设备模型的价值，是让硬件、驱动、用户接口和资源释放都拥有可观察的对象关系。
+本篇使用一个 platform 设备作为可观察实例，但不展开 Device Tree 属性与 platform resource；这些内容放在下一篇。目标是先能回答“对象是谁、谁拥有它、何时 match/probe/remove、sysfs 为什么这样排列”。
 
-本章不从抽象定义开始堆概念。
-
-而是选择一个设备树描述的 platform 外设，沿着它从启动到解绑的完整生命周期观察 bus、device、driver、class、kobject 和 sysfs。
-
-最终目标是建立一张能用于真实 BSP 排查的对象地图。
-
-## 1. 先为一个硬件节点定义可观察的生命周期
+## 一、建立 device、driver、bus、class 与 kobject 地图
 
 选择一个不会影响启动 console、根文件系统、摄像头主链路或量产功能的实验节点。
 
@@ -133,7 +127,7 @@ flowchart TB
 
 理解这点后，sysfs 中看似重复的目录和符号链接就有了明确含义。
 
-## 2. 第一步：从运行时 DTB 跟踪到 device 与 driver 的绑定
+## 二、注册、match 与 probe 如何建立绑定
 
 设备树的 compatible 不是直接调用某个 C 函数的命令。
 
@@ -265,7 +259,7 @@ find /sys/class -maxdepth 2 -type l -lname "*actual-device-name*" -print
 
 同一个外设从不同视角出现，正是设备模型使用户态、总线和驱动能共享同一生命周期的结果。
 
-## 3. 第二步：在 probe 中把资源绑定到 struct device 的生命周期
+## 三、devres 把资源回收绑定到 struct device
 
 device model 的实际价值，在 probe 取得资源时最容易看见。
 
@@ -472,7 +466,7 @@ dev_dbg(dev, "resource ready: irq=%d\n", priv->irq);
 
 这种测试比只看一次正常 probe 更能验证 device 与资源真正绑定在同一生命周期上。
 
-## 4. 第三步：明确 remove、shutdown 与 PM 回调的责任边界
+## 四、remove、shutdown 与 PM 的责任边界
 
 probe 成功只是生命周期的开始。
 
@@ -584,7 +578,7 @@ if (ret)
 
 对于 regulator、DMA、固件或跨子系统对象，也应逐项确认获取、启用、停止和释放分别属于谁。
 
-## 5. 第四步：用 sysfs、class 与解绑回归验证对象没有泄漏
+## 五、用 sysfs、class 与解绑验证对象生命周期
 
 kobject 是 device、driver、bus 和 class 能出现在 sysfs 中的共同基础。
 
@@ -766,5 +760,15 @@ flowchart TD
 - 如何通过一次安全的 unbind/rebind 验证资源、sysfs 接口和对象引用没有泄漏。
 
 当这些对象关系能在运行时 sysfs、日志和回归实验中被验证，设备模型就不再是抽象名词，而是驱动开发最可靠的定位地图。
+
+**参考资料**
+
+- [The Linux Kernel Driver Model](https://docs.kernel.org/driver-api/driver-model/overview.html)
+- [Device drivers infrastructure](https://docs.kernel.org/driver-api/infrastructure.html)
+- [Driver Binding](https://docs.kernel.org/driver-api/driver-model/binding.html)
+
+## 六、小结
+
+Driver Core 通过 device、driver 和 bus 建立匹配与生命周期，通过 kobject/reference 保证对象内存，通过 class/sysfs 提供功能和观测视角，通过 devres 绑定资源回收。下一篇会把这个通用模型应用到 Device Tree 和 platform bus，解释具体硬件节点如何变成可 probe 的设备。
 
 > 🏷️ Linux BSP · device model · platform bus · sysfs · kobject · class · devm · 驱动生命周期

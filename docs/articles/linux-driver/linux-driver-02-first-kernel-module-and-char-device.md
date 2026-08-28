@@ -8,11 +8,63 @@ tags: ["Linux BSP", "Kernel Module", "Character Device"]
 draft: false
 ---
 
-这一篇的目标不是让 `/dev/boardctl0` 出现，而是完成一个可被用户态稳定使用的字符设备。读者会先定义接口，再让内核把设备号、cdev 和文件操作连接起来，最后用用户态程序验证正常、异常和卸载场景。
+应用程序运行在用户空间，通过系统调用请求内核服务；驱动运行在内核空间，拥有更高权限，也必须承担越界、并发和资源泄漏的系统级后果。学习驱动的第一步应先理解一个可加载模块如何进入/离开内核，再建立 Kbuild 编译关系，随后才把字符设备注册到 VFS，并用 `file_operations` 定义用户 ABI。
 
-示例设备名为 `boardctl`。它代表一个简单的板级控制接口，而非某个真实 SoC 外设。后续把它并入 platform driver 时，只需把“模块全局实例”替换为“每个 platform_device 一份实例”，接口和验证思路不变。
+本篇完成一个不依赖真实 SoC 寄存器的 `boardctl` 示例。它用于验证模块、设备号、cdev、用户数据复制、poll 和卸载语义。下一篇建立 Device Model，第三篇再把这个实例放进 platform probe。
 
-## 1. 开始前先写出 ABI，而不是先注册模块
+## 一、从内核空间、模块到 Kbuild
+
+内核模块是可在运行时装入内核的目标文件。它与用户程序共享 C 语言语法，但不能链接 libc，使用内核导出的符号和内核执行上下文。模块错误可能直接导致 kernel oops，因此所有输入、引用和退出路径都必须显式管理。
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+
+static int __init boardctl_init(void)
+{
+    pr_info("boardctl: init\n");
+    return 0;
+}
+
+static void __exit boardctl_exit(void)
+{
+    pr_info("boardctl: exit\n");
+}
+
+module_init(boardctl_init);
+module_exit(boardctl_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("boardctl learning driver");
+```
+
+`module_init()`/`module_exit()` 注册加载与卸载入口；`__init` 允许内核在初始化完成后回收只用于 init 的代码；模块 init 返回非零表示加载失败，已经取得的资源必须在返回前撤销。
+
+外部模块由 Kbuild 使用目标内核的配置、编译器参数和生成头文件编译：
+
+```make
+obj-m += boardctl.o
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+all:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
+```
+
+板端内核与模块的 `vermagic`、架构和配置必须一致。`modinfo boardctl.ko` 查看元数据，`insmod` 直接加载文件，`modprobe` 通过 modules.dep/alias 解析依赖。第一个实验只验证 init/exit 与日志，确认工具链和目标内核一致后再增加字符设备资源。
+
+```mermaid
+flowchart LR
+    SRC[boardctl.c + Kbuild] --> MOD[boardctl.ko]
+    MOD --> LOAD[insmod or modprobe]
+    LOAD --> INIT[module init]
+    INIT --> LIVE[module symbols and resources live]
+    LIVE --> EXIT[module exit after references reach zero]
+```
+
+## 二、先写出 ABI，而不是先注册字符设备
 
 字符设备是用户态与内核之间的长期边界。先判断字符设备是否合适：若是按键、LED、传感器或网络功能，优先使用 input、LED、IIO、netdev 等标准子系统；若确实需要专有命令、数据读取或事件等待，才设计自己的字符设备。
 
@@ -63,7 +115,7 @@ flowchart LR
     E --> F["返回字节数或 errno"]
 ```
 
-## 2. 第一步：建立每个设备实例的内核对象
+## 三、建立每个设备实例的内核对象
 
 不要把状态写成一组全局变量。一个字符设备需要把 cdev、同步对象、等待队列、硬件状态和在线状态绑定到同一个实例。这样后续支持两个外设、driver unbind 或多个打开者时，数据不会串在一起。
 
@@ -153,7 +205,7 @@ static int boardctl_create_node(struct boardctl_dev *bdev,
 
 失败路径的顺序必须反过来：`device_destroy()`、`class_destroy()`、`cdev_del()`、`unregister_chrdev_region()`。每完成一个注册动作就考虑它如何撤销，避免加载失败时留下节点或号码。
 
-## 3. 第二步：实现 file_operations，并统一事件模型
+## 四、实现 file_operations，并统一事件模型
 
 用户态的 `open/read/write/ioctl/poll` 经 VFS 分发到 fops。它们运行于进程上下文，可以睡眠，但必须验证用户指针、保护共享状态，并在设备离线时返回可理解的错误。
 
@@ -254,7 +306,7 @@ static long boardctl_ioctl(struct file *file, unsigned int cmd,
 }
 ```
 
-## 4. 第三步：编译、加载并从用户态验证 ABI
+## 五、编译、加载并从用户态验证 ABI
 
 外部模块必须针对目标内核的构建输出编译，而不是使用开发主机正在运行的内核头文件。路径、架构和交叉编译器按当前 SDK 修改。
 
@@ -300,7 +352,7 @@ dmesg -wT
 
 把用户态测试输出与内核日志配对保存。例如 write 返回 16 字节但硬件未动作，应回到 `boardctl_apply_request()`、锁、PM/clock 与寄存器写入结果，而不是先怀疑 `/dev` 节点。
 
-## 5. 第四步：处理离线、卸载和常见失败
+## 六、处理离线、卸载和常见失败
 
 设备节点删除后，已经打开它的进程仍可能调用 read/write/ioctl。remove 或 module exit 必须先阻止新事务，唤醒所有等待者，再同步停止 IRQ、timer 和 workqueue，最后注销节点和释放私有数据。
 
@@ -337,6 +389,16 @@ dmesg -T | tail -120
 | read 卡住或 poll 占 CPU | 等待条件和 wakeup | 事件状态不一致或忙轮询 |
 | rmmod busy/崩溃 | 打开 fd、异步工作、对象引用 | remove 与 release 没有闭合 |
 
-完成本篇后，把 `boardctl` 接进第 15 篇的 platform driver：在 `probe()` 中分配实例、获取硬件资源并创建设备节点；在 `remove()` 中按本节顺序撤销。这样一个字符设备就不再是孤立的模块演示，而是板级外设的完整用户接口。
+完成本篇后，把 `boardctl` 接进新顺序第 3 篇的 platform driver：在 `probe()` 中分配实例、获取硬件资源并创建设备节点；在 `remove()` 中按本节顺序撤销。这样字符设备就不再是孤立的模块演示，而是板级外设的完整用户接口。
+
+**参考资料**
+
+- [Linux Kernel Module Programming - Building External Modules](https://docs.kernel.org/kbuild/modules.html)
+- [Linux Device Drivers Infrastructure](https://docs.kernel.org/driver-api/infrastructure.html)
+- [Character devices in the Linux kernel](https://docs.kernel.org/core-api/kernel-api.html)
+
+## 七、小结
+
+第一个驱动实验应先证明模块能被目标内核正确加载和卸载，再通过 Kbuild、设备号、cdev 和 `file_operations` 建立稳定用户 ABI。内核对象、用户输入和异步事件必须在卸载前收敛；下一篇将用 Driver Core 解决“设备实例和驱动如何匹配并管理生命周期”。
 
 > 🏷️ 标签：Linux BSP、kernel module、character device、cdev、file_operations、ioctl、poll、UAPI

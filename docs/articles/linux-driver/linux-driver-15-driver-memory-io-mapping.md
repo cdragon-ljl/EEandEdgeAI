@@ -8,23 +8,11 @@ tags: ["Linux BSP", "Memory Management", "I/O Mapping", "MMIO"]
 draft: false
 ---
 
-驱动里的“地址”至少有四种语义。
+CPU 通过虚拟地址访问内核 RAM；`kmalloc` 等 allocator 返回满足特定上下文和连续性需求的内核指针。用户地址不能直接解引用，驱动通过 `copy_to_user`/copy_from_user 跨越地址空间。设备寄存器先由总线提供 `resource`，再经 `ioremap`/devm_ioremap_resource 建立 `__iomem` 映射，最终使用 `readl`/writel 等 accessor。
 
-内核 C 指针用于访问普通 RAM。
+DMA address 属于另一条路径：它由 DMA API 返回给设备使用，不能由 CPU virtual/physical address 手工换算。本篇只建立边界，第 17/18 篇分别深入 DMA 与 IOMMU。
 
-__iomem 指针用于访问设备寄存器。
-
-DMA 地址用于告诉硬件从哪里读写内存。
-
-用户指针则来自一个不可信、可随时失效的地址空间。
-
-它们在部分 SoC 或简单测试中可能看起来数值接近，但绝不能互相替代。
-
-本章以一个 platform 外设的只读 ID 寄存器和一个受控用户读写接口为例，建立从 DTS 资源、内核分配、MMIO 访问到 usercopy 的完整边界。
-
-DMA 数据路径已在前文单独展开，本章只明确它为什么不能与普通物理地址混用。
-
-## 1. 先画出每一类内存和地址的访问边界
+## 一、区分 RAM、用户地址、MMIO 与 DMA 地址
 
 开始写驱动前，先把数据属于谁、CPU 应如何访问、硬件应如何访问写清楚。
 
@@ -131,7 +119,7 @@ flowchart LR
 - 用户态获得的是 copy_to_user 复制出的受控数据；
 - 错误输入、unbind 与重绑不出现引用、映射或资源残留。
 
-## 2. 第一步：按执行上下文选择内核内存分配方式
+## 二、按执行上下文和布局选择内核内存
 
 内核分配器的选择首先由对象大小、物理连续性需求、执行上下文和释放生命周期决定。
 
@@ -263,7 +251,7 @@ devm 分配的对象通常不应再手工 kfree。
 
 将分配失败纳入测试：在 debug build 中限制队列大小或让一次可选缓存分配失败，验证用户态获得明确错误且驱动状态仍然一致。
 
-## 3. 第二步：从 DTS 的 reg 资源安全映射到 MMIO
+## 三、从总线 resource 安全映射并访问 MMIO
 
 设备树中的 reg 描述的是硬件资源，不是可以被普通 C 指针直接访问的内核地址。
 
@@ -415,7 +403,7 @@ flowchart TD
     F -- 是 --> H[检查访问权限和寄存器协议]
 ```
 
-## 4. 第三步：在内核与用户态之间复制数据，而不是传递指针
+## 四、用 usercopy 和 mmap 管理用户边界
 
 用户态传入的地址只在当前进程的虚拟地址空间中有意义。
 
@@ -545,7 +533,7 @@ mmap 可用于高吞吐共享缓冲区，但需要页生命周期、权限、cac
 
 视频、显示和推理大 buffer 更应使用 V4L2、DRM、DMA-BUF 或厂商 runtime 的既有路径，而不是为一个普通 char driver 手写物理页映射。
 
-## 5. 第四步：用地址记录、错误路径和解绑回归完成验收
+## 五、用错误路径和解绑验证资源生命周期
 
 内存与 I/O 问题不能只靠“没有崩溃”验收。
 
@@ -706,5 +694,15 @@ flowchart TD
 - 如何用错误路径和 unbind/rebind 证明内存与 I/O 资源没有泄漏。
 
 把地址看成带访问规则和生命周期的能力，而不是一个整数，驱动中的内存问题才会变得可推理、可复现。
+
+**参考资料**
+
+- [Memory Allocation Guide](https://docs.kernel.org/core-api/memory-allocation.html)
+- [Bus-Independent Device Accesses](https://docs.kernel.org/driver-api/device-io.html)
+- [How to get printk format specifiers right - address types](https://docs.kernel.org/core-api/printk-formats.html)
+
+## 六、小结
+
+普通 RAM、用户地址、MMIO 和 DMA address 是不同能力。Allocator 与 GFP flags 受执行上下文约束；用户数据通过 usercopy；寄存器通过 resource/ioremap/I/O accessor；DMA 地址只能来自 DMA API。明确这些边界后，后续字符接口、外设总线和 DMA 驱动才能安全组合。
 
 > 🏷️ Linux BSP · kmalloc · vmalloc · MMIO · ioremap · readl · usercopy · DMA 地址

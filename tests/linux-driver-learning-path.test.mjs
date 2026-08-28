@@ -36,7 +36,24 @@ const learningPath = [
   ['linux-driver-28-reliability-performance-debug.md', 28, '长稳'],
 ];
 
-const qualityContractFiles = new Set();
+const qualityContractFiles = new Set([
+  'linux-driver-02-first-kernel-module-and-char-device.md',
+  'linux-driver-14-linux-device-model-lifecycle.md',
+  'linux-driver-01-platform-device-model-and-probe.md',
+  'linux-driver-15-driver-memory-io-mapping.md',
+]);
+const introOrder = {
+  'linux-driver-02-first-kernel-module-and-char-device.md': ['内核空间', '模块', 'Kbuild', '字符设备', 'file_operations'],
+  'linux-driver-14-linux-device-model-lifecycle.md': ['struct device', 'struct device_driver', 'struct bus_type', 'match', 'probe'],
+  'linux-driver-01-platform-device-model-and-probe.md': ['Device Tree', 'platform_device', 'of_match_table', 'probe', 'devm_'],
+  'linux-driver-15-driver-memory-io-mapping.md': ['虚拟地址', 'kmalloc', 'copy_to_user', 'resource', 'ioremap', 'readl'],
+};
+const diagramMinimum = new Map([
+  ['linux-driver-02-first-kernel-module-and-char-device.md', 2],
+  ['linux-driver-14-linux-device-model-lifecycle.md', 3],
+  ['linux-driver-01-platform-device-model-and-probe.md', 3],
+  ['linux-driver-15-driver-memory-io-mapping.md', 3],
+]);
 const officialSourcePattern = /https:\/\/(?:docs\.kernel\.org|www\.kernel\.org|git\.kernel\.org|github\.com\/torvalds\/linux|devicetree-specification\.readthedocs\.io)/gi;
 
 function bodyOf(file) {
@@ -77,11 +94,25 @@ test('Framework uses valid Mermaid and lists articles in display order', () => {
 test('rewritten articles no longer use the shared five-step template', () => {
   for (const file of qualityContractFiles) {
     const body = bodyOf(file);
-    const stepHeadings = body.match(/^## .*第[一二三四]步/gm) ?? [];
+    const prose = body.replace(/```[\s\S]*?```/g, '');
+    const stepHeadings = prose.match(/^## .*第[一二三四]步/gm) ?? [];
     assert.ok(stepHeadings.length < 4, `${file} still uses the shared four-step H2 template`);
-    assert.doesNotMatch(body, /^# /m, `${file} must not repeat its title as H1`);
-    assert.doesNotMatch(body, /TBD|TODO|初学者扩展讲解/);
+    assert.doesNotMatch(prose, /^# /m, `${file} must not repeat its title as H1`);
+    assert.doesNotMatch(prose, /TBD|TODO|初学者扩展讲解/);
     assert.ok((body.match(officialSourcePattern) ?? []).length >= 2, `${file} needs two official primary sources`);
+    assert.ok((body.match(/```mermaid\r?\n/g) ?? []).length >= diagramMinimum.get(file), `${file} needs its required diagrams`);
+  }
+});
+
+test('rewritten foundation articles introduce concepts in dependency order', () => {
+  for (const [file, topics] of Object.entries(introOrder)) {
+    const body = bodyOf(file);
+    let previous = -1;
+    for (const topic of topics) {
+      const current = body.indexOf(topic);
+      assert.ok(current > previous, `${file} must introduce ${topic} after its prerequisites`);
+      previous = current;
+    }
   }
 });
 

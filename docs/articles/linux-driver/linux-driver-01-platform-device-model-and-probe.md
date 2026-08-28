@@ -8,11 +8,11 @@ tags: ["Linux BSP", "Platform Driver", "Driver Model"]
 draft: false
 ---
 
-这一篇不把 platform driver 拆成许多彼此独立的概念，而是完成一个明确任务：让一个板级外设从 DTS 节点变成已绑定、可工作的 Linux 设备，并且在失败时能够判断问题停在哪一步。
+Device Tree 用节点和属性描述板上不可自动发现的硬件。内核解析最终 DTB 后，为合适节点创建 `platform_device`；platform bus 用驱动的 `of_match_table` 匹配 compatible，成功后调用 `probe`。Probe 再通过 `devm_` resource API 取得 MMIO、IRQ、clock、reset、GPIO 和 regulator。
 
-示例使用一个带 MMIO、时钟、复位、GPIO 和 IRQ 的假想外设 `board-alert`。地址、时钟 ID、IRQ、GPIO 和寄存器位必须从当前 SoC 的 binding、原理图和 SDK 获取；文中的尖括号是需要替换的硬件事实，不是可直接量产的数值。
+本篇沿这条具体路径完成一个假想 `board-alert` 外设。地址、时钟 ID、IRQ、GPIO 和寄存器位必须来自当前 SoC binding、TRM 和原理图；示例只展示关系与生命周期，不提供可直接量产的虚构数值。
 
-## 1. 本次学习要完成什么
+## 一、目标：证明 DT 节点最终成为可工作的设备
 
 完成后，你应能在同一块开发板上证明下面这条链路每一段都成立：
 
@@ -47,7 +47,7 @@ find /sys/bus/platform/devices -maxdepth 1 -type l -printf '%f\n' | sort > /tmp/
 
 platform bus 的匹配不是 driver 自己调用 `probe()`。设备实例和驱动无论谁先注册，总线都会按自身规则尝试绑定；在 Device Tree 系统中，`compatible` 是匹配契约，节点名只用于阅读和定位。这一点决定了后面的排错顺序：先证明 device 已创建，再讨论 probe 内部。
 
-## 2. 第一步：把硬件事实写入 DTS，并证明设备已经创建
+## 二、从 DTS、DTB 到 platform_device
 
 先从当前 SDK 寻找最相近的 binding 与驱动，确认每一个属性名字的来源。不要照搬别的 SoC 或网页示例里的 `clock-names`、GPIO 名称和 interrupts cell 数量。
 
@@ -120,7 +120,7 @@ flowchart TD
     E -- "是" --> G["进入 probe 资源与功能检查"]
 ```
 
-## 3. 第二步：完成匹配与 probe 的资源初始化
+## 三、of_match_table、probe 与资源初始化
 
 设备创建成功后，驱动才能匹配。先写清楚 `of_match_table`，并把硬件版本差异放进 match data，而不是在 probe 中散落字符串比较。
 
@@ -231,7 +231,7 @@ flowchart TD
     B -- "否" --> G["保留 errno，按属性/资源类别定位"]
 ```
 
-## 4. 第三步：在板端证明 probe 以后硬件真的可用
+## 四、从 sysfs、寄存器和中断证明硬件可用
 
 一次 “probe success” 只证明代码走到了末尾，不证明外设可以通信。现在按对象关系、资源状态、真实硬件事件三层验证。
 
@@ -287,7 +287,7 @@ find /sys -path '*<actual-device-name>*' -type f 2>/dev/null | head -100
 | IRQ 前后计数或波形 | 事件线路真实工作 |
 | 子系统或用户态结果 | 功能可被上层消费 |
 
-## 5. 第四步：把失败、解绑和回归变成固定流程
+## 五、deferred probe、错误回滚与解绑回归
 
 当 bring-up 失败时，按以下顺序定位，不要在 DTS、driver 和用户态之间来回猜：
 
@@ -339,5 +339,15 @@ flowchart TD
 6. 做一次受控 unbind/bind，确认不会留下活跃 IRQ、重复注册节点或 use-after-free。
 
 完成这条路径后，你获得的不是一段“能 probe”的代码，而是一套可迁移到 GPIO、I2C、SPI、PWM、媒体和复杂 SoC 外设的定位方法：每一次都先证明设备描述，再证明匹配，再证明资源，最后证明物理行为。
+
+**参考资料**
+
+- [Platform Devices and Drivers](https://docs.kernel.org/driver-api/driver-model/platform.html)
+- [Devicetree Usage](https://docs.kernel.org/devicetree/usage-model.html)
+- [Device drivers infrastructure](https://docs.kernel.org/driver-api/infrastructure.html)
+
+## 六、小结
+
+Platform Driver 把不可自动发现的板级硬件接入 Driver Core：Device Tree 提供事实，OF population 创建 platform_device，of_match_table 完成匹配，probe 获取并启用资源，deferred probe 等待依赖。可靠 bring-up 必须同时证明运行时 DT、对象绑定、寄存器/IRQ 和 remove 回滚。
 
 > 🏷️ 标签：Linux BSP、platform device、platform driver、Device Tree、probe、deferred probe、sysfs、devres
