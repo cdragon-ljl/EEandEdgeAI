@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #01 · platform 设备模型与 probe 机制"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #03 · Device Tree、platform 设备与 probe"
 description: "按一次完整 bring-up 路径，从 DTS 节点、匹配、probe 到板端验证，掌握 platform driver 的开发和排错方法。"
 pubDate: "2026-08-14"
 series: linux-driver
-order: 1
+order: 3
 tags: ["Linux BSP", "Platform Driver", "Driver Model"]
 draft: false
 ---

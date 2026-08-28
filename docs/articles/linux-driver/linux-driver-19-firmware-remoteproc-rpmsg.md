@@ -1,5 +1,5 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #19 · 固件加载、remoteproc 与 rpmsg"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #19 · firmware、remoteproc 与 rpmsg"
 description: "以 Linux 与一个实时协处理器共同控制的板级服务为主线，建立 firmware、remoteproc、virtio/rpmsg 与崩溃恢复的完整生命周期。"
 pubDate: "2026-08-16"
 series: linux-driver

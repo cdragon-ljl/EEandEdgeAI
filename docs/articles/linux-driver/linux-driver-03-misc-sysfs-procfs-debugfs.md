@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #03 · misc、sysfs、procfs 与 debugfs"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #05 · cdev、misc、sysfs、procfs 与 debugfs"
 description: "围绕一个板级驱动，按稳定控制面和诊断面分层设计 sysfs、miscdevice、procfs 与 debugfs。"
 pubDate: "2026-08-14"
 series: linux-driver
-order: 3
+order: 5
 tags: ["Linux BSP", "miscdevice", "sysfs", "debugfs"]
 draft: false
 ---

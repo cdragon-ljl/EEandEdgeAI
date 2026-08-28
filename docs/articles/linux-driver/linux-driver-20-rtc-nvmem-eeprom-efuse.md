@@ -1,5 +1,5 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #20 · RTC、NVMEM、EEPROM 与 eFuse 板级信息管理"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #20 · RTC、NVMEM、EEPROM 与 eFuse"
 description: "以可追溯的板级身份记录为主线，建立 MAC、序列号、校准参数、RTC 与 OTP/eFuse 的存储边界和量产验证流程。"
 pubDate: "2026-08-16"
 series: linux-driver

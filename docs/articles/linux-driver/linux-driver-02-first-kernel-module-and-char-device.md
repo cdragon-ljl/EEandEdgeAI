@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #02 · 第一个内核模块与字符设备"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #01 · 内核模块、Kbuild 与字符设备入门"
 description: "按 ABI 设计、内核实现、用户态测试和卸载回归的顺序，完成一个可维护的字符设备。"
 pubDate: "2026-08-14"
 series: linux-driver
-order: 2
+order: 1
 tags: ["Linux BSP", "Kernel Module", "Character Device"]
 draft: false
 ---

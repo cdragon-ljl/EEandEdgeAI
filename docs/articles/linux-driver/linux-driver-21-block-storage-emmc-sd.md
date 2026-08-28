@@ -1,5 +1,5 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #21 · 块设备、eMMC 与 SD 存储链路"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #21 · Block、eMMC 与 SD"
 description: "以一次可靠写入与重新启动验证为主线，理解 Linux 块层、eMMC/SD 控制器、分区、文件系统与掉电一致性的边界。"
 pubDate: "2026-08-16"
 series: linux-driver

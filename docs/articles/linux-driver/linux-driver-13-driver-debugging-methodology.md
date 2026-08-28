@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #13 · 驱动调试方法论"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #08 · 驱动调试方法论：从现象到证据"
 description: "用健康基线、最小实验和软硬件证据链定位 BSP 问题，建立可复现、可交接的驱动调试闭环。"
 pubDate: "2026-08-16"
 series: linux-driver
-order: 13
+order: 8
 tags: ["Linux BSP", "Debugging", "ftrace"]
 draft: false
 ---

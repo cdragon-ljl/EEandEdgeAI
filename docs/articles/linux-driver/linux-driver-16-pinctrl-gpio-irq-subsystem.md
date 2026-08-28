@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #16 · pinctrl、GPIO 与 IRQ 子系统深入"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #09 · pinctrl、GPIO 与 IRQ 子系统"
 description: "以一个可观测的板级按键为主线，建立从 pinctrl 电气状态、GPIO descriptor 到 IRQ 和 input event 的完整驱动链路。"
 pubDate: "2026-08-16"
 series: linux-driver
-order: 16
+order: 9
 tags: ["Linux BSP", "pinctrl", "GPIO", "IRQ", "Input"]
 draft: false
 ---

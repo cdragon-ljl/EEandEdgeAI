@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #15 · 驱动内存管理与 I/O 映射"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #04 · 内核内存、用户数据与 I/O 映射"
 description: "通过一个可观测的 platform 驱动实验，区分内核 RAM、MMIO、DMA 地址和用户内存，并建立正确的分配、映射与访问边界。"
 pubDate: "2026-08-16"
 series: linux-driver
-order: 15
+order: 4
 tags: ["Linux BSP", "Memory Management", "I/O Mapping", "MMIO"]
 draft: false
 ---

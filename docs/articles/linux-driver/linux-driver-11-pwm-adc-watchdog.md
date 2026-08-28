@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #11 · PWM、ADC 与 watchdog 驱动适配"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #16 · PWM、IIO ADC 与 watchdog"
 description: "以板级健康监测实验为主线，完成 PWM 波形、ADC 标定采样和 watchdog 受控复位的分层验证。"
 pubDate: "2026-08-16"
 series: linux-driver
-order: 11
+order: 16
 tags: ["Linux BSP", "PWM", "IIO", "Watchdog"]
 draft: false
 ---

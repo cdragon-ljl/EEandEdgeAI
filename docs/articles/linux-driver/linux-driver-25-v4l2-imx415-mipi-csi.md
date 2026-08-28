@@ -1,5 +1,5 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #25 · V4L2、IMX415 与 MIPI CSI"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #25 · V4L2、Media Graph 与 MIPI CSI"
 description: "以 IMX415 从上电识别到稳定采集一帧图像为主线，建立 sensor、MIPI CSI-2、media graph、ISP 与 V4L2 的完整调试路径。"
 pubDate: "2026-08-16"
 series: linux-driver

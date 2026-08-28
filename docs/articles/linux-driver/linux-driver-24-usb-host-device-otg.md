@@ -1,5 +1,5 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #24 · USB Host、Device 与 OTG"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #24 · USB Controller、PHY、Host 与 Gadget"
 description: "以一个可重复插拔的 USB 接口为主线，建立角色选择、PHY/VBUS、枚举、gadget、日志与恢复验证的完整路径。"
 pubDate: "2026-08-16"
 series: linux-driver

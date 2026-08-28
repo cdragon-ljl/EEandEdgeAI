@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #12 · DMA 与缓存一致性"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #17 · DMA API、DMAengine 与缓存一致性"
 description: "以一次可验证的 DMA buffer 交接实验为主线，正确选择 coherent、streaming 和 DMA-BUF 路径，避免缓存不一致。"
 pubDate: "2026-08-16"
 series: linux-driver
-order: 12
+order: 17
 tags: ["Linux BSP", "DMA", "Cache Coherency"]
 draft: false
 ---

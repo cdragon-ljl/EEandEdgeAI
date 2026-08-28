@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #05 · 按键、中断与 Input 子系统"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #11 · 按键、中断与 Input 子系统"
 description: "沿着一次 GPIO 按键事件的完整路径，学习 gpio-keys、IRQ、去抖、Input 上报和低功耗唤醒。"
 pubDate: "2026-08-14"
 series: linux-driver
-order: 5
+order: 11
 tags: ["Linux BSP", "GPIO Keys", "Interrupt", "Input Subsystem"]
 draft: false
 ---

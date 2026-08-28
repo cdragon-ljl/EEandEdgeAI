@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #10 · UART、TTY 与 console 驱动框架"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #15 · UART、TTY 与 console"
 description: "从一条可复现的启动日志开始，完成 UART 控制器、serial core、TTY 通信与 console 的分层验证。"
 pubDate: "2026-08-16"
 series: linux-driver
-order: 10
+order: 15
 tags: ["Linux BSP", "UART", "TTY"]
 draft: false
 ---

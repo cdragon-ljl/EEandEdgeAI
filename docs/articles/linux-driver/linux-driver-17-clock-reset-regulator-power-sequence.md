@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #17 · clock、reset、regulator 与上电时序"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #12 · clock、reset、regulator 与上电时序"
 description: "以一个需要电源、参考时钟、复位和 I2C 识别的板级模块为主线，建立可回滚、可延迟 probe、可测量的 Linux 上电时序。"
 pubDate: "2026-08-16"
 series: linux-driver
-order: 17
+order: 12
 tags: ["Linux BSP", "Clock Framework", "Reset Controller", "Regulator", "Power Sequence"]
 draft: false
 ---

@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #14 · Linux 设备模型、sysfs 与资源生命周期"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #02 · Linux 设备模型与资源生命周期"
 description: "以一个设备树 platform 节点为线索，理解 bus、device、driver、class、kobject、sysfs 与 devm 如何共同管理驱动生命周期。"
 pubDate: "2026-08-16"
 series: linux-driver
-order: 14
+order: 2
 tags: ["Linux BSP", "Device Model", "sysfs", "devm"]
 draft: false
 ---

@@ -1,5 +1,5 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #23 · Ethernet、MAC、PHY 与 netdev"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #23 · Ethernet、PHY、phylink 与 netdev"
 description: "以稳定建立千兆链路并完成长时间收发为主线，理解 MAC、PHY、RGMII、phylink、设备树和网络层的调试边界。"
 pubDate: "2026-08-16"
 series: linux-driver

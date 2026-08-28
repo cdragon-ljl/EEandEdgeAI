@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #04 · GPIO 与 LED 子系统"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #10 · GPIO 与 LED 驱动实践"
 description: "沿着一颗板载 LED 的完整 bring-up 路径，学习 GPIO 描述符、pinctrl、极性、LED class 和硬件验证。"
 pubDate: "2026-08-14"
 series: linux-driver
-order: 4
+order: 10
 tags: ["Linux BSP", "GPIO", "LED Class", "pinctrl"]
 draft: false
 ---

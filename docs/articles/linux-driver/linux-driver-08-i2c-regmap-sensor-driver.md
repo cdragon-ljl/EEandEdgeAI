@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #08 · I2C、regmap 与传感器驱动"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #13 · I2C、regmap 与传感器驱动"
 description: "以一颗板载 I2C 传感器为例，从总线连通、regmap 配置、上电时序到数据验证完成一次驱动 bring-up。"
 pubDate: "2026-08-15"
 series: linux-driver
-order: 8
+order: 13
 tags: ["Linux BSP", "I2C", "regmap", "Sensor Driver"]
 draft: false
 ---

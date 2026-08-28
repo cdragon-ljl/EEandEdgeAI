@@ -1,5 +1,5 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #27 · thermal、CPUFreq、Devfreq 与电源管理"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #27 · thermal、CPUFreq、Devfreq 与 PM"
 description: "以持续图像处理负载下的温度与性能曲线为主线，建立 thermal zone、cooling device、CPUFreq、Devfreq 和 runtime PM 的验证方法。"
 pubDate: "2026-08-16"
 series: linux-driver

@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #09 · SPI 设备与传输"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #14 · SPI 控制器、设备与传输"
 description: "从 SPI 四线时序、片选和 mode 配置开始，完成 spi_device、spi_driver、同步传输和逻辑分析仪验证。"
 pubDate: "2026-08-15"
 series: linux-driver
-order: 9
+order: 14
 tags: ["Linux BSP", "SPI", "spi_driver", "Bus Transfer"]
 draft: false
 ---

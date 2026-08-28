@@ -1,5 +1,5 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #26 · ALSA SoC、I2S/TDM 与音频链路"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #26 · ALSA ASoC、DAI、DAPM 与 I2S/TDM"
 description: "以一次可测量的录音与播放回环为主线，建立 codec、I2S/TDM、ASoC machine driver、ALSA PCM 与 XRUN 的调试路径。"
 pubDate: "2026-08-16"
 series: linux-driver

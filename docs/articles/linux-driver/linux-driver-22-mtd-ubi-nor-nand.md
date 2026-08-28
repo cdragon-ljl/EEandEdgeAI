@@ -1,5 +1,5 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #22 · MTD、UBI、SPI NOR 与 NAND 存储"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #22 · MTD、UBI、NOR 与 NAND"
 description: "以可掉电恢复的数据卷为主线，建立从原始 flash、MTD 分区、UBI attach 到 UBIFS volume 的完整存储模型。"
 pubDate: "2026-08-16"
 series: linux-driver

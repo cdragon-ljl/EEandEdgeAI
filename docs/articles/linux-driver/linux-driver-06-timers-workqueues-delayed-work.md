@@ -1,5 +1,5 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #06 · timer、workqueue 与 delayed work"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #06 · 执行上下文、timer 与 workqueue"
 description: "通过一个周期采样与异步事件处理实验，理解 Linux 不同执行上下文、workqueue 调度和退出取消顺序。"
 pubDate: "2026-08-14"
 series: linux-driver

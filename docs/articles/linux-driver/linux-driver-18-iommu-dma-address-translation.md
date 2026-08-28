@@ -1,5 +1,5 @@
 ---
-title: "嵌入式知识体系 · Linux 驱动开发实战 #18 · IOMMU 与 DMA 地址转换"
+title: "嵌入式知识体系 · Linux 驱动开发实战 #18 · IOMMU、IOVA 与 DMA 地址转换"
 description: "以一帧图像从采集到处理模块的流转为主线，建立 IOVA、DMA mapping、scatter-gather 与 dma-buf 共享的正确边界。"
 pubDate: "2026-08-16"
 series: linux-driver
