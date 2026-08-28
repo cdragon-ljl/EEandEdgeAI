@@ -60,7 +60,7 @@ flowchart LR
 
 环形队列中的索引不能只用“数组下标相等”判断空满，否则会产生歧义。常见方案是维护 producer/consumer index，并额外保存 phase bit，或者让队列大小取 2 的幂并保留一个空槽。
 
-## 三、缓冲区所有权协议
+### 缓冲区所有权协议
 
 以 RX 队列为例，缓冲区生命周期可以这样描述：
 
@@ -111,7 +111,7 @@ struct my_desc {
 
 描述符里的多字节字段通常使用 `__le16`、`__le32` 或 `__le64`，通过 `cpu_to_le32()` 和 `le32_to_cpu()` 显式处理字节序，不要假设设备和 CPU 永远都是同一种 endian。
 
-## 四、Linux DMA API 的选择
+## 三、Linux DMA API、描述符发布与内存顺序
 
 ### 1. 一致性 DMA 内存
 
@@ -158,7 +158,7 @@ dma_sync_single_for_device(dev, dma, len, DMA_FROM_DEVICE);
 
 长期映射的 buffer 要在设备使用期间保持映射，不能每次中断都无条件 map/unmap。短期映射则必须严格配对。
 
-## 五、描述符发布前的内存顺序
+### 描述符发布前的内存顺序
 
 驱动通常先写描述符，再写 doorbell。CPU 和 PCIe 设备之间必须保证这个顺序：
 
@@ -177,7 +177,7 @@ writel(new_tail, regs + TX_DOORBELL);
 
 完成路径也有相反的顺序要求：设备先写 completion，再更新状态或触发中断。CPU 在读取 completion 前，需要遵循设备 spec 要求的读取顺序，并在驱动中使用合适的 `dma_rmb()` 或 DMA sync。具体屏障不能机械套用，必须结合设备对 completion 的写入协议。
 
-## 六、MSI 与 MSI-X 的选择
+## 四、MSI-X、中断处理与 RX 回收
 
 ### MSI
 
@@ -220,7 +220,7 @@ while (--i >= 0)
 pci_free_irq_vectors(pdev);
 ```
 
-## 七、中断处理不要做重活
+### 中断处理不要做重活
 
 硬中断处理函数应尽快完成：
 
@@ -249,7 +249,7 @@ static irqreturn_t my_irq(int irq, void *data)
 
 数据包或 completion 的批量回收放到 NAPI poll 等下半部中。中断风暴、锁竞争和 cache 抖动通常都需要通过批处理缓解。
 
-## 八、RX 队列的伪代码
+### RX 队列的伪代码
 
 ```c
 static int my_rx_poll(struct napi_struct *napi, int budget)
@@ -291,7 +291,7 @@ static int my_rx_poll(struct napi_struct *napi, int budget)
 
 这段代码省略了锁、错误状态、分配失败和上层回收机制，但完整体现了：读取 completion、同步 DMA、处理 buffer、重新投递描述符和恢复中断。
 
-## 九、吞吐量为什么达不到链路理论值
+## 五、吞吐量为什么达不到链路理论值
 
 PCIe 链路带宽只是上限，实际吞吐还受到：
 
@@ -330,7 +330,7 @@ CPU 使用率
 
 多队列共享全局内存/带宽时还要公平调度，避免一个 queue耗尽 descriptor或MSI-X预算。Reset/错误向所有阻塞提交者广播并让状态收敛。
 
-## 十、背压、generation 与 reset 让 ring 能长期运行
+## 六、背压、generation、reset 与稳定性
 
 SQ 满时 software producer 不能覆盖 device consumer 尚未释放的槽位；可以阻塞提交者、返回 `-EAGAIN` 或让上层 queue 限流。CQ 接近满时 Device 也必须停止产生新 completion 或报告 overflow，否则软件会永久丢失 buffer ownership。
 
@@ -340,7 +340,7 @@ SQ 满时 software producer 不能覆盖 device consumer 尚未释放的槽位�
 
 长期一致性可以用守恒关系检查：`submitted = completed + failed + in_flight`，DMA mapping 数和 buffer pool 数在停止后归零，所有 queue producer/consumer 回到同一 generation。吞吐仍在增长并不能证明资源没有缓慢泄漏。
 
-## 十一、稳定性设计
+### 稳定性设计
 
 ### 1. DMA 超时
 
@@ -378,7 +378,7 @@ if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64))) {
 
 这并不代表硬件真的支持 64 位地址。最终应以设备 spec、IOMMU 配置和平台 DMA 能力为准。
 
-## 十二、硬件验证方法
+## 七、硬件验证与验收
 
 至少准备：
 
@@ -398,7 +398,7 @@ if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64))) {
 6. 环形队列连续传输通过；
 7. 高负载、长时间和复位恢复通过。
 
-## 十三、验收清单
+### 验收清单
 
 - [ ] 描述符和 completion 的字节序已明确；
 - [ ] TX/RX buffer 的所有权转移有清晰协议；
@@ -410,7 +410,13 @@ if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64))) {
 - [ ] 设备 reset 或链路掉线时不会继续提交 DMA；
 - [ ] 已完成单 buffer、环形队列、高负载和恢复测试。
 
-## 十四、小结
+**参考资料**
+
+- [Dynamic DMA Mapping Guide](https://docs.kernel.org/core-api/dma-api-howto.html)
+- [The MSI Driver Guide HOWTO](https://docs.kernel.org/PCI/msi-howto.html)
+- [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
+
+## 八、小结
 
 PCIe 高吞吐驱动的主线是：
 

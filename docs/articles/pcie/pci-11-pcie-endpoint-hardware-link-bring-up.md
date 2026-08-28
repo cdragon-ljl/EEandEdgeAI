@@ -7,11 +7,11 @@ order: 11
 tags: ["PCIe", "Linux Driver"]
 draft: false
 ---
-PCIe 驱动开发经常被误解成“写一个 `pci_driver`，然后访问 BAR”。实际项目中，驱动能否进入 `probe()`，取决于更底层的一整条链路：参考时钟、复位、PERST#、供电、参考地、lane 配置、LTSSM、配置空间和资源分配。
+PCIe Endpoint Bring-up 同时涉及链路两端。Root Complex 必须提供电源/时钟/复位、训练、配置访问和地址窗口；Endpoint 必须实现 LTSSM、Configuration Space、BAR、ATU、中断和 DMA。任一端未就绪，Host 侧 `pci_driver` 都没有执行机会。
 
-这一篇以嵌入式 SoC 连接 FPGA、网卡或自研加速器为场景，建立一套从原理图到 Linux 的 PCIe Endpoint bring-up 方法。示例命令适用于常见 Linux 系统，具体寄存器和设备树属性必须以目标 SoC 手册为准。
+本篇以嵌入式 SoC 连接 FPGA、网卡或自研加速器为场景，从原理图走到 Linux；同时说明 SoC 自己运行 Linux 并充当 Endpoint 时，PCI Endpoint Framework 位于哪里。具体寄存器和设备树 binding 仍以目标 SoC/IP 手册为准。
 
-## 一、先分清 Root Complex 与 Endpoint
+## 一、Root Complex、Endpoint 角色与硬件信号
 
 PCIe 链路至少包含两个角色：
 
@@ -37,7 +37,7 @@ flowchart LR
 
 如果 SoC 被配置成 Endpoint，它不会主动枚举其他设备，而是等待外部 RC 对它进行配置。RC/EP 角色必须先从硬件设计和控制器模式上确认，不能仅根据设备树节点名字猜测。
 
-## 二、硬件设计中必须核对的信号
+### 硬件设计中必须核对的信号
 
 ### 1. REFCLK
 
@@ -71,7 +71,7 @@ PERST# 提前释放会导致 Endpoint 没有完成内部电源和 PLL 初始化�
 
 PCIe TX 必须连接对端 RX，RX 必须连接对端 TX。差分对的极性翻转在部分控制器中可配置，但不能假设所有芯片都能自动修正。x1、x2、x4 的 lane 数量和 lane 映射也必须与控制器支持范围一致。
 
-## 三、链路训练与 LTSSM
+## 二、链路训练与 LTSSM
 
 PCIe 链路启动会经历 LTSSM，即 Link Training and Status State Machine。初学阶段重点关注这些状态：
 
@@ -84,7 +84,7 @@ PCIe 链路启动会经历 LTSSM，即 Link Training and Status State Machine。
 
 链路最终必须进入 `L0`，但“进入 L0”还不代表设备功能一定可用，因为后面仍有枚举、BAR 和中断配置。
 
-## 四、Endpoint 内部先建立配置空间与 BAR 通路
+## 三、Configuration Space、BAR、ATU 与 RC 设备树
 
 Endpoint Controller 至少包含配置空间响应、BAR decode、inbound/outbound address translation、MSI/MSI-X 和可选 DMA engine。Host 能读 VID/DID 只证明 Configuration TLP 可达；BAR Memory TLP 还要经过 Endpoint inbound translation 才能落到内部 AXI/AHB/BRAM。
 
@@ -111,7 +111,7 @@ BAR mask、64位和 prefetchable属性必须与实际 aperture一致。Function 
 
 Host `lspci -vvxxxx` 的每个字段都应能对应 Endpoint IP配置或用户逻辑寄存器。
 
-## 五、设备树中的 RC 节点
+### 设备树中的 RC 节点
 
 一个抽象的 RC 节点可能包含以下资源：
 
@@ -152,7 +152,7 @@ tr '\0' '\n' < /proc/device-tree/soc/pcie@40000000/compatible
 
 节点路径只是示意，实际路径需要根据 `/proc/device-tree` 查找结果调整。
 
-## 六、Linux 侧的第一轮检查
+## 四、Linux 枚举和 lspci 证据
 
 启动后先执行：
 
@@ -183,7 +183,7 @@ modinfo your_driver
 
 查看 `lspci -vv` 中的 BAR、BusMaster、MSI/MSI-X 和链路状态，再检查驱动的错误回滚路径。
 
-## 七、用 lspci 读懂一块真实设备
+### 用 lspci 读懂一块真实设备
 
 ```bash
 lspci -s 01:00.0 -nn
@@ -203,7 +203,7 @@ lspci -s 01:00.0 -xxxx
 
 例如设备支持 Gen3 x4，但 `LnkSta` 只有 Gen1 x1，说明链路虽然工作，却存在速度或宽度降级，需要回到信号、lane、参考时钟和训练日志排查。
 
-## 八、链路速度与宽度验证
+## 五、链路速度、宽度与稳定性
 
 可以使用：
 
@@ -222,7 +222,7 @@ cat /sys/bus/pci/devices/0000:01:00.0/max_link_width
 
 如果这些文件不存在，可能是内核版本、设备类型或 sysfs 支持不同，应以 `lspci -vv` 为准。
 
-## 九、链路稳定性测试
+### 链路稳定性测试
 
 初次 bring-up 不能只执行一次 `lspci`。建议组合测试：
 
@@ -253,7 +253,7 @@ Host驱动通过 DMA API分配/映射 buffer，把 `dma_addr_t`、length和reque
 
 Device写 payload/CQE必须先于 MSI可见；reset/PERST#/FLR后停止旧 outbound DMA。若 Host unmap后 Device迟到访问，IOMMU应直接暴露 fault。
 
-## 十、常见故障定位
+## 六、故障定位、Endpoint Framework 与验收
 
 ### 故障 1：链路停在 Detect
 
@@ -275,7 +275,7 @@ Device写 payload/CQE必须先于 MSI可见；reset/PERST#/FLR后停止旧 outbo
 
 先关闭省电特性建立稳定基线，再逐项启用 L0s/L1、L1 Substates 和 runtime PM。不要把低功耗问题与初始链路问题混在一起。
 
-## 十一、Linux PCI Endpoint Framework 的另一侧视角
+### Linux PCI Endpoint Framework 的另一侧视角
 
 当 SoC运行 Linux并充当 Endpoint，PCI Endpoint Framework用 `pci_epc` 表示 Endpoint Controller，EPC driver适配硬件，`pci_epf` Function driver配置 Configuration Space、BAR、MSI和数据协议。`pci_epf_test`/对应 Host test driver可用于最小验证。
 
@@ -283,7 +283,11 @@ Framework API负责 function bind/unbind和资源配置，但 PHY、LTSSM、ATU�
 
 这套框架适合验证 BAR read/write/copy/MSI，再扩展自定义 Function，顺序与 FPGA Endpoint最小闭环一致。
 
-## 十二、验收清单
+EPC driver 负责 controller capability、BAR/ATU window、raise IRQ、start/stop link；EPF driver 负责一个 Function 的 Vendor/Device/Class、BAR 内容和业务协议。configfs 可把 EPF 绑定到某个 EPC/Function，再启动 link。Function bind 成功不等于 Host 已枚举，仍要从 RC 侧读取 Configuration Space 验证。
+
+Inbound window 把 Host 对 BAR 的 Memory TLP 映射到 EP 本地内存/寄存器；Outbound window 让 EP DMA/CPU 发起到 Host address 的事务。两者方向必须明确。EPF test 的 read/write/copy 命令适合验证窗口和 MSI，但高吞吐 DMA 还需要独立 descriptor/ownership 协议。
+
+### 验收清单
 
 - [ ] 已确认 RC/EP 角色和 lane 配置；
 - [ ] REFCLK、PERST#、电源和连接器信号经过原理图核对；
@@ -295,7 +299,13 @@ Framework API负责 function bind/unbind和资源配置，但 PHY、LTSSM、ATU�
 - [ ] Gen1/x1 基线通过后，再验证目标速率和宽度；
 - [ ] 高负载下没有 AER、Completion Timeout 或链路反复 Recovery。
 
-## 十三、小结
+**参考资料**
+
+- [Linux PCI Endpoint Framework](https://docs.kernel.org/PCI/endpoint/index.html)
+- [PCI Endpoint Function ConfigFS](https://docs.kernel.org/PCI/endpoint/pci-endpoint-cfs.html)
+- [Linux PCI Express Port Bus Driver Guide](https://docs.kernel.org/PCI/pciebus-howto.html)
+
+## 七、小结
 
 PCIe Endpoint bring-up 的主线是：
 

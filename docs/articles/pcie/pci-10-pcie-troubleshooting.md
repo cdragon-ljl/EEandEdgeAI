@@ -1,129 +1,138 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #10 · PCIe 问题排查：链路、枚举、BAR、中断与 DMA"
-description: "PCIe 问题排查比普通外设复杂，因为它跨越硬件、固件、内核、驱动和用户态。设备不出现、BAR 没分配、中断不来、DMA 超时、IOMMU fault，这些问题都很常见。"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #10 · PCIe 故障排查"
+description: "按电源/PERST#/REFCLK/LTSSM、配置空间、BAR/ATU、驱动/IRQ、DMA/IOMMU、AER/reset 建立有进入条件的证据链。"
 pubDate: "2026-08-18"
 series: pcie
 order: 10
 tags: ["PCIe", "Linux Driver"]
 draft: false
 ---
-PCIe 故障必须按链路建立顺序排查。`lspci` 看不到设备时，驱动和 DMA 尚未参与；设备可见但 BAR 失败时，链路已经工作；中断正常但数据错，问题才进入 descriptor、DMA 和 IOMMU。混合修改各层只会丢失证据。
+PCIe 故障常被一句“设备不工作”掩盖，但 `lspci` 看不到、BAR 读全 1、MSI-X 不增长、DMA 数据错误属于完全不同阶段。正确方法是为每层设置进入条件：上层证据未成立，不进入下层。
 
-本篇从电源/PERST#/REFCLK、LTSSM 开始，逐层建立配置、BAR、IRQ、DMA、IOMMU 和 AER 的观察边界。
-
-## 一、电源、PERST#、REFCLK 和 lane
-
-确认各电源 rail、时序和功耗限制；PERST# 应在 REFCLK 与电源稳定后按规范释放；lane 数、极性反转、lane reversal 与板级连接要符合 RC/EP 支持。
-
-示波器/协议分析仪确认 REFCLK、PERST# 和 receiver detect。Endpoint LTSSM debug register若停在 Detect，查连接/termination；Polling/Configuration 失败，查时钟、lane、equalization 和速率能力；进入 L0 后又 Recovery，查信号质量和错误。
-
-`lspci` 完全无设备且 LTSSM 不到 L0，不需要先改 `pci_device_id`。
-
-## 二、Host bridge 与配置空间访问
-
-RC 自身要正确 probe，ECAM/config window 和 bus range 有效。检查启动日志和：
-
-```bash
-lspci -Dnn
-lspci -tv
-lspci -s BDF -vvxxxx
-```
-
-Vendor ID 可读但 header 后部异常，可能是配置访问宽度/ATU；bridge 下设备缺失，检查 secondary/subordinate bus 与 bridge reset/window；BDF 变化不应被脚本写死。
-
-### Configuration Space 原始读取是枚举层的边界证据
-
-Endpoint进入 L0后，Root Complex应能通过 ECAM/config window读取 Vendor ID和 Header。`lspci -xxxx` 与 sysfs config展示 Configuration Space；完全读全 1/abort时，检查 RC config ATU、bus range和 BDF，而不是 BAR driver。
-
-Type 1 bridge的 secondary/subordinate bus和 memory window决定下游可见性。Bridge本身可见、下游缺失时，递归 bus number或 reset/window是独立故障层。
-
-Capability链损坏会让 MSI/AER/PCIe能力解析异常；记录原始 offset/next，避免用 setpci盲改。
-
-## 三、BAR 和地址转换
-
-`lspci -vv` 查看 Region，sysfs resource 核对 Host 分配：
-
-```bash
-cat /sys/bus/pci/devices/BDF/resource
-cat /proc/iomem | grep -i pci
-```
-
-BAR assignment failure 说明 aperture/window/地址空间不足；resource 有值但 MMIO read 全 1 或 abort，检查 RC outbound ATU、bridge window、Endpoint BAR decode/inbound translation 和 reset 状态。
-
-不要在运行设备上随意写 BAR 全 1。先用驱动/只读工具确认分配，再通过最小 scratch register 验证。
-
-## 四、驱动绑定和 probe 回滚
-
-```bash
-readlink /sys/bus/pci/devices/BDF/driver
-cat /sys/bus/pci/devices/BDF/modalias
-lspci -s BDF -k
-```
-
-未绑定看 ID/module/override；probe 失败按 enable、regions、DMA mask、BAR、IRQ、queue 的最后成功点定位。dynamic debug 应打印具体 errno 与硬件状态。
-
-设备 enable 后 probe 失败还可能留下 bus master 或中断，检查错误路径是否反向回滚。
-
-### Completion Timeout、Unsupported Request 与 Malformed TLP 指向不同问题
-
-Memory Read有 request/completion配对。Completion Timeout说明目标没有在期限内返回，可能是 address route、Endpoint状态或内部总线卡住；Unsupported Request常见访问未实现 BAR/offset或属性不支持；Completer Abort表示目标接收但无法完成；Malformed TLP更接近格式/硬件协议错误。
-
-AER header log可还原 TLP header，结合 requester/completer和 address定位。不要把所有 AER都归为信号质量，Receiver Error/Bad DLLP与 UR/CTO属于不同层。
-
-Posted Write没有 completion，写错地址可能只通过 AER或后续业务超时体现。关键控制写按设备规范 readback确认。
-
-## 五、INTx/MSI/MSI-X
-
-`lspci -vv` 确认 capability Enabled，`/proc/interrupts` 看 vector 计数。计数不涨时检查设备 event、mask、MSI-X table、message address/data；计数涨但 completion 不动，检查 handler ack、queue mapping 和 ownership。
-
-共享 INTx handler 返回值错误会影响其他设备；MSI-X vector 与 queue 数不匹配会读错 completion。中断风暴通常是源未清或 unmask 时机错误。
-
-## 六、DMA 与 IOMMU fault
-
-IOMMU fault 是设备访问了未映射/无权限 IOVA 的直接证据。记录 requester、IOVA、方向，再在 descriptor ring 找地址和 length：
-
-```bash
-dmesg | grep -Ei 'IOMMU fault|SMMU|DMAR|AMD-Vi|swiotlb'
-```
-
-无 fault 但数据旧，检查 streaming sync/cache/barrier；地址高位错误，检查 DMA mask 与寄存器写序；timeout 后内存被破坏，检查是否在设备 quiescent 前 unmap/free。
-
-临时关闭 IOMMU 只可用于对比，不能作为修复；它可能把可见 fault 变成静默越界。
-
-## 七、AER 和链路恢复
-
-AER Correctable 持续增加说明链路有压力，Uncorrectable/Fatal 需要解析 TLP header log 和 source ID。Surprise Down、Completion Timeout、Unsupported Request、Malformed TLP 分别指向链路、目标响应、地址/请求和协议格式。
-
-```bash
-lspci -s BDF -vv | grep -A25 'Advanced Error'
-dmesg -w | grep -i -E 'aer|pcie'
-```
-
-恢复可能执行 FLR、hot reset、secondary bus reset 或 slot power cycle。Reset 后 BAR 配置通常由 PCI core 保持/恢复，但设备内部 ring/IRQ 状态需要驱动重建。
-
-### Reset 后必须重建哪些状态
-
-FLR重置单 function，Secondary Bus Reset影响桥下链路，PERST#/slot power更彻底。Reset可能清设备 DMA engine、queue index、MSI-X table shadow和内部 firmware，但 Host配置空间/BAR由PCI core重新恢复部分状态。
-
-驱动恢复顺序：冻结提交、停/确认 DMA、mask/sync IRQ、执行 reset、恢复 PCI state、重新写 BAR queue/doorbell、清旧 completion、增加 generation、unmask并唤醒。跳过任何一步都可能让旧 DMA访问新内存。
-
-AER `error_detected/slot_reset/resume`、timeout recovery与remove需要共享状态机，防止并发双 reset或双释放。
-
-## 八、用一张证据链避免跨层猜测
+## 一、先用决策树确定故障层
 
 ```mermaid
 flowchart TD
-    P[Power PERST REFCLK] --> L[LTSSM reaches L0]
-    L --> C[Config space and BDF]
-    C --> B[BAR and bridge ATU]
-    B --> D[Driver probe]
-    D --> I[IRQ vector]
-    I --> M[DMA mapping and ownership]
-    M --> A[AER performance recovery]
+    A[Power on or hot insert] --> B{Endpoint power, PERST# and REFCLK valid}
+    B -->|No| P[Fix power and reset sequencing]
+    B -->|Yes| C{LTSSM reaches L0}
+    C -->|No| L[Check lane, polarity, training, equalization]
+    C -->|Yes| D{Configuration Space readable and BDF exists}
+    D -->|No| F[Check Host bridge, ECAM, bus range]
+    D -->|Yes| E{BAR assigned and MMIO responds}
+    E -->|No| R[Check resources, bridge window and ATU]
+    E -->|Yes| G{Driver probe and IRQ work}
+    G -->|No| I[Check match, probe rollback, MSI-X]
+    G -->|Yes| H{DMA and completions are correct}
+    H -->|No| M[Check descriptor, barrier, IOMMU and reset]
+    H -->|Yes| S[Stress PM, AER and recovery]
 ```
 
-每层都要求一个可观察证据后再进入下一层。现场记录寄存器、lspci、dmesg、IOMMU fault 和 ring counters 的时间线，比只保存最终错误截图更有价值。
+保存环境：板卡/插槽、固件、内核、Device revision、拓扑、复现动作、最后正常版本。每次只改变一个变量，保留寄存器/日志时间线。
 
-## 九、小结
+## 二、电源、PERST#、REFCLK、Lane 与 LTSSM
 
-PCIe 排错顺序是 PERST#/REFCLK/lane、LTSSM、配置空间、BAR/ATU、驱动、IRQ、DMA/IOMMU、AER/恢复。`lspci -vv` 只能证明配置层状态，不证明 DMA 正确；IOMMU fault 也不等于 IOMMU 本身有 bug。下一篇从 Endpoint 视角解释 Host 为何看到这些状态，以及 FPGA/SoC EP 如何建立最小 BAR 通路。
+Endpoint 电源 rail 和时序必须满足器件要求；PERST# 释放前 REFCLK 通常应稳定，具体时序看平台/规范。AC-coupling capacitor 位置、TX/RX lane、polarity、lane reversal 和 bifurcation 必须与两端配置一致。
+
+LTSSM 停在 Detect：receiver detect、电源、lane/open；Polling：训练序列、REFCLK、polarity/signal；Configuration：lane numbering/width；Recovery 循环：equalization、margin、目标速率过高。
+
+能进入 L0 但 `LnkSta` 降速/降宽，先比较 `LnkCap`，再看 AER correctable/replay 和不同速率。强制 Gen1 用于定位 signal/training，不是最终修复。
+
+`lspci` 完全看不到 Endpoint 时，普通 Endpoint Driver 未运行。此时不要修改 id_table 或 probe。
+
+可以把 LTSSM 现象与检查对象对应：
+
+| 现象 | 更可能的层 | 需要的证据 |
+| --- | --- | --- |
+| 一直 Detect | receiver detect、供电、lane open | 两端 LTSSM、RX detect、原理图/波形 |
+| Polling 循环 | TS1/TS2、极性、时钟质量 | analyzer、错误计数、强制 Gen1 对比 |
+| Configuration 失败 | lane numbering/width | lane map、bifurcation、两端配置 |
+| L0/Recovery 反复 | signal/equalization/replay | LnkSta、AER、眼图/分析仪 |
+| L0 但降宽 | 某些 lane 不可用 | per-lane 状态、连接器/焊接 |
+
+PERST#/REFCLK 条件应由硬件测量或 controller status 证明，不能只根据 Linux probe 顺序推断。冷启动与热重启差异通常指向电源/reset/firmware 时序。
+
+## 三、Host Bridge、Configuration Space 与 BDF
+
+Link Up 后 Host 仍需 ECAM/indirect config access、正确 bus range 和 root bus。检查 RC driver/firmware日志、`lspci -tv`、Host Bridge resource。
+
+Vendor ID 读 `0xffff` 可能表示不存在，也可能是 config request 超时/UR。对照 RC error status、LTSSM 和 protocol trace。Bridge 下游缺失检查 Secondary/Subordinate Bus、下游 Link 和热插拔扫描。
+
+能看到 BDF 后记录 Header Type、Class、Command、Capability、LnkSta。此阶段已证明 config path，但不能证明 BAR MMIO 和 DMA path。
+
+```bash
+lspci -nn -s BDF
+lspci -xxxx -s BDF
+cat /sys/bus/pci/devices/BDF/config | xxd -g 4 | head
+```
+
+配置 dump 仅用于只读分析。检查 Vendor/Device/Class/Header、Command Memory/BusMaster、BAR、Capability pointer；多级拓扑还要检查 Bridge Primary/Secondary/Subordinate 与 window。配置读取偶发全 1 时，关联 RC Unsupported Request/Completion Timeout，而不是把结果当“设备不存在”。
+
+## 四、BAR、Bridge Window 与 ATU
+
+BAR unassigned/size异常：检查 sizing、Host `ranges`、64-bit/prefetchable window、Bridge window 和资源不足。`pci_resource_len()` 与硬件期望不匹配应让 probe 拒绝。
+
+BAR 已分配，`pci_iomap()` 成功但 `readl()` 全 1/abort：依次核对 CPU resource、RC outbound ATU、PCI bus address、Endpoint BAR decode、EP inbound ATU 和内部寄存器 offset。
+
+posted write 导致“写后立即读旧状态”时，使用安全 readback/状态完成。不要读 W1C/read-clear/FIFO 做 flush。
+
+把 `lspci -vv -s BDF` 的 BAR 地址与 sysfs `resource`、Device Tree `ranges` 和 RC ATU register逐项对齐。地址至少有 CPU resource、PCI bus address、EP local target 三个视角；打印日志必须注明是哪一种。
+
+若 BAR 小于硬件协议要求，可能是 Endpoint sizing mask 错；若 64-bit BAR 高位丢失，只在高地址平台失败；若 prefetchable BAR 被放进不支持的 Bridge window，资源可能无法分配。每种现象都在 probe 前发生。
+
+## 五、驱动绑定、MSI-X 与软件并发
+
+```bash
+lspci -vv -s BDF
+readlink /sys/bus/pci/devices/BDF/driver
+cat /sys/bus/pci/devices/BDF/modalias
+cat /proc/interrupts
+dmesg -w
+```
+
+probe 未触发：ID/module/driver override；probe 返回失败：保留第一错误码并检查逆序回滚。设备在 driver bind 后立即发中断，需要在 start 前 request IRQ 且保持 source mask。
+
+MSI-X 不增长：检查 vector enable/Table/PBA、设备 source、message write、interrupt remapping；增长但任务不完成：检查 queue mapping、CQ phase、`dma_rmb()` 和 poll budget。INTx storm 则检查 source deassert/W1C。
+
+热插拔崩溃看 IRQ/work/timer/用户 fd 是否在释放后访问对象。增加 sleep 不是修复，使用 KASAN/lockdep 和 tracepoint 对齐 remove 与 callback。
+
+中断排错用两个计数同时判断：Device event/source 计数和 Linux IRQ 计数。source 增、IRQ 不增，查 mask/Table/message/RC；IRQ 增、CQ 不增，查 queue mapping/order；CQ 增、用户不醒，查 poll/wait/UAPI。只看 `/proc/interrupts` 会跳过两端状态。
+
+## 六、DMA、IOMMU fault 与数据一致性
+
+IOMMU fault 提供 requester、IOVA、方向和 reason。回查 request ID/generation、mapping length/direction、descriptor 高低位/endian。关闭 IOMMU 只会隐藏越界。
+
+无 fault 但数据旧/损坏：检查 DMA API direction、sync、`dma_wmb/dma_rmb`、Device completion 顺序、cache/coherency、length/SG。只在高地址失败看 DMA mask/descriptor address width。
+
+timeout 后不能立即 unmap。先阻止新请求、停止 DMA、确认 idle/synchronize IRQ，再 unmap/reset。reset 后旧 completion 必须由 generation 丢弃。
+
+DMA 数据错时保存一条请求的完整元数据：ID/generation、CPU buffer、DMA address、length/direction、SQ slot、doorbell、CQ status/bytes。用 IOMMU fault IOVA 或 CQ ID 回查，而不是全局打印所有 descriptor。
+
+若关闭 IOMMU 后 fault 消失但数据仍偶发损坏，反而更支持越界/迟到 DMA。IOMMU 是检测器和隔离器，不是根因。若只在 non-coherent 架构失败，再核对 DMA API 与硬件 descriptor ordering，不直接加 cache flush 猜测。
+
+## 七、AER、FLR 和恢复是否真正完成
+
+AER 错误按 Correctable、Uncorrectable Non-Fatal、Fatal 分类。Receiver Error/Replay 与 Link 质量相关；Unsupported Request/Completion Timeout/Malformed TLP 更接近事务/路由/设备实现。
+
+```bash
+lspci -s BDF -vv | grep -A30 'Advanced Error'
+dmesg | grep -Ei 'aer|pcie|iommu|timeout'
+```
+
+FLR/hot reset/slot reset 可能清配置和设备 ring。恢复不是 BDF 重新出现，而是：旧 DMA 停止、旧 mapping 收敛、新 generation/ring/vector 完成、业务请求重新通过、AER 不持续增长。
+
+用 submitted/completed/failed/inflight、mapping count、reset count 和恢复时长证明闭环。仅打印“reset done”没有验收价值。
+
+恢复测试至少覆盖：业务中 FLR、Link retrain/hot reset、runtime suspend、AER non-fatal/fatal（平台支持时）、进程异常退出和 device remove。每种恢复后执行相同最小 MMIO + DMA 校验，比较 generation、AER 和资源计数。
+
+**参考资料**
+
+- [Linux PCI Error Recovery](https://docs.kernel.org/PCI/pci-error-recovery.html)
+- [Linux PCI Express Port Bus Driver Guide](https://docs.kernel.org/PCI/pciebus-howto.html)
+- [PCI-SIG Specifications](https://pcisig.com/specifications)
+
+## 八、小结
+
+PCIe 排错必须按电气与 LTSSM、配置访问、BAR/ATU、驱动/IRQ、DMA/IOMMU、AER/reset 逐层推进。每层都有明确证据和停止条件，不能跨层猜测。
+
+下一篇站到 Endpoint 与 Root Complex 两侧，把硬件 Link Bring-up、配置/BAR/ATU 和 Linux Endpoint Framework 放进同一条链。

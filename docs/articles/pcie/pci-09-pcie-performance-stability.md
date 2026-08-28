@@ -1,57 +1,97 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #09 · PCIe 性能与稳定性优化"
-description: "PCIe 驱动能跑起来只是第一步。真正的工程难点在于：高负载下是否稳定、吞吐是否达标、延迟是否可控、异常场景是否能恢复。"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #09 · PCIe 性能与稳定性"
+description: "从实际 Link 到 TLP、credit、outstanding、DMA、Ring、MSI-X、NUMA 和 IOMMU 建立分层性能模型，并把 P99、AER、reset 和资源守恒纳入验收。"
 pubDate: "2026-08-18"
 series: pcie
 order: 9
 tags: ["PCIe", "Linux Driver"]
 draft: false
 ---
-PCIe 性能不是 `Gen × lane` 一个数字。有效吞吐还受到编码、TLP header、Max Payload Size、Max Read Request、credit、outstanding 数、DMA ring、中断、CPU/NUMA 和内存带宽影响；稳定性则由 AER、timeout、reset 和长期资源一致性决定。
+PCIe 性能不是“Gen × Lane”一个数字。链路只提供原始传输能力，业务数据还要经过 TLP、flow control、DMA、内存系统、队列、中断和 CPU。任一层出现空洞，实际吞吐都可能远低于标称值。
 
-本篇给出可复用的测量模型，不虚构某块硬件的 benchmark，重点说明每个指标对应哪一层。
+稳定性也不是“压力跑一小时没崩”。驱动必须证明请求、DMA mapping、buffer、completion 和 reset 长期守恒，并同时观察 AER 与尾延迟。本篇不给特定硬件编造测试结果，而是建立可复用的测量方法。
 
-## 一、先确认实际链路，不用插槽规格代替
+## 一、先画出性能路径和每层可观察量
+
+```mermaid
+flowchart LR
+    APP[Application request size and concurrency] --> SW[Driver queue, batch, locks]
+    SW --> DMA[DMA mapping and memory bandwidth]
+    DMA --> ENG[Device DMA engine and outstanding]
+    ENG --> TLP[TLP size, tag, credit, Completion]
+    TLP --> LINK[Negotiated speed, width, encoding]
+    IRQ[MSI-X, moderation, CPU and NUMA] --> SW
+    IOMMU[IOMMU, IOVA and IOTLB] --> DMA
+```
+
+应用层观察 request size/concurrency/latency；驱动层观察 queue depth、batch、doorbell、inflight；DMA 层观察 mapping、内存带宽和 NUMA；事务层观察 MPS/MRRS/tag/credit；链路层观察 speed/width/AER；通知层观察 IRQ/completion、moderation 和 CPU。
+
+只记录最终 MiB/s 无法定位。每次实验应保存这些中间指标，并一次只改变一个变量。
+
+## 二、从 LnkSta 计算可达到的上限
+
+先读取实际链路，而不是插槽丝印：
 
 ```bash
 lspci -s BDF -vv | grep -E 'LnkCap|LnkSta'
 ```
 
-`LnkCap` 是设备能力，`LnkSta` 是本次协商结果。目标 Gen4 x4 若实际为 Gen3 x1，任何 ring 调优都无法补回物理带宽。降速/降宽应检查拓扑、Switch、插槽 bifurcation、信号、equalization 和 AER。
+`LnkCap` 是 Port 能力，`LnkSta` 是本次协商结果。目标 Gen4 x4 若实际 Gen3 x1，软件队列不可能补回物理能力。还要检查是否降宽/降速、Equalization 和 AER correctable error。
 
-理论 line rate 还要扣除编码与协议开销。小 TLP 的 header/LCRC 比例更高，所以大量几十字节请求远低于大 payload 的效率。
+理论计算分三步：
 
-### 从 GT/s 到业务吞吐的分层预算
+1. `GT/s × encoding efficiency × lane count` 得到编码后 bit rate。
+2. 扣除 TLP header、LCRC、DLLP、ACK/flow-control、SKP 等协议开销。
+3. 再乘业务中有效 payload 比例，并考虑方向和读 Completion。
 
-Gen3 8 GT/s使用 128b/130b编码，单 lane单方向编码后约 7.877 Gb/s；x4再乘 lane，但业务还要扣除 TLP header、LCRC、DLLP、ACK/credit和空闲。一个 256B Memory Write与 32B小写的有效率差异很大。
+一个 256-byte Memory Write 的 header 比例低于 32-byte Write。Memory Read 还产生 Request 与一个或多个 Completion，吞吐受往返时延和 Completion 边界影响。报告应注明 payload size 和 read/write 方向。
 
-性能模型至少分四层：Link有效带宽、TLP payload效率、DMA/内存带宽、软件 queue/CPU。若设备内部只允许一个 outstanding Read，Completion RTT会先限制吞吐；若 Device持续 Write但 Host内存远端 NUMA，瓶颈可能在内存而非 Link。
+### 用公式拆开编码与 TLP 效率
 
-测试报告应写 LnkSta、MPS/MRRS、payload、queue depth、方向、IOMMU和CPU/NUMA，不用“PCIe x4 理论值”代替环境。
+以 Gen3 为例，单 Lane 编码后 bit rate 是 `8 GT/s × 128/130`；x4 再乘 4。若只估算连续 Memory Write，单个 packet 的有效率可近似写成：
 
-## 二、Max_Payload_Size 决定写 TLP 的最大数据段
+```text
+payload_efficiency = payload_bytes /
+    (payload_bytes + TLP_header + ECRC_optional + LCRC + framing_share)
+```
 
-MPS 由链路路径上设备能力和系统配置共同决定，Device Control 中的当前值可能低于 Device Capability 上限。更大 MPS 减少 header 开销，但增加单包占用与错误重放成本，并要求整个路径支持。
+3DW/4DW Header、地址宽度、tag/attribute、是否有 ECRC 会改变开销。ACK/DLLP/SKP 不是每个 TLP 固定附加，适合在较长时间窗摊销，而不是硬塞进单包常量。
 
-设备 DMA write 4096 字节，在 MPS 256 时至少拆成多个 TLP。驱动通常不直接逐包控制，但硬件 queue/burst 设计与 MPS 会影响吞吐。不要随意通过 setpci 修改生产系统 MPS，错误配置可能破坏拓扑兼容性。
+Read 更复杂：Request 本身无大 payload，Completion 受 MPS/RCB/remaining byte count 拆分。若 Request 4096 bytes、MRRS 4096，但 Completion MPS 256，则仍需要多个 Completion TLP；增大 MRRS 只减少 Request 数，不会突破 Completion 端限制。
 
-## 三、Max_Read_Request 和 outstanding 决定读延迟隐藏能力
+理论值用于建立上限，不用于替代测量。协议 analyzer/Device counter 可观察 TLP size、replay、credit stall；没有这些计数时，用 payload sweep（32B 到大块）和 read/write 对比反推固定开销与 RTT 限制。
 
-Memory Read Request 受 Max_Read_Request（MRRS）限制，Completion 还受 RC/bridge 的 completion boundary、MPS 和 credit 影响。单个同步 read 的往返延迟较高，高吞吐设备需要多个 outstanding tag 并行，让链路在等待某个 Completion 时继续工作。
+## 三、MPS、MRRS、RCB、tag 和 credit 决定事务效率
 
-MRRS 过小增加请求数量，过大可能占用 credit/内部 buffer 并影响公平性。设备设计应测量 outstanding 深度、Completion latency 和 tag 利用率，而不是只增大 MRRS。
+Max_Payload_Size（MPS）限制单个带数据 TLP 的最大 payload。路径中所有 Port 都要支持当前值，系统通常选择兼容值。增大 MPS 可降低 header 比例，但增加接收 buffer 占用和 replay 成本，不保证所有 workload 更快。
 
-## 四、Ring 深度、批处理和 doorbell 决定软件能否喂满硬件
+Max_Read_Request（MRRS，对应 Linux 输出常见 `Max_Read_Request`）限制一个 Memory Read Request 的长度。大 Read 可能被多个 Completion 拆分；Root Completion Boundary（RCB）、MPS 和 remaining byte count 决定拆分。
 
-Ring 太浅会在一次调度延迟内耗尽，设备等待 producer；过深会增加排队延迟并掩盖拥塞。通过 producer/consumer high watermark 和 queue idle time选择深度。
+Device 用 tag 区分多个 outstanding Read。若只允许一个 outstanding，请求必须等待 Completion RTT，链路会出现空闲；增加 tag 深度可隐藏延迟，直到 non-posted credit、Completion credit、内部 buffer 或内存带宽成为限制。
 
-批量填写 descriptor 后一次 `dma_wmb()` 和 doorbell，可减少 MMIO 与 barrier 开销。Completion 也可按 budget 批量回收。每个请求都写 doorbell、每个 completion 都触发 IRQ，会把 CPU 和 PCIe 小事务开销放大。
+Flow-control credit 分 Posted/Non-Posted/Completion 的 Header/Data。某类 credit 耗尽时，该类事务停发。链路利用率低但 tag/credit 满，问题不在 Lane；需要设备或协议 analyzer counter。
 
-吞吐与延迟需要分别测量：中断合并/批量通常提高吞吐但增加尾延迟。至少报告平均、P99、queue depth 和 batch 参数，不能只给最高瞬时带宽。
+不要在生产系统用 `setpci` 盲改 MPS/MRRS。修改前确认整条拓扑能力和设备限制，实验后记录原值并恢复。
 
-## 五、MSI-X、affinity 与 NUMA 要按队列布置
+### Outstanding 深度如何隐藏 Read RTT
 
-多队列设备让每个 queue 使用 MSI-X vector，并将 IRQ、处理线程和 buffer 绑到同一 NUMA node/CPU，可降低跨核 cache 和远端内存访问。
+粗略关系是 `required_outstanding_bytes >= target_bandwidth × round_trip_latency`。例如要维持给定带宽，RTT 越大，需要同时在途的 Read bytes 越多；它由 MRRS × outstanding request 数组成，再受 tag/NPH/Cpl credit 限制。
+
+实际 Device 还可能按 queue、Function 或 traffic class 分配 tag。只增加软件 queue depth，不增加硬件 outstanding，无法隐藏 RTT；反过来硬件能发很多 request，但 Host completion buffer/内存系统不足，也会 credit stall。
+
+测量应同时记录 outstanding high watermark、tag stall、NPH/Cpl credit stall、Completion latency 分布。没有这些硬件计数时，逐步增加 request concurrency，观察吞吐何时饱和、P99 何时恶化，并结合 CPU/内存指标排除软件瓶颈。
+
+## 四、Queue depth、batch 和 doorbell 控制软件空洞
+
+queue depth 太浅，设备在 CPU 调度间隔内耗尽 SQ；太深会增加排队和 reset 停止成本。初始值可由吞吐 × 最坏补充延迟估算，再根据 queue idle/high watermark 调整。
+
+批量填多个 descriptor 后一次 `dma_wmb()` 和 doorbell，可减少 MMIO 与 barrier。completion 也可按 budget 批量回收。每请求一次 doorbell、每 completion 一次 IRQ，会让小事务开销占主导。
+
+背压必须可见：SQ full 时阻塞/`-EAGAIN`，记录 full duration；不能无限堆积内核 request。队列更深可能提高 benchmark 吞吐，却把 P99 延迟藏进排队时间。
+
+## 五、MSI-X、interrupt moderation、CPU 和 NUMA
+
+多队列设备通常 queue-vector-CPU 对齐。IRQ、poll worker 和 buffer 在同一 NUMA node，可减少 cache line migration 和远端内存访问。
 
 ```bash
 cat /proc/interrupts
@@ -59,52 +99,67 @@ cat /sys/bus/pci/devices/BDF/numa_node
 numactl --hardware
 ```
 
-irqbalance 可能重新分配 affinity，手工 hint 与系统策略要协调。所有 vector 都落到 CPU0 会形成单核瓶颈；盲目分散又会增加共享状态锁竞争。
+interrupt moderation 按 completion count、timer 或二者触发。增大阈值降低 IRQ/CPU、提高 batch，但增加低负载和 P99/P999 延迟。每次调参同时记录 completions/IRQ、poll budget exhausted、平均/P99、CPU 和 queue backlog。
 
-### Interrupt moderation 要与 batch 和 P99 一起测
+管理/实时 queue 可使用低延迟 vector，批量数据 queue 使用较强 moderation。自适应算法要防止负载边界震荡。
 
-Interrupt moderation可按 completion count、timer或两者触发。阈值 32 表示累计一批再 IRQ，timer保证低流量不会永久等待。增大阈值通常降低 IRQ/CPU、提高吞吐，但 P99/P999延迟上升。
+IRQ affinity 不是一次配置完成。irqbalance、CPU hotplug 和容器/cpuset 都可能改变有效 CPU。压测前保存 `/proc/interrupts`，压测中采样每 vector 增量和 poll CPU；若数据 queue 在 NUMA node 1 而 IRQ/worker/buffer 在 node 0，远端访问可能成为瓶颈。
 
-每次实验同时记录 completions/IRQ、poll budget耗尽次数、CQ high watermark、平均/P99延迟和CPU。只看总带宽会把排队延迟隐藏在深 ring中。
+## 六、DMA mapping、IOMMU、IOTLB 和内存系统
 
-自适应 moderation可以按负载切换，但必须防止震荡，并为实时/管理 queue保留低延迟 vector。IRQ affinity、worker和buffer NUMA位置也要成组配置。
+每个小 buffer 单独 map/unmap 会产生 IOMMU page-table/IOTLB invalidation 和锁开销。buffer pool、scatter-gather 合并、大页或长期 mapping 可以减少开销，但扩大 pinned memory 与访问窗口。
 
-## 六、DMA mapping、IOMMU 和 cache 可能成为软件瓶颈
+SWIOTLB bounce 会复制数据；远端 NUMA memory、内存控制器带宽、cache line false sharing 都可能先于 PCIe Link 饱和。使用 memory bandwidth/perf 与 IOMMU 日志区分。
 
-每个小 buffer 单独 map/unmap 会产生 IOMMU 页表和 IOTLB invalidation；长期 pool、scatter-gather 合并和合理大页可减少成本。SWIOTLB bounce 会额外复制，应通过日志确认。
+零拷贝不等于零成本。用户页 pin、mmap queue、IOMMU mapping、权限校验和生命周期都会增加复杂度。优化必须同时报告 CPU、内存、P99 和故障恢复。
 
-零拷贝只有在所有权清晰时才成立。把用户页长期 pin 或 mmap coherent buffer可能降低复制，却增加内存回收、cache 和安全复杂度。性能优化必须同时记录 CPU 占用、内存带宽和 pinned memory。
+## 七、可复现实验和稳定性闭环
 
-## 七、AER 与设备计数器是稳定性的一部分
-
-Advanced Error Reporting（AER）区分 Correctable、Uncorrectable Non-Fatal 和 Fatal。Correctable Error 频率持续增长可能预示链路质量问题，即使业务尚未失败；Fatal/Surprise Down 需要 reset/recovery。
-
-```bash
-lspci -s BDF -vv | grep -A20 'Advanced Error'
-dmesg | grep -i aer
+```mermaid
+flowchart TD
+    B[Freeze hardware firmware kernel governor topology] --> C[Record LnkSta MPS MRRS NUMA IOMMU]
+    C --> W[Choose payload, direction, concurrency, queue depth]
+    W --> M[Measure throughput, mean/P99, CPU, IRQ, memory, errors]
+    M --> O[Change one parameter]
+    O --> M
+    M --> S[Long stress, PM, FLR, hot reset, fault injection]
+    S --> R[Check request and resource conservation]
+    R --> A[Archive config, counters and raw evidence]
 ```
 
-设备驱动还应维护 submitted/completed/timeout/reset、IRQ、ring full、DMA mapping failure 和数据校验错误。压力结束后 producer/consumer、mapping 和 request 数必须收敛，不能只因数据还在流动就认为稳定。
+稳定性测试不只跑固定大包。交替 payload、并发、queue depth、runtime PM、FLR/hot reset、IOMMU fault、进程异常退出和 device remove。每轮结束检查：
 
-### 稳定性测试要证明资源守恒和错误恢复
+- `submitted = completed + failed`；
+- inflight、DMA mapping、buffer pool 回到基线；
+- IRQ/work/timer 无残留；
+- reset 后旧 generation completion 不进入新请求；
+- AER Correctable/Non-Fatal/Fatal 计数与业务错误关联。
 
-长压不仅跑固定大包。应交替 payload、queue depth、并发进程、runtime PM、FLR/hot reset、IOMMU fault注入和用户异常退出。每轮结束检查 submitted/completed/failed/in_flight守恒、DMA mapping与buffer pool归零、IRQ/work无残留。
+AER correctable 持续增长可能预示 signal margin/replay，即使业务尚未失败；Completion Timeout、Surprise Down、Malformed TLP 必须关联发生时 Link/queue/reset 状态。性能验收应包含错误率、恢复时间和连续运行时间。
 
-AER Correctable计数增长虽然未中断业务，仍可能说明链路 margin不足；Completion Timeout、Surprise Down、Malformed TLP要与发生时 queue/reset状态关联。Reset成功标准不是设备重新出现在 lspci，而是 ring重新同步且旧 generation completion不会污染新请求。
+### 一组可执行的测量记录
 
-将错误率、恢复时间和连续运行时长与吞吐一起验收，才能称为稳定性优化。
+```bash
+lspci -vv -s BDF > before-lspci.txt
+cat /proc/interrupts > before-irqs.txt
+numactl --hardware > numa.txt
+perf stat -e cycles,instructions,cache-misses \
+    -- ./pcie_workload --size 4096 --queues 4
+dmesg | grep -Ei 'aer|pcie|iommu|timeout' > errors.txt
+```
 
-## 八、一套可复现的 profiling 顺序
+工作负载本身应输出 payload、方向、并发、queue depth、batch、moderation、submitted/completed/failed 和 latency histogram。只保存控制台“平均带宽”无法复现实验。
 
-1. 固定硬件、固件、内核、CPU governor 和拓扑；
-2. 记录 LnkSta、MPS、MRRS、NUMA 和 IOMMU；
-3. 测量 payload size、queue depth、outstanding、batch、IRQ moderation；
-4. 同时记录吞吐、P99 延迟、CPU、IRQ、内存带宽和错误计数；
-5. 每次只改变一个参数；
-6. 做长时间、冷热 reset、错误注入与并发退出测试。
+长压后再次保存 lspci/AER/IRQ/驱动 counters，计算差值。若吞吐稳定但 Correctable Error/Replay 增长，性能结果不能判为通过；若平均延迟正常但 P99 在 reset/PM 时失控，也要单独呈现。
 
-`perf`、ftrace/trace-cmd 和设备 counters 用于定位 CPU/调度；协议 analyzer/硬件 counters 用于 TLP/credit/link。没有分层指标时，调参只能得到偶然结果。
+**参考资料**
 
-## 九、小结
+- [PCI Express Bus Performance HOWTO](https://docs.kernel.org/PCI/pciebus-howto.html)
+- [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
+- [PCI-SIG Specifications](https://pcisig.com/specifications)
 
-PCIe 性能由实际 Link、MPS/MRRS、TLP/credit、outstanding、ring、doorbell、MSI-X、NUMA、DMA/IOMMU 和内存系统共同决定。稳定性还必须观察 AER、timeout、reset 和资源收敛。下一篇将把这些指标放进故障证据链，从 PERST#/REFCLK 一路排到 IOMMU fault。
+## 八、小结
+
+PCIe 性能由实际 Link、TLP 开销、MPS/MRRS、tag/credit、outstanding、Ring、doorbell、MSI-X、CPU/NUMA、DMA/IOMMU 和内存系统共同决定。任何调优都必须有分层指标。
+
+稳定性则要求 AER、timeout、reset 和资源守恒同时成立。下一篇将把这些指标变成从电气到 DMA 的故障决策树。
