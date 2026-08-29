@@ -1,312 +1,227 @@
 ---
 title: "嵌入式知识体系 · PCIe 驱动开发实战 #03 · BAR、Resource Tree、ATU 与 MMIO"
-description: "BAR 把 Endpoint 内部资源暴露到系统地址空间。本篇从 BAR 编码、写全 1 sizing、Linux resource、MMIO accessor、posted write 和 ATU 讲清完整地址路径。"
+description: "用一组代表性地址贯穿 BAR sizing、桥窗口、Linux Resource、RC/EP ATU、pci_iomap 与 MMIO 顺序，建立 CPU 到 Endpoint 的完整地址路径。"
 pubDate: "2026-08-29"
 series: pcie
 order: 3
 tags: ["PCIe", "BAR", "MMIO", "Linux 6.12"]
 draft: false
 ---
-Endpoint 被枚举后，CPU 仍需要一种方式访问它的控制寄存器、doorbell、片上 SRAM 或 frame buffer。BAR（Base Address Register）描述这些窗口的类型、大小和属性，系统为它们分配地址，Host Bridge 把 CPU 访问转换成 PCIe Memory Request。
 
-本文的 PCI Resource 和映射 API 固定以 Linux 6.12 为基线。
+第 02 篇结束时，Linux 已经发现一个 Function，也知道它的 BAR0 需要多大空间。但这并不等于 CPU 已经可以访问设备：BAR 里是哪个地址域，Linux `resource` 为什么又显示另一个地址，`pci_iomap()` 返回的指针与 PCIe TLP 中的地址究竟是什么关系？
 
-BAR 最容易产生三个误解：BAR 中的值不是驱动随意写入的物理地址；`pci_iomap()` 返回的是 CPU 虚拟地址，不一定等于 PCIe bus address；读写 MMIO 不能用普通指针替代 `readl()/writel()`。本文把配置、资源和事务三层连起来。
+本文用一组**代表性示例值**走完地址路径。它们只用于计算和推导，不是某块 RK356x、RTL8822CE 或 FPGA 的实测结果。设备案例在这里不重要，重要的是不同平台都必须完成同样的“声明需求、分配窗口、转换地址、匹配 BAR、解码 offset”。
 
-## 一、BAR 描述窗口类型，而不是业务寄存器
+Linux API 与 Resource 行为固定到 Linux 6.12。读完后，应能够从 `lspci`、sysfs `resource`、Device Tree `ranges` 和控制器 ATU 配置之间建立因果关系，而不是把所有数字统称为“物理地址”。
 
-Type 0 Header 最多提供 6 个 BAR。每个 BAR 低位编码属性，高位参与 base address。主要类型：
+## 一、先看问题：BAR 里的地址为什么不能直接解引用
 
-- I/O BAR：面向传统 I/O Port，现代嵌入式系统较少使用。
-- 32-bit Memory BAR：地址位于 32-bit PCI 地址范围。
-- 64 位 BAR：占两个连续 BAR dword，低 dword 含属性和低地址，高 dword 含高地址。
-- Prefetchable Memory BAR：读操作没有 destructive side effect，允许系统进行预取/合并；常用于 frame buffer/大内存窗口。
-- Non-prefetchable Memory BAR：常用于控制/status register，不允许把读取任意重排/预取。
+假设 Endpoint 的 BAR0 声明 128 KiB 空间，PCI Core 给它分配 PCI Bus Address `0x4000_0000`。嵌入式 Root Complex 又把 CPU Physical `0xF800_0000`～`0xF801_FFFF` 映射到这段 PCI 地址。驱动最终通过 `pci_iomap()` 得到内核虚拟地址，但我们不伪造这个虚拟地址的固定数值。
 
-prefetchable 不等于 CPU cacheable，也不等于 write-combining 一定启用。它向资源分配/桥窗口表达 PCIe 事务属性，CPU page attribute 由架构和映射 API 决定。
+```text
+代表性示例，不是实测值
 
-一个 BAR 内可以包含多类寄存器，offset 由设备协议定义。例如 BAR0 0x0000 是 ID，0x0010 是 Control，0x1000 是 Doorbell。BAR 只负责把整个窗口路由到 Function，设备内部再解码 offset。
+Endpoint BAR0 size       = 128 KiB
+PCI Bus Address          = 0x4000_0000
+CPU Physical Window      = 0xF800_0000
+RC Outbound translation  = CPU 0xF800_0000 -> PCI 0x4000_0000
+Register offset          = 0x0000_0100
+TLP target address       = 0x4000_0100
+Endpoint local register  = BAR0 local base + 0x100
+```
 
-设备复位时 BAR base 通常为 0 或固件值。系统枚举后写入分配地址；驱动读取 `pci_resource_start()` 获得分配结果，不直接决定全局地址布局。
+因此驱动读取 `bar0 + 0x100` 时，CPU 侧访问的是某个内核虚拟地址，页表把它转换到 `0xF800_0100`，RC ATU 再转换成 PCIe Memory Read 地址 `0x4000_0100`，Endpoint BAR0 命中后取 offset `0x100`。这些地址数值可能不同，但表示的是同一次访问在不同地址域中的位置。
 
-## 二、写全 1 sizing 如何得到窗口大小
+如果把 BAR Register 中的 `0x4000_0000` 当成 CPU 可直接解引用的物理地址，访问可能打到错误外设、触发外部 Abort 或读回全 1。因为地址转换由 Host Bridge 决定，所以功能驱动必须使用 PCI Core 已经建立的 Resource 和映射 API。
 
-BAR 大小必须是 2 的幂并按大小对齐。枚举软件保存原值、暂时避免 decode 干扰，向 BAR 写 `0xffffffff`，读回设备实现的 address mask，屏蔽属性位后取反加一。
+## 二、BAR 首先声明窗口需求与属性
+
+BAR 是 Base Address Register 的缩写，位于 Type 0/Type 1 Configuration Header 中。它不是业务寄存器本身，而是 Function 向系统声明“我需要一段怎样的地址窗口”；窗口内部 offset 的含义才由设备协议定义。
+
+Type 0 Header 最多有 6 个 BAR。常见编码包括 I/O BAR、32-bit Memory BAR 和 64-bit Memory BAR；64-bit BAR 占两个连续 dword，低 dword 保存属性和低地址，高 dword保存高地址，因此不能把相邻两个槽位误判成两个独立资源。
+
+Prefetchable 表示读取没有 destructive side effect，允许上游进行预取、合并等优化。它不等于 CPU Cache 一定打开，也不等于任何映射都可以使用 Write Combining。控制寄存器、Read-Clear 状态、FIFO Data Port 等通常需要 Non-Prefetchable 语义，因为多读一次就可能改变设备状态。
+
+一个 BAR 可以包含多个子区域，例如：
+
+```text
+BAR0 + 0x0000 : device identity and capability registers
+BAR0 + 0x0100 : control and status registers
+BAR0 + 0x1000 : queue doorbell array
+BAR0 + 0x8000 : on-device SRAM aperture
+```
+
+PCIe 只负责把整个 BAR Window 路由到 Function，设备内部再解释 offset。不同厂商可以让同一 offset 表示完全不同的功能，因此标准 Explorer 可以安全读取 BAR Resource 属性，却不能凭别家数据手册去读写未知设备 BAR。
+
+## 三、BAR sizing 怎样得到 128 KiB
+
+设备不能仅靠一个固定字段直接报告 BAR 大小。标准枚举方法是保存原值、向地址位写全 1、读回设备实现的 Mask、屏蔽属性位，再取反加一。设备未实现的低地址位读回 0，因此 Mask 同时表达大小和对齐要求。
 
 ```mermaid
 sequenceDiagram
-    participant K as PCI Core
-    participant C as Endpoint Config BAR
-    K->>C: Save original BAR value
-    K->>C: Write 0xffffffff
-    C-->>K: Return implemented address mask and attributes
-    K->>K: Clear attribute bits, invert mask, add one
-    K->>C: Restore or program allocated base
-    K->>K: Insert assigned range into resource tree
+    participant CORE as PCI Core
+    participant CFG as Endpoint BAR0 config register
+    CORE->>CFG: save original value
+    CORE->>CFG: write all ones to address bits
+    CFG-->>CORE: implemented address mask + attributes
+    CORE->>CORE: clear attributes, invert mask, add one
+    CORE->>CFG: restore or program allocated base
 ```
 
-假设 32-bit Memory BAR 读回 `0xfffff008`。bit0 为 0 表示 Memory，type/属性低位去掉后 mask 是 `0xfffff000`，`~mask + 1 = 0x1000`，因此窗口 4 KiB，base 必须 4 KiB 对齐。
+对 128 KiB 的 32-bit Memory BAR，屏蔽属性后的代表性 Mask 是 `0xFFFE_0000`：
 
-64-bit BAR 要把高/低 dword 合并后计算，并跳过被占用的下一个 BAR index。驱动若把两个 dword 当成两个独立 BAR，会把高地址误判成资源。BAR mask 的属性位也必须从原始值而非地址 mask 中保存。
+```text
+size = ~(0xFFFE_0000) + 1
+     = 0x0002_0000
+     = 128 KiB
+```
 
-Resizable BAR Capability 允许在设备支持集合中选择更大/更小 window，但仍由 PCI Core/平台资源策略协调。驱动不能在 BAR 已映射且 DMA/用户 mmap 活动时私自调整大小。
+这意味着 Base Address 必须按 128 KiB 对齐。64-bit BAR 要先组合高低 dword 再计算，Resizable BAR 则允许系统从设备支持的 Size 集合中选择，但仍要满足 Host Window、Bridge Window 和系统资源策略。
 
-生产系统不应使用 `setpci` 对已启用设备执行 sizing：写全 1 会暂时改变地址 decode，其他 CPU/driver 可能并发访问。应读取 Linux 已保存的 resource 或在受控早期枚举环境调试。
+因为 sizing 会暂时改写配置寄存器，所以它应在功能驱动尚未并发使用设备时完成。对已经启用 DMA 的设备使用 `setpci` 写全 1，不是“只读探测”，而是可能破坏正在运行的地址 Decode。
 
-## 三、Linux resource tree 先声明所有权，再建立映射
+## 四、Linux Resource Tree 记录分配结果与所有权
 
-PCI Core 把 BAR 保存为 `pci_dev->resource[]`。每项包含 CPU 资源起止地址和 `IORESOURCE_IO/MEM/PREFETCH` 等 flags，并挂入系统 resource tree。父 Host Bridge/Bridge window 必须覆盖该区间。
+PCI Core 将每个 BAR 表示为 `pci_dev->resource[]` 中的 `struct resource`，保存 CPU 侧起止地址和 `IORESOURCE_MEM`、`IORESOURCE_IO`、`IORESOURCE_PREFETCH` 等属性。它还把资源插入系统 I/O 或 iomem 树，从而表达 Host Window、Bridge Window 和 Endpoint BAR 的包含关系。
 
-驱动通常按以下顺序处理 BAR：
+```mermaid
+flowchart TD
+    ROOT[iomem_resource] --> HOST[Host Bridge CPU memory window]
+    HOST --> BR[Root Port / Switch memory window]
+    BR --> BAR0[pdev resource BAR0 128 KiB]
+    BR --> BAR2[pdev resource BAR2]
+    BAR0 --> OWNER[driver requested region]
+```
+
+Resource Tree 解决的是范围分配和软件所有权，不自动建立 CPU 页表映射，也不自动启用设备 DMA。因此 `pci_resource_start()`、`pci_request_region()` 和 `pci_iomap()` 分别回答三个不同问题：地址被分到哪里、当前驱动是否获得独占使用权、CPU 用哪个 `__iomem` 地址访问。
+
+在代表性示例中，`pci_resource_start(pdev, 0)` 可能返回 CPU Resource `0xF800_0000`，而 `lspci` 侧重显示 PCI 配置和 Bus 视角。不同体系结构的 `/sys/bus/pci/devices/BDF/resource` 以 Linux Resource 为准，因此不能假设它与 TLP Address 数字相同。
+
+Bridge Window 必须覆盖下游 BAR 且属性兼容。若 Endpoint BAR0 已分配 `0x4000_0000`，但上游 Bridge Memory Base/Limit 不包含该范围，配置访问仍然可能成功，因为 Configuration Request 走 BDF 路由；普通 Memory Request 却会在桥处被挡住。
+
+## 五、驱动按 Request、Map、Access 的顺序取得 BAR
+
+功能驱动不应拿到 `pci_dev` 后立即解引用 Resource。正常顺序是先启用设备 Decode，再验证 BAR 类型和大小，申请 Resource 所有权，最后建立映射：
 
 ```c
 int ret;
 
-ret = pci_enable_device(pdev);
+ret = pci_enable_device_mem(pdev);
 if (ret)
     return ret;
 
-ret = pci_request_region(pdev, 0, "demo_bar0");
+if (!(pci_resource_flags(pdev, 0) & IORESOURCE_MEM)) {
+    ret = -ENODEV;
+    goto err_disable;
+}
+
+if (pci_resource_len(pdev, 0) < SZ_128K) {
+    ret = -ENOSPC;
+    goto err_disable;
+}
+
+ret = pci_request_region(pdev, 0, "demo-bar0");
 if (ret)
     goto err_disable;
 
-if (!(pci_resource_flags(pdev, 0) & IORESOURCE_MEM)) {
-    ret = -ENODEV;
-    goto err_release;
-}
-
-dev->bar0_len = pci_resource_len(pdev, 0);
-if (dev->bar0_len < DEMO_REQUIRED_BAR0_SIZE) {
-    ret = -ENOSPC;
-    goto err_release;
-}
-
-dev->bar0 = pci_iomap(pdev, 0, 0);
-if (!dev->bar0) {
+bar0 = pci_iomap(pdev, 0, 0);
+if (!bar0) {
     ret = -ENOMEM;
     goto err_release;
 }
+
+return 0;
+
+err_release:
+    pci_release_region(pdev, 0);
+err_disable:
+    pci_disable_device(pdev);
+return ret;
 ```
 
-`pci_request_region()` 在 resource tree 声明驱动拥有 BAR，防止两个驱动/子系统同时映射使用；`pci_iomap()` 根据 I/O/Memory 类型建立适合架构的 `__iomem` 映射。顺序不能反：先映射再 request 会在冲突设备上短暂访问不属于自己的资源。
+`pci_request_region()` 成功表示没有其他 Resource Owner 冲突，`pci_iomap()` 成功表示内核建立了适合当前架构的 I/O 映射。映射成功仍不证明设备会响应，因为 Command Memory Space Enable、Bridge Window、ATU、Link 和 Endpoint 内部 Decode 任何一层都可能有问题。
 
-也可使用 `pci_request_regions()` 申请所有 BAR，或 `pcim_*` managed API 自动释放。但 managed release 只减少 error label，不替代停机顺序：remove 时先停止硬件/IRQ/DMA，再让 mapping/resource 被释放。
+也可以使用 `pci_request_regions()` 申请 Function 的全部可请求 BAR，或使用 `pcim_*` Managed API 简化释放。但 Managed API 只负责对象生命周期，不能替代停机顺序；remove 时仍要先停止用户入口、IRQ 和 DMA，再让映射与 Resource 自动释放。
 
-`pci_resource_start()` 是 CPU resource address，sysfs `resource` 也通常展示该视角。它不保证等于 Endpoint 在 TLP header 中看到的地址；Host Bridge 可在中间做转换。
+## 六、MMIO 必须使用 I/O Accessor
 
-## 四、MMIO accessor、side effect 和 posted write
-
-`pci_iomap()` 返回 `void __iomem *`。驱动使用 `readb/readw/readl/readq`、`writeb/writew/writel/writeq`，而不是普通 `*ptr`：accessor 处理架构 I/O ordering、endianness 约定和静态检查。
+`pci_iomap()` 返回 `void __iomem *`，这个类型提醒代码不能像普通 RAM 一样访问。驱动使用 `readb/readw/readl/readq` 与 `writeb/writew/writel/writeq`，让编译器和体系结构应用正确的 I/O 宽度、顺序和地址空间规则。
 
 ```c
-u32 id = readl(dev->bar0 + DEMO_REG_ID);
-if (id != DEMO_EXPECTED_ID)
-    return -ENODEV;
+u32 id = readl(bar0 + DEMO_REG_ID);
 
-writel(DEMO_CTRL_RESET, dev->bar0 + DEMO_REG_CONTROL);
+writel(DEMO_CTRL_STOP, bar0 + DEMO_REG_CONTROL);
+status = readl(bar0 + DEMO_REG_STATUS);
 ```
 
-寄存器语义比宽度更重要：
+普通 `*ptr` 解引用可能被编译器合并、重排或按普通 Cacheable Memory 处理。即使在 x86 上偶然可用，也会把错误带到 ARM、RISC-V 或不同映射属性的平台。因此 `__iomem` 与 Accessor 不是语法装饰，而是在代码中表达设备 I/O 语义。
 
-- Read-clear：读取会清状态，调试脚本不能反复读。
-- W1C：写 1 清对应 bit，read-modify-write 可能误清其他事件。
-- Doorbell：写入触发设备消费 descriptor，必须先发布内存。
-- Split 64-bit：32-bit CPU/设备可能要求固定高低顺序或 latch。
-- FIFO/data port：连续读取/写入有 side effect，不能预取。
+寄存器字节序和 side effect 由设备协议定义：Read-Clear 会在读取后清零，W1C 要写 1 清位，Doorbell 写入会触发队列消费，FIFO Port 每次读取都可能 Pop 数据。因为这些行为不是 PCIe 通用规则，所以调试程序不能把“读 BAR 前 64 字节”当成对所有设备都安全。
 
-PCIe Memory Write 是 posted write。`writel()` 返回只表示 CPU/RC 接受写，不保证 Endpoint 已执行。若驱动在关闭 IRQ、reset 或释放资源前必须确认写到达，使用设备规范指定的安全 readback：
+## 七、Posted Write 为什么需要按协议 Flush
 
-```c
-writel(DEMO_CTRL_STOP, dev->bar0 + DEMO_REG_CONTROL);
-readl(dev->bar0 + DEMO_REG_STATUS); /* Flush posted write. */
-```
-
-不要随意读 W1C/read-clear/FIFO 寄存器用于 flush。设备协议应提供无副作用 status/ID 或显式 completion。
-
-MMIO ordering 也不替代 DMA barrier。CPU 写普通内存 descriptor 后敲 doorbell：先填 descriptor，`dma_wmb()`，再 `writel()`；设备写 completion 后，CPU 从 MMIO/内存看到完成，再使用 `dma_rmb()` 读取 payload/descriptor 字段。具体模式以后续 DMA 文章为准。
-
-## 五、CPU 地址、PCIe 地址、BAR 和 ATU 的完整路径
-
-嵌入式 RC 常有多个地址域：驱动的 CPU virtual address、CPU physical MMIO window、PCIe bus address、Endpoint BAR match 和设备内部 offset。Address Translation Unit（ATU）负责在 RC/EP 边界转换窗口。
-
-```mermaid
-flowchart LR
-    VA[Driver CPU virtual __iomem address] --> PA[CPU physical outbound window]
-    PA --> RATU[Root Complex outbound ATU]
-    RATU --> BUS[PCIe bus address in Memory TLP]
-    BUS --> BAR[Endpoint BAR address match]
-    BAR --> EATU[Endpoint inbound translation optional]
-    EATU --> REG[Device internal register or SRAM offset]
-```
-
-Device Tree `ranges` 可描述 CPU address 到 PCI bus address 的 Host Bridge window。PCI Core 在该 window 中分配 BAR，并把 CPU 侧 resource 提供给驱动。RC outbound ATU 必须覆盖转换；Endpoint inbound ATU 可能把 BAR hit 映射到片上 AXI/APB 地址。
-
-若 `lspci` 显示 BAR 已分配，但 CPU `readl()` 全 1/abort：
-
-1. 确认驱动映射的 BAR/index/offset。
-2. 检查 Host `ranges` 与 resource 地址。
-3. 检查 RC outbound ATU base/limit/target。
-4. 检查 TLP 是否到达 Endpoint。
-5. 检查 BAR enable/Command Memory Space。
-6. 检查 EP inbound ATU 和内部 bus target。
-
-对 Device 发起 DMA 的 outbound path，方向相反且通常使用 `dma-ranges`/IOMMU；不能拿 MMIO BAR 地址直接当 DMA 地址。
-
-## 六、资源停止、用户映射和错误验证
-
-remove/错误回滚时，先阻止用户进入和新 MMIO，停止设备产生中断/DMA，flush posted stop，等待 hardware idle/synchronize IRQ，再 `pci_iounmap()`、`pci_release_region()`、`pci_disable_device()`。
-
-若把 BAR 暴露给用户 `mmap()`，需要限制 offset/length、只映射允许区域、设置 `pgprot_noncached` 或架构合适属性，并处理 Device remove。用户持有 VMA 时硬件消失，访问可能触发 machine check；生产设计通常用 ioctl/read/write 隔离控制寄存器，只对明确 data aperture 开放 mmap。
-
-调试命令：
-
-```bash
-lspci -s BDF -vv
-cat /sys/bus/pci/devices/BDF/resource
-cat /proc/iomem
-sudo devmem CPU_RESOURCE_ADDR 32   # 仅在确认安全寄存器和无人占用时
-```
-
-`lspci` 的 BAR、sysfs resource、`/proc/iomem` 应形成一致所有权链。内核驱动已绑定时不要用 `devmem` 并发访问有 side effect 的寄存器。
-
-常见错误：
-
-- BAR 为 0/unassigned：Host resource/window 不足或 sizing/bridge allocation 失败。
-- `pci_request_region()` 返回 busy：已有 owner，检查 driver/firmware reservation。
-- `pci_iomap()` 成功但读取全 1：decode/ATU/Link/offset 问题，mapping 成功不证明设备响应。
-- 写入后立即检查失败：posted write 未 flush 或设备异步处理。
-- 只在 64-bit 地址失败：BAR 高 dword、Host window、DMA mask 或 ATU 地址宽度错误。
-
-**参考资料**
-
-- [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
-- [PCI-SIG Specifications](https://pcisig.com/specifications)
-- [Linux I/O Mapping documentation](https://docs.kernel.org/driver-api/device-io.html)
-
-## 七、64-bit 与 Prefetchable 属性影响放置
-
-Memory BAR bit 2:1 表示地址类型，64-bit BAR 占用相邻两个 BAR Register。
-
-读取/写入时要把低 dword 的属性 bit 与上下地址分开。
-
-Prefetchable 表示读取无副作用、允许合并/预取等优化语义，不等于“缓存一定打开”。
-
-Doorbell、Status FIFO 等有 read side effect 的窗口不能错误标成 Prefetchable。
-
-大容量 Frame Buffer/Device Memory 常使用 64-bit Prefetchable BAR，并放在 4 GiB 以上。
-
-每级 Bridge 和 Host Window 都要支持相应地址宽度和属性。
-
-## 八、Resource Tree 表示声明所有权与包含关系
-
-Linux 将 BAR 转换为 `struct resource`，插入 I/O Port 或 iomem 树。
-
-```mermaid
-flowchart TD
-    IOMEM[iomem_resource] --> HOST[PCI host bridge window]
-    HOST --> BR[bridge memory window]
-    BR --> BAR0[pdev resource BAR0]
-    BR --> BAR2[pdev resource BAR2]
-    BAR0 --> REG[driver requested register aperture]
-```
-
-`pci_request_regions()` 声明整个 Function 的可请求 BAR。
-
-`pci_request_region(pdev, bar, name)` 只声明一个。
-
-请求成功不执行映射；`pci_iomap()` 才产生 `__iomem` 地址。
-
-映射成功不自动启用 Device DMA；还需要 DMA Mask、Bus Master 与 Device 私有 Queue。
-
-释放顺序为停止设备访问、iounmap、release region、disable device。
-
-## 九、MMIO accessor 表达宽度、字节序与顺序
-
-使用 `readb/readw/readl/readq` 与 `write*`（按体系结构支持）访问 `__iomem`。
-
-这些接口表达 I/O 地址空间语义。
-
-普通 `*ptr` 解引用会绕过必要的编译器/体系结构 I/O 规则。
-
-设备寄存器字节序由硬件手册定义。
-
-PCI 配置与多数 PCIe Device Register 使用 Little Endian，但自定义 FPGA 协议仍应明确。
-
-`ioread32be()` 等接口适用于确实定义为 Big Endian 的窗口。
-
-## 十、posted write 需要按协议 flush
-
-PCIe Memory Write 是 Posted Request。
-
-CPU `writel()` 返回时，Write 可能仍在 Root Complex/Bridge Buffer 中，Device 尚未观察。
-
-当软件必须确认此前 Write 已到达设备，可读取一个定义为安全的同设备寄存器，利用 Non-Posted Read Completion flush 路径。
+PCIe Memory Write 是 Posted Request，`writel()` 返回只说明 CPU/Root Complex 接受了写入，不保证 Endpoint 已经执行。若驱动随后立即关闭时钟、释放队列或执行 Reset，仍在桥和 RC 中排队的写可能晚到，形成难以复现的状态错误。
 
 ```mermaid
 sequenceDiagram
-    participant CPU as Driver CPU
-    participant RC as Root Complex/Bridge
+    participant CPU as Driver
+    participant RC as Root Complex / Bridge
     participant EP as Endpoint
-    CPU->>RC: writel Doorbell posted write
-    Note over RC: write may be buffered
-    CPU->>RC: readl safe status register
-    RC->>EP: ordered Memory Read request
+    CPU->>RC: writel STOP (posted)
+    Note over RC: write may still be buffered
+    CPU->>RC: readl safe STATUS
+    RC->>EP: Memory Read (non-posted)
     EP-->>RC: Completion with Data
-    RC-->>CPU: readl returns after prior write reached ordering point
+    RC-->>CPU: readl returns after ordering point
 ```
 
-不能随便读取 Clear-on-Read 或 Pop FIFO Register 来 flush。
+常见做法是在设备手册允许时读取同一 Function 的无副作用寄存器，利用 Non-Posted Read 的 Completion 把此前写推进到规定顺序点。但不能随意读取 Read-Clear、W1C、FIFO 或会触发状态变化的寄存器，因此“哪个寄存器可用于 Flush”属于设备协议。
 
-选择哪个寄存器必须由硬件协议定义。
+MMIO Flush 也不等于 DMA Barrier。CPU 填写 Descriptor 后通知设备，通常需要 `dma_wmb()` 保证普通内存先对设备可见，再 `writel()` Doorbell。因为它们约束不同地址空间，所以一个安全 readback 不能替代 Descriptor 所有权发布。
 
-## 十一、ATU 把 CPU/PCI/Local 三种地址连接
+## 八、RC/EP ATU 把不同地址域连接起来
 
-嵌入式 Root Complex 常有 Outbound ATU：把 CPU Physical Window 转为 PCIe Address/TLP。
-
-Endpoint Controller 常有 Inbound ATU：把 Host 对 BAR 的访问映射到 EP Local Address。
-
-Endpoint 主动访问 Host Memory 还可能需要 Outbound ATU。
+嵌入式 Root Complex 常用 Address Translation Unit（ATU）把 CPU Physical Window 转换成 PCIe Address。Device Tree `ranges` 描述 Host Bridge 的 CPU/PCI 地址关系，控制器驱动据此建立 Outbound Region，PCI Core 再在可用 PCI Window 中分配 BAR。
 
 ```mermaid
 flowchart LR
-    CPUVA[CPU virtual ioremap address] --> CPUPA[CPU physical PCI window]
-    CPUPA --> RCATU[RC outbound ATU]
-    RCATU --> PCIA[PCIe bus address]
-    PCIA --> BAR[Endpoint BAR match]
-    BAR --> EPATU[EP inbound ATU]
-    EPATU --> LOCAL[EP local register/SRAM]
+    VA[Kernel virtual __iomem] --> PA[CPU physical 0xF8000100]
+    PA --> RCATU[RC outbound ATU]
+    RCATU --> BUS[PCI address 0x40000100]
+    BUS --> BAR[Endpoint BAR0 match]
+    BAR --> EPATU[optional EP inbound ATU]
+    EPATU --> LOCAL[local register offset 0x100]
 ```
 
-任何一层 Base/Limit/Target/Type 错误都会让访问读全 1、触发 abort 或打到错误窗口。
+Endpoint Controller 还可能使用 Inbound ATU，把 Host 对某个 BAR 的访问映射到片上 AXI/APB/SRAM 地址。Endpoint 主动访问 Host Memory 时则可能需要另一组 Outbound ATU，并可能叠加 Host IOMMU；这条 DMA 地址路径与 CPU 访问 BAR 的 MMIO 路径不能混用。
 
-`lspci` 读取配置空间成功不证明 Memory ATU 正确，因为 Configuration Transaction 可走不同窗口。
+若 `lspci` 可读、BAR 已分配，而 `readl()` 全 1或触发 Abort，可以按地址路径逐层检查：Resource 是否属于正确 BAR，Command Memory Enable 是否打开，Bridge Window 是否覆盖，Host `ranges` 与 Outbound ATU 是否一致，TLP 是否到达 Endpoint，BAR Hit 是否进入正确 Inbound Region。
 
-## 十二、mmap BAR 的安全边界
+因为 Configuration Request 与 Memory Request 可能使用不同 ATU Region，所以“配置空间能读”只能证明 Config Path，不足以证明 Memory Path。这个区别是嵌入式 PCIe Bring-up 中最重要的分层之一。
 
-用户映射 BAR 前必须验证：
+## 九、用户映射与停止顺序决定安全边界
 
-- 只映射允许的 BAR/子范围。
-- Page Offset 与 Length 不溢出。
-- 目标 Resource 属于当前 Device。
-- 缓存属性符合 BAR 语义。
-- Device 在线且 Mapping 生命周期有管理。
-- 用户不能越过 Control Region 访问敏感寄存器。
+把 BAR 暴露给用户 `mmap()` 之前，驱动必须限制 BAR 和子范围、检查 Page Offset/Length 溢出、选择正确缓存属性，并定义设备移除后的 Fault 行为。控制寄存器通常不适合直接映射给任意用户，因为用户可以绕过锁、状态机和权限检查。
 
-remove 时已有 VMA 可能仍存在。
+remove 或 Probe 回滚的顺序从“谁还可能访问这段 MMIO”推导：先阻止新用户请求，停止设备产生新 DMA/IRQ，写 Stop 并按协议 Flush，等待 Hardware Idle，`synchronize_irq()`，释放 DMA，再 `pci_iounmap()`、`pci_release_region()` 和 `pci_disable_device()`。
 
-驱动需要通过引用、revocation 或上层框架定义断开后的 fault 行为。
+若先解除映射再停止设备，IRQ Handler 或 Worker 可能继续访问失效 `__iomem`；若先释放 Resource 再撤销用户 VMA，另一个驱动可能获得同一区域而旧进程仍可访问。因此所有权和地址映射必须与异步执行上下文一起设计。
 
-简单 `remap_pfn_range()` 后在 remove 直接释放一切，可能留下用户访问失效 MMIO 的风险。
+## 十、本篇检查点
 
-## 十三、一手资料
+现在应当能够把以下五个概念严格区分：BAR Register 表示设备窗口需求和 PCI 地址编码；Linux `resource` 表示 CPU 侧范围与软件所有权；`pci_request_regions()` 声明当前驱动占用；`pci_iomap()` 建立内核 I/O 映射；ATU 在 CPU、PCI 和 Endpoint Local 地址域之间转换。
 
-- [Linux 6.12 PCI resource API](https://www.kernel.org/doc/html/v6.12/driver-api/pci/pci.html)
-- [Linux device I/O access](https://docs.kernel.org/driver-api/device-io.html)
-- [Linux stable PCI setup source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci/setup-res.c?h=linux-6.12.y)
-- [PCI-SIG specifications](https://pcisig.com/specifications)
+还应能够解释为什么 `pci_iomap()` 成功不等于访问成功，为什么 Configuration Space 可读不等于 Memory Window 正常，以及为什么 Posted Write Flush 与 DMA Barrier 是两个不同问题。如果这些边界仍然混在一起，后续驱动 Probe、DMA 和 Reset 会变成只能记顺序的 API 清单。
 
-## 十四、小结
+## 十一、小结：下一篇进入 Linux PCI Core 对象
 
-BAR 是 Endpoint 对系统声明的地址窗口需求。PCI Core 通过写全 1 sizing 取得大小，在 Host/Bridge resource window 中分配地址并写回 BAR；驱动先 request resource，再 iomap，并用 MMIO accessor 按寄存器语义访问。
+BAR 让 Endpoint 声明窗口大小、类型和属性，PCI Core 在 Host/Bridge Window 中分配地址并建立 `struct resource`。驱动先 Enable、验证、Request，再通过 `pci_iomap()` 获得 `__iomem`，并使用 MMIO Accessor 按寄存器协议访问。
 
-一次 CPU 访问可能经历 virtual address、CPU physical window、RC ATU、PCIe bus address、BAR match 和 EP internal translation。下一篇将在这条资源基础上构建完整 `pci_driver` 生命周期和 probe 错误回滚。
+一次读取从内核虚拟地址出发，经过 CPU Physical Window、RC Outbound ATU、PCI Bus Address、Endpoint BAR Match 和可选 EP Inbound ATU。下一篇将回答这些枚举和资源结果在 Linux 中由哪些对象保存，以及 `pci_host_bridge`、`pci_bus`、`pci_dev` 和 `pci_ops` 如何按创建顺序连接起来。
+
+**一手资料**
+
+- [Linux 6.12 PCI driver API](https://www.kernel.org/doc/html/v6.12/driver-api/pci/pci.html)
+- [Linux Device I/O access](https://docs.kernel.org/driver-api/device-io.html)
+- [Linux 6.12 PCI resource setup source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci/setup-res.c?h=linux-6.12.y)
+- [PCI-SIG Specifications](https://pcisig.com/specifications)

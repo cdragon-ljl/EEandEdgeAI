@@ -1,299 +1,192 @@
 ---
 title: "嵌入式知识体系 · PCIe 驱动开发实战 #01 · 拓扑、Lane、Link、LTSSM 与 TLP"
-description: "从什么是 PCI Express 开始，建立点对点拓扑、Link/Lane、代际速率、三层协议、事务、流控、可靠性和链路训练模型，再映射到 Linux。"
+description: "从 CPU 读取 Endpoint 寄存器这一具体问题出发，建立 PCIe 拓扑、事务、三层协议、链路训练、流控、顺序与 Linux 观察方法。"
 pubDate: "2026-08-29"
 series: pcie
 order: 1
 tags: ["PCIe", "Protocol", "Linux 6.12"]
 draft: false
 ---
-PCI Express，简称 PCIe，是 CPU/内存系统连接高速外设的一套通用 I/O 互连协议。NVMe SSD、网卡、GPU、FPGA、采集卡和 AI 加速器都可以借助它访问寄存器、交换数据并向 CPU 发出通知。
 
-本文的 Linux 对象与工具固定以 Linux 6.12 为基线，协议层对照 PCI-SIG 公开资料。
+学习 PCIe 时最容易遇到的问题不是概念太少，而是概念同时出现：Root Complex、Lane、TLP、LTSSM、Credit、BAR、DMA 看起来彼此独立，读者只能逐个记忆，却不知道它们为什么会在同一次访问中同时发挥作用。
 
-它不是“更快的 USB”，也不是一组 Linux API。PCIe 首先是一套硬件与协议共同定义的互连：设备如何形成点对点拓扑，串行链路如何训练，读写请求如何封装和返回，发送端如何受流控约束，错误如何被检测并恢复。Linux 的枚举、BAR、中断和 DMA 都建立在这些机制之上。
+本文只从一个具体问题开始：**CPU 执行一次 `readl()`，为什么最后能够读到插在 PCIe 插槽中的设备寄存器？**我们会跟随这次读取经过软件地址、Root Complex、链路和 Endpoint，再从这条路径中自然引出拓扑、事务和三层协议。
 
-本文从零回答三件事：PCIe 为什么出现；一条链路中实际传输什么；CPU 读设备寄存器和设备访问内存时，事务如何往返。
+Linux 相关对象和命令以 Linux 6.12 为基线。协议行为以 PCI-SIG 公开资料为依据；文中设备名称只帮助观察拓扑，不把某一款网卡、SSD 或 FPGA 的私有寄存器当成 PCIe 规范。
 
-## 一、为什么高速设备需要 PCIe
+## 一、先看问题：一次寄存器读取经历了什么
 
-CPU 不能为每类高速外设设计一套专用引脚、地址和驱动模型。一个通用互连至少要解决：设备发现、地址分配、可靠传输、并发、带宽扩展、中断、电源管理和错误报告。
+假设驱动已经把设备 BAR0 映射为 `bar0`，并执行下面的读取：
 
-传统 PCI 使用共享并行总线。多块设备共享地址/数据线与仲裁，时钟频率、走线偏差和负载限制了扩展。PCIe 保留了 PCI 软件可见的配置空间和资源模型，但把电气传输改造成高速串行、全双工、点对点 Link。每条 Link 只连接两个 Port，Switch 再把多条 Link 组成 fabric。
+```c
+u32 status = readl(bar0 + 0x100);
+```
 
-“点对点”不等于只能连接一个设备。它表示每段电气链路有明确的两个端点，多个设备通过 Root Port 和 Switch Port 形成树。这样每条 Link 可以独立协商速度/宽度并并行传输，不再由所有设备争用一组并行线。
+这行代码表面上只是 CPU Load，实际至少经历五次语义转换：内核虚拟地址转换成 CPU 物理 MMIO 地址；Root Complex 判断地址属于 PCIe 窗口；地址被封装成 Memory Read Request；Endpoint 根据 BAR 和 offset 找到寄存器；读取结果再通过 Completion 返回 CPU。
 
-PCIe 对软件提供 load/store 风格。CPU 访问某个映射地址时，Root Complex 把请求转换成 PCIe 事务；设备访问 Host memory 时也发出事务。软件看到地址和读写，链路上则是 packet。
+```mermaid
+sequenceDiagram
+    participant CPU as CPU / readl
+    participant RC as Root Complex
+    participant LNK as PCIe Link
+    participant EP as Endpoint
+    CPU->>RC: load CPU MMIO address
+    RC->>LNK: Memory Read Request TLP
+    LNK->>EP: route by address
+    EP->>EP: BAR match + register decode
+    EP-->>LNK: Completion with Data
+    LNK-->>RC: return same request tag
+    RC-->>CPU: finish load with value
+```
 
-## 二、Root Complex、Endpoint、Switch 与 Port 组成拓扑
+因为 Memory Read 需要返回数据，所以它属于 Non-Posted Request，必须得到 Completion。与之相对，CPU 使用 `writel()` 写设备寄存器时通常产生 Posted Memory Write，正常路径没有逐笔成功 Completion。因此驱动若需要确认停止命令已经到达设备，必须使用设备协议允许的安全 readback，而不是等待一个不存在的“写完成包”。
 
-Root Complex（RC）连接 CPU/内存系统与 PCIe fabric。它提供一个或多个 Root Port，负责配置访问、地址路由、事务进入内存系统以及平台级错误/中断集成。
+这条最小路径已经给出了后续学习顺序：先知道请求经过哪些节点，再理解请求在链路上以什么格式传输，最后讨论链路如何保证请求可靠到达。BAR 地址如何得到会在第 03 篇展开，本篇暂时把它视为已经建立的入口。
 
-Endpoint（EP）是叶子设备，例如 NVMe、NIC、GPU 或 FPGA。Endpoint 暴露配置空间和一个或多个功能；每个 Function 可以拥有独立 ID、BAR、Capability 和驱动。
+## 二、Root Complex、Port、Switch 与 Endpoint 组成路径
 
-Switch 有一个 Upstream Port 面向 RC，多个 Downstream Port 面向 Endpoint 或下级 Switch。每个 Port 在配置软件看来具有 PCI-to-PCI Bridge 特征，用 bus number 和窗口路由下游事务。
+PCIe 不是所有设备共享一组电气导线的并行总线，而是由多段点对点 Link 组成的树形互连。每段 Link 只连接两个 Port；需要接入更多设备时，由 Root Port 和 Switch Port 把多段 Link 连接起来。
+
+Root Complex（RC）位于 CPU/内存系统与 PCIe fabric 的边界。它把 CPU MMIO 访问变成 PCIe 事务，也把设备发起的 DMA 事务送入内存系统。Root Complex 可以提供多个 Root Port，每个 Root Port 都是下游拓扑的一条入口。
+
+Endpoint（EP）是树的叶子，例如 NVMe SSD、网卡、GPU 或 FPGA。一个物理 Endpoint 可以包含多个 Function，每个 Function 都有自己的配置空间、设备 ID、BAR 和驱动绑定关系。因此 Linux 中的一个 `pci_dev` 对应 Function，而不一定对应整块板卡。
+
+Switch 的 Upstream Port 面向 Root Complex，Downstream Port 面向 Endpoint 或下级 Switch。Switch 主要根据地址或 Routing ID 转发 TLP，它通常不知道某个 offset 是队列 Doorbell 还是状态寄存器。
 
 ```mermaid
 flowchart TD
     CPU[CPU and Memory] --> RC[Root Complex]
-    RC --> RP0[Root Port 0]
-    RC --> RP1[Root Port 1]
-    RP0 --> NVME[NVMe Endpoint]
+    RC --> RP0[Root Port 00:01.0]
+    RC --> RP1[Root Port 00:02.0]
+    RP0 --> NVME[NVMe Endpoint 01:00.0]
     RP1 --> SWU[Switch Upstream Port]
-    SWU --> SWD0[Downstream Port 0]
-    SWU --> SWD1[Downstream Port 1]
+    SWU --> SWD0[Downstream Port]
+    SWU --> SWD1[Downstream Port]
     SWD0 --> NIC[Network Endpoint]
     SWD1 --> FPGA[FPGA Endpoint]
 ```
 
-Port 是 Link 一端的协议实体，Link 是两个 Port 之间的连接。Linux 后续用 domain:bus:device.function 地址表示拓扑位置，但该地址由枚举生成，不是设备永久身份。热插拔、固件和桥资源变化都可能改变位置。
+“点对点”因此不等于“只能连接一个设备”。它表示每段电气链路的两端明确，速度、宽度和错误恢复也按 Link 独立管理。Linux 的 Bus Number 和 BDF 则把这棵树编码成软件可枚举的地址，下一篇会解释这些编号如何产生。
 
-事务经过 Switch 时按地址或 ID 路由。Switch 通常不理解某个寄存器的业务意义，它只根据 packet header、路由规则和虚通道转发。
+## 三、链路上传输的是 TLP，不是 C 语言读写
 
-## 三、Link、Lane、速率与有效带宽
+Transaction Layer Packet（TLP）是事务层在链路上传递请求和结果的基本单元。TLP Header 描述事务类型、地址或 Routing ID、长度、Requester ID、Tag、Byte Enable 和属性；带数据的写请求或 Completion 还包含 Payload。
 
-一条 Link 由一个或多个 Lane 组成。Lane 包含一对发送差分线和一对接收差分线，因此天然全双工。x1、x4、x8、x16 表示协商宽度；插槽机械长度不保证实际宽度，布线、bifurcation、两端能力和链路质量都会影响结果。
+常用事务可以先按“是否期待 Completion”分类：
 
-速率以 GT/s（每秒十亿次传输）表示，不等于 Gbit/s payload。Gen1/Gen2 使用 8b/10b 编码，每 10 bit 只有 8 bit 数据；Gen3 及以后使用 128b/130b，编码效率更高。常见代际：
+| 事务 | 类型 | 是否返回 Completion | 常见用途 |
+| --- | --- | --- | --- |
+| Memory Write | Posted | 否 | 写寄存器、设备 DMA 写 Host 内存 |
+| Memory Read | Non-Posted | 是 | 读寄存器、设备 DMA 读 Host 内存 |
+| Configuration Read/Write | Non-Posted | 是 | 枚举和配置 Function |
+| Completion with Data | Completion | 本身就是响应 | 返回读取结果 |
+| Message | Message | 取决于消息语义 | 中断、错误和电源事件 |
+
+Memory Read Request 中的 Tag 用来标识未完成请求。Requester 可以同时发出多个 Read，只要 Tag、Credit 和接收能力允许；Completion 带回相同 Tag，Requester 因此能把乱序返回的结果放回正确请求。大读取还可能被拆成多个 Completion，这意味着“一个 API 调用”不一定对应“一个返回包”。
+
+因为 Memory Write 是 Posted，发送方释放本地请求资源并不等于目标寄存器已经产生副作用。因此 PCIe 设备协议通常用 Completion Queue、状态寄存器或序号定义端到端完成语义。链路层 ACK 也不能替代这种业务完成，因为 ACK 只证明相邻 Port 收到并校验了 TLP。
+
+## 四、三层协议分别解决不同问题
+
+PCIe 把职责分成 Transaction Layer、Data Link Layer 和 Physical Layer。理解这三层的关键不是背名字，而是问：如果去掉这一层，哪类问题将无法解决？
+
+```mermaid
+flowchart LR
+    REQ[Read / Write / Config request] --> TL[Transaction Layer: type address tag ordering]
+    TL --> TLP[TLP]
+    TLP --> DL[Data Link: sequence LCRC replay credit DLLP]
+    DL --> PHY[Physical: encoding lanes training equalization]
+    PHY --> WIRE[Serial differential pairs]
+```
+
+Transaction Layer 解决端到端事务表达和路由问题。没有它，接收方不知道这是读、写还是配置访问，也不知道地址、长度和请求者。因此 BAR、Requester ID、Tag、MPS 和 Ordering Attribute 都属于事务语义。
+
+Data Link Layer 解决一段相邻 Link 的可靠传输。它为 TLP 增加 Sequence Number 和 LCRC，接收端用 ACK/NAK DLLP 反馈，发送端在 Replay Buffer 中保留未确认 TLP。因为可靠性是逐 Link 的，所以经过 Switch 的事务会在每段 Link 上分别确认和重放。
+
+Physical Layer 解决比特怎样稳定穿过差分线的问题。它负责 Receiver Detect、串并转换、编码、Lane 对齐、极性处理、均衡和训练。信号完整性不足时，软件可能只看到 Receiver Error、Replay 增加或链路降速，而不会直接得到“某根走线阻抗不连续”的结论。
+
+三层并不是三个独立教程：一次 Memory Read 先由事务层形成 TLP，数据链路层加可靠传输信息，物理层把它分布到 Lane；返回的 Completion 再按相反顺序还原。这样读者才能把 `readl()` 与示波器、协议分析仪、AER 日志和 Linux 对象联系起来。
+
+## 五、Lane、Link Width 和代际决定原始能力
+
+一个 Lane 包含一对发送差分线和一对接收差分线，因此 PCIe 天然全双工。x1、x4、x8、x16 描述协商后的 Lane 数量；插槽机械长度只表示可能容纳的宽度，不保证主板实际布线和双方最终协商结果。
 
 | Generation | 每 Lane 速率 | 编码 | 单方向编码后近似上限 |
-| --- | --- | --- | --- |
+| --- | ---: | --- | ---: |
 | Gen1 | 2.5 GT/s | 8b/10b | 2.0 Gbit/s |
 | Gen2 | 5.0 GT/s | 8b/10b | 4.0 Gbit/s |
 | Gen3 | 8.0 GT/s | 128b/130b | 7.877 Gbit/s |
 | Gen4 | 16.0 GT/s | 128b/130b | 15.754 Gbit/s |
 | Gen5 | 32.0 GT/s | 128b/130b | 31.508 Gbit/s |
 
-这仍不是应用吞吐。Packet header、LCRC、Data Link packet、ACK、flow-control update、SKP、空闲、包大小和重放都会占用链路。大量 32-byte request 的效率远低于 256/512-byte payload。
+GT/s 是每秒传输次数，不是应用 Payload 带宽。因为 TLP Header、LCRC、DLLP、SKP、重放和小包比例都会消耗链路，所以“Gen3 x4”只能给出物理上限，不能直接推出 NVMe 或网卡吞吐。第 13 篇会把 MPS、MRRS、Tag 和 Credit 放进完整性能计算。
 
-多 Lane 的 striping 由 Physical Layer 完成，上层不需要知道某个 packet 的字节走了哪条 Lane。训练时链路可以从 x4 降到 x2/x1，或从高代际降速继续工作。因此“设备能被发现”不能替代 speed/width 验证。
+多 Lane 的 striping 和对齐由 Physical Layer 完成，上层不需要选择某个 TLP 走哪条 Lane。若某条 Lane 质量不足，链路可能从 x4 降到 x2/x1；若高代际均衡失败，也可能降到更低速率后进入 L0。因此“设备能够枚举”不能证明 Link Width 和 Speed 达到设计目标。
 
-## 四、三层协议把请求变成可靠串行传输
+## 六、LTSSM、Credit 与 Replay 让链路能够持续工作
 
-PCIe 按功能分为 Physical Layer、Data Link Layer 和 Transaction Layer。发送时上层逐步加信息，接收时反向处理：
-
-```mermaid
-flowchart LR
-    REQ[Memory, Configuration or Message request] --> TL[Transaction Layer]
-    TL --> TLP[Transaction Layer Packet with header and optional data]
-    TLP --> DL[Data Link Layer adds sequence number and LCRC]
-    DL --> PHY[Physical Layer encoding, framing and Lane striping]
-    PHY --> WIRE[Serial Link]
-    WIRE --> RPHY[Receiver Physical Layer]
-    RPHY --> RDL[Check sequence and LCRC]
-    RDL --> RTL[Decode transaction and route]
-```
-
-Transaction Layer 生成 TLP（Transaction Layer Packet）。类型包括 Memory Read/Write、Configuration Read/Write、Completion、Message。Header 包含地址或 routing ID、length、Requester ID、tag、byte enable 和 attribute；写请求或 Completion with Data 还携带 payload。
-
-Data Link Layer 为相邻 Link 上的 TLP 添加 sequence number 和 LCRC。接收端校验后用 DLLP（Data Link Layer Packet）发送 ACK/NAK 和 flow-control update。发送端在 Replay Buffer 保存未确认 TLP，NAK 或 Replay Timer 超时会触发重传。
-
-这套 replay 只保证一跳可靠到达。ACK 证明下一跳 Port 收到并校验 TLP，不证明目标设备已经执行命令，也不证明 DMA 数据已被软件消费。
-
-Physical Layer 负责电气检测、串并转换、编码、Lane 对齐、均衡和链路训练。Receiver Error 更接近物理层；Replay Timer Timeout 指向链路可靠性；Malformed TLP 则是 Transaction Layer 格式问题。AER（Advanced Error Reporting）把这些错误类别暴露给软件。
-
-## 五、读、写、Completion、credit 与 ordering
-
-CPU 对设备 BAR 地址执行 `writel()` 时，RC 产生 Memory Write Request。Memory Write 是 posted request，正常路径没有 Completion；发送方不能等待一个不存在的“写完成包”。需要确认设备 side effect 时，驱动使用规范允许的 readback 或设备定义的同步寄存器。
-
-CPU 对设备执行 `readl()` 时，RC 发出 Memory Read Request。它是 non-posted request，Endpoint 返回一个或多个 Completion with Data。Request 中的 tag 让多个 outstanding read 可以并行，Completion 用相同 tag 回到发起者。
-
-```mermaid
-sequenceDiagram
-    participant CPU as CPU Driver
-    participant RC as Root Complex
-    participant EP as Endpoint
-    participant MEM as Host Memory
-    CPU->>RC: readl BAR address
-    RC->>EP: Memory Read Request with tag
-    EP-->>RC: Completion with Data and same tag
-    RC-->>CPU: load completes
-    CPU->>RC: writel BAR address
-    RC->>EP: Posted Memory Write no Completion
-    EP->>RC: DMA Memory Read Request
-    RC->>MEM: read Host memory
-    MEM-->>RC: data
-    RC-->>EP: Completion with Data
-```
-
-设备 DMA Write Host memory 同样是 posted Memory Write；设备 DMA Read Host memory 则需要 Completion。Read 吞吐受 round-trip latency、tag 数、Max Read Request Size、Completion split 和 credit 共同影响。
-
-Flow Control 使用 credit 防止发送方溢出接收 buffer。Posted、Non-Posted、Completion 分别有 Header/Data credit，例如 PH/PD、NPH/NPD、CplH/CplD。某类 credit 耗尽时，该类 TLP 停发，其他类型可能继续。Link 空闲不代表发送方有可用 tag/credit。
-
-Ordering 规定事务可见顺序，Relaxed Ordering、ID-Based Ordering、No Snoop 等 attribute 会改变约束。但 PCIe ordering 不等于 CPU memory model，也不替代 DMA barrier。CPU 写 descriptor 后敲 doorbell 需要 `dma_wmb()` 和正确 MMIO accessor；设备写 completion 后发 MSI 也需要硬件保证顺序，Host 消费时按 DMA API 使用 `dma_rmb()`。
-
-## 六、LTSSM 把两端从电气检测带到可传输状态
-
-Link Training and Status State Machine（LTSSM）是 Physical Layer 的链路状态机。两端上电、REFCLK/PERST# 条件满足后，从 Detect 开始，经 Polling 和 Configuration 建立 Lane/宽度，进入 L0 才能正常传 TLP。
+Link Training and Status State Machine（LTSSM）管理链路从没有连接到正常传输的状态变化。电源、REFCLK 和 PERST# 满足条件后，链路从 Detect 开始，经过 Polling 和 Configuration 协商 Lane、宽度和训练参数，进入 L0 才能承载正常 TLP。
 
 ```mermaid
 stateDiagram-v2
     [*] --> Detect
     Detect --> Polling: receiver detected
     Polling --> Configuration: training sequences exchanged
-    Configuration --> L0: width and lane numbering agreed
-    L0 --> Recovery: retrain, equalize or change speed
+    Configuration --> L0: width and lane mapping agreed
+    L0 --> Recovery: retrain or change speed
     Recovery --> L0: training succeeds
-    L0 --> L0s: optional low-power state
-    L0 --> L1: optional low-power state
-    L1 --> Recovery: wake and retrain as required
+    L0 --> L1: optional power saving
+    L1 --> Recovery: wake
     Recovery --> Detect: link lost
 ```
 
-Detect 失败先查电源、PERST#、REFCLK、lane 和 receiver detect；Polling/Recovery 循环常指向训练序列、极性、Lane mapping、signal integrity 或 equalization；进入 L0 但宽度/速率低于目标，说明链路选择了可工作的降级组合。
+LTSSM 解决“链路是否可用”，Flow Control Credit 则解决“接收端是否还有缓冲”。接收端分别通告 Posted、Non-Posted 和 Completion 的 Header/Data Credit；发送端只有在对应 Credit 足够时才能发送。这样可以在不丢包的前提下形成背压。
 
-ASPM（Active State Power Management）使用 L0s/L1/L1 Substates 降低功耗，但增加唤醒延迟并依赖 CLKREQ#/REFCLK/平台固件。低负载 timeout 可能与电源状态切换相关，但关闭 ASPM 只能作为对比实验，不是默认修复。
+Credit 是逐 Link 的接收缓冲合同，不是驱动队列深度。即使软件还有大量 Descriptor，某段 Switch Port 的 Completion Credit 耗尽也会暂时阻塞 Read 返回。所以性能分析需要同时观察队列、Tag、Completion 延迟和 Link Credit，而不是只看 CPU 利用率。
 
-普通 Endpoint Driver 的 `probe()` 被调用时，LTSSM 已进入可配置状态、配置空间可读、设备对象已创建。若系统完全看不到 Endpoint，修改 `pci_device_id` 没有作用，应该回到 RC、PERST#/REFCLK 和 LTSSM。
+Replay 处理的是传输错误，不是业务重试。持续出现 Bad DLLP、Replay Timer Timeout 或 Receiver Error 时，链路也许仍停留在 L0，但有效吞吐和尾延迟已经恶化。因此 AER Correctable 计数不是“可以永远忽略的错误”，它是物理链路质量的重要趋势证据。
 
-## 七、Linux 如何显示这套硬件模型
+## 七、PCIe 顺序与 CPU/DMA 顺序不是一回事
 
-固件或 Host Bridge Driver 创建 root bus，PCI Core 扫描配置空间并建立 `pci_bus`、bridge/port 和 `pci_dev` 树。`lspci -t` 显示拓扑，`lspci -vv` 显示 Link 与 Capability：
+TLP 可以携带 Relaxed Ordering、No Snoop、ID-Based Ordering 等属性，PCIe 规范定义不同事务之间允许怎样重排。但 CPU 编译器、CPU Cache、互连和 DMA 设备还各自拥有可见性规则，因此 PCIe Ordering 不能替代 Linux DMA Barrier。
+
+例如 CPU 先写普通内存中的 Descriptor，再写 Doorbell。如果缺少 `dma_wmb()`，设备可能先观察到 Doorbell，却还看不到完整 Descriptor；mutex 只能约束软件线程，也不能自动把 Cache 中的数据发布给设备。因此正确顺序通常是“填写 Descriptor -> `dma_wmb()` -> `writel()` Doorbell”。
+
+反方向也一样：设备写回 Completion 和 Payload 后再发 MSI，硬件协议要保证中断不会越过数据；CPU Handler 看到完成后仍要按 DMA API 使用 `dma_rmb()` 或同步接口。第 08～09 篇会用所有权状态机完整解释这一过程，本篇只建立边界。
+
+## 八、Linux 6.12 中怎样观察拓扑和链路
+
+Linux PCI Core 把每个 Function 表示为 `struct pci_dev`，把桥后的层级表示为 `struct pci_bus`。此时 `lspci` 读取的是配置空间和内核枚举结果，而不是在链路上实时抓取 TLP。
 
 ```bash
 lspci -tv
 lspci -s 0000:01:00.0 -vv
+cat /sys/bus/pci/devices/0000:01:00.0/current_link_speed
+cat /sys/bus/pci/devices/0000:01:00.0/current_link_width
 ```
 
-重点区分能力与当前状态：`LnkCap` 是 Port 最大能力，`LnkSta` 是本次协商 speed/width；`DevCap/DevCtl` 显示 MPS/MRRS 等事务能力和配置；AER Capability/日志显示协议错误；ASPM 字段显示电源能力与状态。
+`LnkCap` 表示 Port 支持的最大能力，`LnkSta` 表示本次实际协商结果。如果两端都支持 Gen3 x4，而 `LnkSta` 只有 5 GT/s x1，这意味着链路以降级组合进入 L0；下一步应检查两端 Port、固件限制、Lane 配置、REFCLK 和信号质量，而不是先修改设备驱动 ID。
 
-一次基础验收至少记录：拓扑、目标与实际 speed/width、Device/Link status、AER error count。性能问题若不先确认这些数据，后续 ring/中断调优没有可靠基线。
+`lspci -vv` 可以解码 Device/Link Capability、MPS/MRRS、ASPM 和 AER，但它看不到每一笔 TLP。协议分析仪能观察 TLP/DLLP/Training，却不知道 Linux 中哪个请求对象拥有该 Tag。因此实际调试需要用 BDF、时间戳和业务请求把两类证据关联起来。
 
-**参考资料**
+Linux 6.12 的 PCIe Port Bus 文档说明 Root Port 服务驱动的组织方式，PCI 驱动 API 文档说明 `pci_dev` 和功能驱动接口。后续文章会从这些软件对象继续向下推导，而不是重新定义一套术语。
+
+## 九、本篇检查点与常见误解
+
+读完本篇后，应当能够不依赖术语清单，按顺序描述一次 CPU Memory Read：CPU 地址命中 RC 窗口，RC 生成带地址和 Tag 的 Request TLP，逐 Link 经数据链路和物理层传输，Endpoint 通过 BAR/offset 解码，Completion 使用相同 Tag 返回。
+
+还应能解释以下区别：Port 是 Link 一端的协议实体，Link 是两个 Port 之间的连接；Function 是配置和驱动对象，Endpoint 是物理/逻辑设备角色；ACK 证明一跳可靠接收，Completion 才是 Non-Posted 事务响应，而业务完成还可能需要设备自己的队列协议。
+
+常见误解包括：把插槽长度当成实际 Link Width；把 GT/s 当成 Payload Gbit/s；认为进入 L0 就一定达到最高速度；把 `lspci` 当成协议抓包；把 Data Link Replay 当成驱动重试；用 CPU 锁代替 DMA Barrier。它们的问题都在于混淆了不同层解决的事情。
+
+## 十、小结：下一篇从事务走向设备发现
+
+PCIe 用 Root Complex、Port、Switch 和 Endpoint 组成点对点树，用 TLP 表达读写、配置和消息事务，用 Data Link Layer 在每段 Link 上提供 LCRC、ACK/NAK、Replay 和 Credit，再由 Physical Layer 完成训练、编码和 Lane 传输。
+
+本文解决了“已经知道设备地址时，一次访问怎样往返”。但系统刚上电时还不知道设备型号，也没有为 BAR 分配普通地址。下一篇将回答发现问题：Host 如何仅凭拓扑位置和 Configuration Space 找到每个 Function，并把它表示成 BDF。
+
+**一手资料**
 
 - [PCI-SIG Specifications](https://pcisig.com/specifications)
-- [Linux PCI Express Port Bus Driver Guide](https://docs.kernel.org/PCI/pciebus-howto.html)
-- [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
-
-## 八、TLP 的类型决定路由与完成语义
-
-Transaction Layer Packet 可分为 Memory、I/O、Configuration、Message 与 Completion 等类别。
-
-Memory Write 通常是 Posted Request，Requester 发出后不等待 Completion。
-
-Memory Read 是 Non-Posted Request，Completer 必须返回一个或多个 Completion with Data。
-
-Configuration Read/Write 也需要 Completion，并按 BDF/路由类型到达目标 Function。
-
-Message TLP 承载中断、错误、电源管理等语义。
-
-```mermaid
-flowchart TD
-    REQ[TLP generated] --> TYPE{request type}
-    TYPE -- Memory Write / Message --> POST[Posted: no completion expected]
-    TYPE -- Memory Read / Config / IO --> NP[Non-Posted]
-    NP --> ROUTE[address or ID routing]
-    ROUTE --> CPL[Completer returns Completion]
-    CPL --> MATCH[Requester matches tag/requester ID]
-    POST --> FC[consume posted credits]
-    NP --> FC2[consume non-posted credits]
-```
-
-Posted 不表示没有错误。
-
-错误可通过 AER/Message/状态报告，但 Requester 不会为每笔 Write 收到成功确认。
-
-需要端到端确认的协议必须在 Device Register、Completion Queue 或上层消息中自行定义。
-
-## 九、Completion 用 Tag 关联并允许分片返回
-
-Requester 为 Non-Posted Request 分配 Tag。
-
-Completer 返回的 Completion Header 包含 Requester ID、Tag、Completion Status、Byte Count 与 Lower Address 等信息。
-
-一次大 Memory Read 可能被多个 Completion TLP 分片返回。
-
-Requester 要按 Tag 和字节范围重组。
-
-可同时在途的 Tag 数限制 Outstanding Read 深度。
-
-Extended Tag 等能力可增加并发，但设备、Root Port 与软件策略必须共同支持。
-
-Completion Status 包括 Successful Completion、Unsupported Request、Completer Abort 等。
-
-Completion Timeout 表示预期返回未按时到达，可能触发 AER。
-
-## 十、Flow Control Credit 是逐 Link 的接收缓冲合同
-
-接收端用 Flow Control DLLP 通告 Header/Data Credit。
-
-Posted、Non-Posted、Completion 分别计数。
-
-发送端只有足够 Credit 才能发相应 TLP。
-
-Credit 是每段 Link 的机制，不是端到端业务 Queue Depth。
-
-Switch 每个 Port 有自己的缓冲与 Credit 状态。
-
-Credit 耗尽会形成 backpressure，即使物理 Link 仍为 L0。
-
-因此高吞吐分析要同时考虑 TLP Size、Outstanding、Completion 返回速度与 Credit，而不只是 Lane 速率。
-
-## 十一、Ordering Attribute 不能由 CPU 锁替代
-
-PCIe 事务包含 Relaxed Ordering、No Snoop、ID-Based Ordering 等属性。
-
-设备协议还常定义 Descriptor、Payload、Doorbell、Completion 的发布顺序。
-
-CPU mutex 只序列化软件线程，不自动保证 DMA Memory 与 MMIO TLP 的 Device 可见顺序。
-
-Linux Driver 使用 `dma_wmb()`、`dma_rmb()`、`writel()`/`readl()` 等接口表达跨 CPU、Interconnect 与 Device 的顺序。
-
-错误使用 relaxed MMIO accessor 或缺少 DMA Barrier，会在弱内存序平台出现偶发错误。
-
-## 十二、Data Link 重放与 AER 的边界
-
-Data Link Layer 给 TLP 添加 Sequence Number 与 LCRC。
-
-接收端用 ACK/NAK DLLP 反馈。
-
-发送端保留 Replay Buffer，NAK 或 Replay Timer 到期时重发。
-
-这一机制对 Transaction Layer/Driver 通常透明。
-
-持续 Receiver Error、Bad DLLP、Replay Timeout 会在 AER 中留下 Correctable/Uncorrectable 证据。
-
-“业务成功”不代表链路没有重放；重放过多会消耗吞吐并预示信号或时钟问题。
-
-## 十三、从 Link 能力到 Linux 6.12 对象
-
-PCI Core 将每个 Function 表示为 `pci_dev`，每段 Bridge 拓扑表示为 `pci_bus`。
-
-PCIe Capability 中的 Link Capabilities/Control/Status 提供最大/当前 Speed、Width、ASPM 与错误状态。
-
-`lspci -vv` 是配置空间解码，不是物理协议抓包。
-
-Protocol Analyzer 能观察 TLP/DLLP/Training，但不理解 Linux Request Object 与 DMA Ownership。
-
-两类证据需要按 BDF、时间和业务请求关联。
-
-一手资料：
-
-- [PCI-SIG specifications](https://pcisig.com/specifications)
 - [Linux 6.12 PCI driver API](https://www.kernel.org/doc/html/v6.12/driver-api/pci/pci.html)
-- [Linux PCI Express Port Bus](https://docs.kernel.org/PCI/pciebus-howto.html)
-- [Linux stable PCIe capability helpers](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci/pci.c?h=linux-6.12.y)
-
-## 十四、链路降速和降宽是协议允许的恢复结果
-
-训练从双方共同支持的 Speed/Width 中选择可稳定工作组合。
-
-某条 Lane 失败时，链路可能以更窄 Width 进入 L0；高代际均衡失败时可能降到更低 Speed。
-
-因此“已经 L0”不等于达到设计性能。
-
-Bring-up 要同时记录 Max Capability 与 Negotiated Link Status，并在冷启动、热重启、ASPM 恢复和压力温漂下复测。
-
-Receiver Error、Replay 和 Recovery 状态增长，可解释为何链路虽未掉线却吞吐/尾延迟恶化。
-
-Switch 路径还要逐段读取每个 Port 的 `LnkSta`，不能只看 Endpoint 一端。
-
-任意一段降宽都会限制整条端到端路径。
-
-链路反复进入 Recovery 也可能造成业务抖动，而不一定触发完整 Link Down。
-
-## 十五、小结
-
-PCIe 是连接 CPU/内存与高速设备的串行点对点 fabric。RC、Switch 和 Endpoint 通过 Port/Link 形成树；Lane 和代际决定原始能力；Transaction/Data Link/Physical 三层分别处理请求、相邻链路可靠性和电气传输；Memory Read/Write、Completion、credit、ordering 和 LTSSM 共同决定软件可见行为。
-
-下一篇会在这个模型上回答枚举问题：设备尚未拥有 BAR 地址时，系统如何通过配置空间发现它、分配 bus number 和资源。
+- [Linux PCI Express Port Bus Driver Guide](https://docs.kernel.org/PCI/pciebus-howto.html)

@@ -67,6 +67,27 @@ function articleBody(markdown) {
   return markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
 }
 
+function explanatoryParagraphs(body) {
+  return body.split(/\r?\n\s*\r?\n/).filter((paragraph) => {
+    const text = paragraph.replace(/`[^`]+`/g, '').trim();
+    return text.length >= 80 && !/^(?:#|```|\||[-*] )/.test(text);
+  });
+}
+
+function assertTeachingStructure(file, index) {
+  const markdown = readFileSync(join('docs/articles/pcie', file), 'utf8');
+  const body = articleBody(markdown);
+  const h2 = [...body.matchAll(/^## (.+)$/gm)].map((match) => match[1]);
+  const opening = body.slice(0, 1800);
+
+  assert.match(opening, /问题|为什么|如何|先看/, `${file} must open with a concrete question`);
+  assert.ok(h2.length >= 8 && h2.length <= 18, `${file} must keep a readable section count`);
+  assert.ok(explanatoryParagraphs(body).length >= 18, `${file} needs explanatory prose, not only lists`);
+  assert.ok((body.match(/因为|所以|因此|这意味着/g) ?? []).length >= 8, `${file} needs causal explanation`);
+  assert.match(body, /本篇检查点/);
+  assert.match(body, index === 17 ? /系列收尾/ : /下一篇/);
+}
+
 test('PCIe reference rewrite publishes the approved 18-article sequence', () => {
   pcieFiles.forEach((file, index) => {
     const path = join('docs/articles/pcie', file);
@@ -79,8 +100,7 @@ test('PCIe reference rewrite publishes the approved 18-article sequence', () => 
     assert.match(markdown, /^draft: false$/m);
     assert.match(markdown, new RegExp(`title: .*#${String(index + 1).padStart(2, '0')}`));
     assert.match(body, /Linux 6\.12/);
-    assert.ok(markdown.split(/\r?\n/).length >= 300, `${file} must contain at least 300 lines`);
-    assert.ok((body.match(/^```mermaid$/gm) ?? []).length >= 5, `${file} must contain at least five Mermaid diagrams`);
+    assert.ok((body.match(/^```mermaid$/gm) ?? []).length >= 1, `${file} must use a diagram when structure or flow benefits`);
     assert.ok((body.match(officialSourcePattern) ?? []).length >= 2, `${file} must cite at least two official primary sources`);
     assert.doesNotMatch(body, forbiddenTemplatePattern);
     assert.match([...body.matchAll(/^## (.+)$/gm)].at(-1)?.[1] ?? '', /小结|总结|结语/);
@@ -89,6 +109,10 @@ test('PCIe reference rewrite publishes the approved 18-article sequence', () => 
       assert.ok(body.toLowerCase().includes(marker.toLowerCase()), `${file} is missing ${marker}`);
     }
   });
+});
+
+test('PCIe teaching structure explains mechanisms before constraints', () => {
+  pcieFiles.slice(0, 3).forEach(assertTeachingStructure);
 });
 
 test('PCIe legacy slugs redirect to one canonical rewritten article', () => {
