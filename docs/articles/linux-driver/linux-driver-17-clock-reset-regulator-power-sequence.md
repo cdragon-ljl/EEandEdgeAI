@@ -8,17 +8,11 @@ tags: ["Linux BSP", "Clock Framework", "Reset Controller", "Regulator", "Power S
 draft: false
 ---
 
-设备树中有 compatible，不代表外设已经具备工作条件。
+一个外设可能依赖 regulator 电源、clock 参考时钟、reset controller/GPIO、pinctrl 状态和 power domain。Provider 尚未注册时 consumer 应返回 `-EPROBE_DEFER` 形成 deferred probe；运行后 runtime PM 则复用 power_on/off 路径管理空闲功耗。
 
-一个摄像头、无线模块或传感器通常需要多路电源达到稳定值，需要外部参考时钟输出，需要复位脚按规定保持和释放，最后才能通过 I2C 或其他控制总线回应识别命令。
+本篇以最终通过控制总线读取 ID 的模块为例，把“读 ID 失败”拆成资源依赖、时序和可回滚状态。具体电压、延时、引脚和频率必须来自 datasheet、原理图和目标 binding。
 
-任何一步缺失，probe 的表面现象都可能只是“读 ID 失败”。
-
-本章以一个由 platform 驱动管理、最终通过 I2C 读取身份寄存器的板级模块为例，建立完整的资源顺序和失败回滚方法。
-
-示例只描述通用 Linux 驱动结构。具体电压、延时、引脚和时钟频率必须以实际模块 datasheet、原理图和 RV1126 SDK 的设备树为准。
-
-## 1. 先把“能回应总线”拆成可验证的前置条件
+## 一、把设备可响应条件画成依赖图
 
 总线读写是上电时序的最后一步，不是第一步。
 
@@ -83,7 +77,7 @@ flowchart LR
 
 如果某项没有可观察方法，它就还只是“感觉已配置”，不是可验证条件。
 
-## 2. 第一步：在 DTS 中描述资源连接，而不是硬编码编号
+## 二、用 DTS 名称表达 regulator、clock、reset 与 pinctrl
 
 设备树表达的是板子连接关系：这个模块由哪些 regulator 供电、引用哪一路 clock、被哪个 reset controller 或 GPIO 控制。
 
@@ -211,7 +205,7 @@ sequenceDiagram
 
 资源的注册顺序属于内核设备模型，延迟 probe 才能把依赖关系交给正确的机制处理。
 
-## 3. 第二步：把上电、复位和身份识别写成可回滚的单一路径
+## 三、用 power_on/power_off 建立可回滚状态机
 
 真正容易出错的是失败路径。
 
@@ -349,7 +343,7 @@ MODULE_CHIP_ID_REG 和 MODULE_CHIP_ID_VALUE 必须由实际模块数据手册确
 
 在未确认寄存器安全性的情况下，不要用 i2cset 等工具向生产硬件随意写寄存器。
 
-## 4. 第三步：用各层观测点定位“ID 读失败”
+## 四、用 regulator、clock、波形和总线证据定位首读失败
 
 同样是 I2C 读失败，故障位置可能完全不同。
 
@@ -418,7 +412,7 @@ sequenceDiagram
 
 日志应帮助人判断失败发生在 get resource、enable、deassert 还是 identity read。
 
-## 5. 第四步：通过错误注入、解绑和重复冷启动验证生命周期
+## 五、用 runtime PM、错误注入和冷启动验证生命周期
 
 资源顺序正确的驱动，必须也能安全地失败和再次运行。
 
@@ -512,5 +506,15 @@ dmesg | tail -n 100
 - 如何用冷启动、波形、解绑和重绑证明电源时序具备工程可靠性。
 
 当模块的每一路电源、每个时钟、每次复位和每个首读总线事务都有来源、顺序与测量证据时，“偶发识别失败”才会被收敛为可定位的工程问题。
+
+**参考资料**
+
+- [Common clock framework](https://docs.kernel.org/driver-api/clk.html)
+- [Voltage and current regulator API](https://docs.kernel.org/power/regulator/consumer.html)
+- [Reset controller API](https://docs.kernel.org/driver-api/reset.html)
+
+## 六、小结
+
+上电时序是资源依赖和状态机，不是一串固定 sleep。Driver 应从 DTS 获取 regulator/clock/reset/pinctrl，正确传播 deferred probe，用单一 power_on/off 路径回滚，并让 runtime PM、remove 和错误恢复共享同一安全状态。
 
 > 🏷️ Linux BSP · regulator · clock framework · reset controller · power sequence · deferred probe

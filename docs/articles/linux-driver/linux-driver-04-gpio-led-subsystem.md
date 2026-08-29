@@ -8,11 +8,11 @@ tags: ["Linux BSP", "GPIO", "LED Class", "pinctrl"]
 draft: false
 ---
 
-本篇只做一件事：让一颗板载状态 LED 从硬件原理图到 `/sys/class/leds` 都可被解释和验证。完成后，读者应能区分“内核逻辑亮灭”和“测试点物理高低电平”，并能定位 LED 不亮时究竟是软件、pinmux、极性、供电还是电路问题。
+LED 驱动首先是电气问题：原理图决定 active-high/low、限流、反相与供电。简单 GPIO 指示灯优先使用 `gpio-leds` binding，由 LED class 创建 brightness；标准 trigger 提供心跳、timer、default-on 等策略。只有 LED 与复杂板级状态机/协议强耦合时才写自定义驱动。
 
-对于只需要开关或触发器的指示灯，优先使用 `leds-gpio` 和 LED class。这样用户态得到标准 `brightness`、`trigger` 接口，不必为一颗灯创建私有字符设备。只有 LED 行为与板级状态机、电源时序或硬件协议强耦合时，才把 GPIO 放入自定义 platform driver。
+本篇不重复 pinctrl/gpiolib/irqchip 架构，而是沿原理图 -> DTS -> LED class -> pad 波形完成一颗灯的实践，并验证 suspend/remove 后的安全状态。
 
-## 1. 先确认硬件连接和验收目标
+## 一、从原理图确定逻辑极性与验收目标
 
 从原理图建立 LED 的最小事实表。不要先写 DTS，也不要猜“输出高电平应该点亮”。有外部反相三极管、低边灌电流、PMIC 控制或 active-low 接法时，软件逻辑和 pad 电平往往正好相反。
 
@@ -46,7 +46,7 @@ ls -l /sys/class/leds 2>/dev/null
 mount | rg debugfs
 ```
 
-## 2. 第一步：在 DTS 中描述真实电路和 pinctrl
+## 二、用 gpio-leds 描述电路而不是硬编码控制
 
 LED class 的 `leds-gpio` 节点只描述“哪根 GPIO 驱动哪颗 LED、逻辑有效态是什么”。pinctrl 负责把 pad 切到 GPIO 功能，并配置上下拉、驱动强度等电气属性。两部分缺一不可。
 
@@ -100,7 +100,7 @@ flowchart TD
 
 如果系统已有自己的 pinctrl 节点，应将 LED pad 状态放在相应 SoC pinctrl 控制器下，而非在 `leds` 节点中发明寄存器配置。default 状态负责正常运行；sleep 状态应符合产品的漏电、亮灭和唤醒要求。
 
-## 3. 第二步：让 LED class 出现，并验证软件控制链路
+## 三、验证 LED class、brightness 与 trigger
 
 启动后，先找 LED class 设备。若没有出现，不要直接改驱动代码，按 DTS、Kconfig、platform device 和 probe 日志的顺序检查。
 
@@ -148,7 +148,7 @@ sleep 5
 printf 'none\n' > "$LED/trigger"
 ```
 
-## 4. 第三步：从 GPIO 所有权到示波器验证物理电平
+## 四、仅在标准框架不足时设计自定义驱动
 
 GPIO descriptor API 让驱动按逻辑 active/inactive 操作引脚；真正的物理电平还会经过 active-low 映射、pad 复用和外部电路。此处要用三类证据串联，而不是只看其中一个。
 
@@ -193,7 +193,7 @@ flowchart TD
     F -- "是" --> H["保存波形作为基线"]
 ```
 
-## 5. 第四步：处理复杂状态、低功耗和回归
+## 五、用 GPIO 所有权、波形和低功耗完成回归
 
 单纯的状态灯可以交给 trigger；当 LED 表示启动、升级、故障和低功耗等多个状态时，不要让不同驱动和用户服务直接争抢同一根 GPIO。应在一个明确的状态机中定义优先级，再由单一输出路径控制 LED。
 
@@ -350,5 +350,15 @@ GPIO 的学习重点不是记住“高电平亮”还是“低电平亮”，而
 保存示波器的时间基准。
 
 保存负载电流的测量值。
+
+**参考资料**
+
+- [LEDs class](https://docs.kernel.org/leds/leds-class.html)
+- [Common LED bindings](https://docs.kernel.org/devicetree/bindings/leds/common.yaml)
+- [GPIO Descriptor Consumer Interface](https://docs.kernel.org/driver-api/gpio/consumer.html)
+
+## 六、小结
+
+LED 实践应优先复用 gpio-leds 与 LED class，把 active-low 交给 descriptor 层，把策略交给 trigger。自定义驱动只用于标准框架无法表达的硬件状态机，并仍需遵守 GPIO ownership、PM 与 remove 生命周期。
 
 > 🏷️ 标签：Linux BSP、GPIO descriptor、pinctrl、LED class、leds-gpio、active-low、板级调试

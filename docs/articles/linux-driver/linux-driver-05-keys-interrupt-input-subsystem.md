@@ -8,11 +8,11 @@ tags: ["Linux BSP", "GPIO Keys", "Interrupt", "Input Subsystem"]
 draft: false
 ---
 
-本篇只完成一个目标：按下板上的 GPIO 按键时，Linux 产生一次正确的 input event；松开时产生对应释放事件；系统 suspend 后按键能够按产品要求唤醒。
+gpio-keys 是普通板级按键的首选标准驱动。绑定后从 GPIO descriptor 取得 Linux IRQ，按硬件/软件条件执行 debounce，再通过 input_event/input_report_key 上报按下和释放，最后根据产品策略配置 wakeup。
 
-按键问题不能从 `input_report_key()` 开始。机械触点会抖动，GPIO 有物理极性，IRQ 有触发类型，低功耗还有 pinctrl 和 wake 配置。本文沿着一条事件路径逐步验证这些条件，并优先使用内核已有的 `gpio-keys` 驱动。
+本篇基于上一讲的 pinctrl/GPIO/IRQ 框架，完成从原理图逻辑极性到 `/dev/input/eventX` 的实践。机械抖动、触发类型、Input code 和 suspend 唤醒均通过波形、IRQ 计数与 evtest 对齐；只有标准 binding 无法表达时才写自定义驱动。
 
-## 1. 先定义按键的电气事实和用户态结果
+## 一、定义按键电气事实和 Input 验收结果
 
 准备原理图、按键测试点、目标 DTB 和一个可读取 input event 的工具。先写事实表，再写节点；否则“按下是高还是低”会在 DTS、驱动和用户态之间反复猜。
 
@@ -48,7 +48,7 @@ evtest /dev/input/event<N>
 
 工具名称按当前 rootfs 实际情况替换。先找到设备名称、物理路径和支持的 key code，再进行 DTS 修改。
 
-## 2. 第一步：用 gpio-keys 描述按键并设置去抖
+## 二、用 gpio-keys binding 描述极性、按键码和去抖
 
 普通 GPIO 按键不需要自定义字符设备。`gpio-keys` 已经把 GPIO descriptor、IRQ、去抖和 Input 设备注册组织起来，并为用户态提供标准 event 接口。
 
@@ -101,7 +101,7 @@ flowchart TD
     E --> F["再检查事件内容"]
 ```
 
-## 3. 第二步：用 IRQ 和原始事件证明一次按键只走一次
+## 三、沿 IRQ、debounce 到 input_event 验证事件
 
 输入设备出现后，按一次按键，同时观察 input event、IRQ 计数和 pad 波形。三者要在同一个时间线上对应：有电平变化才有 IRQ，有稳定状态才有 event。
 
@@ -153,7 +153,7 @@ flowchart TD
 
 只有在按键事件稳定之后，才处理长按、连击或重复键。这样每一次失败都有明确层次，不会把用户态功能问题倒推成 GPIO 中断问题。
 
-## 4. 第三步：处理 wakeup、suspend 和必要的自定义驱动
+## 四、处理 wakeup、suspend 和自定义驱动边界
 
 `wakeup-source` 不是单独打开一个开关就结束。低功耗时 pad 仍需保持正确输入电平，GPIO irqchip 和中断控制器需要支持 wake，驱动和 PM 核心要正确启用/禁用 wake。resume 后还要重新同步实际键状态。
 
@@ -209,7 +209,7 @@ flowchart TD
     E --> F["释放 GPIO 和私有状态"]
 ```
 
-## 5. 第四步：完成回归并形成故障判断表
+## 五、完成抖动、长按、休眠和解绑回归
 
 执行一套固定的按键回归，不要只验证一次单击：
 
@@ -342,5 +342,15 @@ dmesg -T | tail -100
 最后把以下内容作为学习手册的完成记录：原理图极性、最终 DTB 片段、`/proc/interrupts` 前后、`evtest` 单击日志、去抖参数、suspend/resume 事件序列和任何自定义驱动的 remove 日志。以后遇到“偶发多按一次”，可以直接从这份记录的第一处不一致开始排查。
 
 最终判断标准是：硬件波形、IRQ 计数、Input event 和用户态行为能够互相解释。若四者不一致，先定位断点，再修改一个变量并重复实验；不要同时改变极性、去抖和 keymap。
+
+**参考资料**
+
+- [Input Subsystem](https://docs.kernel.org/input/input.html)
+- [GPIO keys binding](https://docs.kernel.org/devicetree/bindings/input/gpio-keys.yaml)
+- [Linux generic IRQ handling](https://docs.kernel.org/core-api/genericirq.html)
+
+## 六、小结
+
+标准板级按键优先使用 gpio-keys，让 binding 表达极性、code、debounce 和 wakeup，让 Input Core 提供稳定事件 ABI。验证必须同时对齐物理波形、IRQ 计数、input event 和 suspend/解绑行为。
 
 > 🏷️ 标签：Linux BSP、gpio-keys、interrupt、threaded IRQ、input subsystem、debounce、wakeup-source

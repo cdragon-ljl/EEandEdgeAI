@@ -45,6 +45,10 @@ const qualityContractFiles = new Set([
   'linux-driver-06-timers-workqueues-delayed-work.md',
   'linux-driver-07-kernel-synchronization-primitives.md',
   'linux-driver-13-driver-debugging-methodology.md',
+  'linux-driver-16-pinctrl-gpio-irq-subsystem.md',
+  'linux-driver-04-gpio-led-subsystem.md',
+  'linux-driver-05-keys-interrupt-input-subsystem.md',
+  'linux-driver-17-clock-reset-regulator-power-sequence.md',
 ]);
 const introOrder = {
   'linux-driver-02-first-kernel-module-and-char-device.md': ['内核空间', '模块', 'Kbuild', '字符设备', 'file_operations'],
@@ -55,6 +59,10 @@ const introOrder = {
   'linux-driver-06-timers-workqueues-delayed-work.md': ['进程上下文', '硬中断', 'timer', 'workqueue', 'delayed work'],
   'linux-driver-07-kernel-synchronization-primitives.md': ['共享数据', 'mutex', 'spinlock', 'atomic', 'completion', 'waitqueue'],
   'linux-driver-13-driver-debugging-methodology.md': ['现象', '层次', '假设', 'dynamic_debug', 'tracepoint', 'ftrace'],
+  'linux-driver-16-pinctrl-gpio-irq-subsystem.md': ['Device Tree', 'pinctrl', 'GPIO descriptor', 'gpiochip', 'irq_domain', 'request_threaded_irq'],
+  'linux-driver-04-gpio-led-subsystem.md': ['电气', 'gpio-leds', 'LED class', 'trigger', '自定义驱动'],
+  'linux-driver-05-keys-interrupt-input-subsystem.md': ['gpio-keys', 'IRQ', 'debounce', 'input_event', 'wakeup'],
+  'linux-driver-17-clock-reset-regulator-power-sequence.md': ['regulator', 'clock', 'reset', 'pinctrl', 'deferred probe', 'runtime PM'],
 };
 const diagramMinimum = new Map([
   ['linux-driver-02-first-kernel-module-and-char-device.md', 2],
@@ -65,6 +73,10 @@ const diagramMinimum = new Map([
   ['linux-driver-06-timers-workqueues-delayed-work.md', 2],
   ['linux-driver-07-kernel-synchronization-primitives.md', 2],
   ['linux-driver-13-driver-debugging-methodology.md', 3],
+  ['linux-driver-16-pinctrl-gpio-irq-subsystem.md', 3],
+  ['linux-driver-04-gpio-led-subsystem.md', 2],
+  ['linux-driver-05-keys-interrupt-input-subsystem.md', 2],
+  ['linux-driver-17-clock-reset-regulator-power-sequence.md', 3],
 ]);
 const officialSourcePattern = /https:\/\/(?:docs\.kernel\.org|www\.kernel\.org|git\.kernel\.org|github\.com\/torvalds\/linux|devicetree-specification\.readthedocs\.io)/gi;
 

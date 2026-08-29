@@ -1,24 +1,18 @@
 ---
 title: "嵌入式知识体系 · Linux 驱动开发实战 #09 · pinctrl、GPIO 与 IRQ 子系统"
-description: "以一个可观测的板级按键为主线，建立从 pinctrl 电气状态、GPIO descriptor 到 IRQ 和 input event 的完整驱动链路。"
+description: "从 Device Tree pin state、pinctrl、GPIO descriptor/gpiochip 到 irq_domain/irqchip，建立引脚资源和级联中断框架。"
 pubDate: "2026-08-16"
 series: linux-driver
 order: 9
-tags: ["Linux BSP", "pinctrl", "GPIO", "IRQ", "Input"]
+tags: ["Linux Driver", "pinctrl", "GPIO", "IRQ"]
 draft: false
 ---
 
-板上的一个按键不响应，通常不是“中断函数没有写对”这么简单。
+Device Tree 用 pin state 描述硬件复用和电气配置，pinctrl 在设备生命周期中选择 default/sleep 状态。驱动通过 GPIO descriptor API 请求逻辑 GPIO，descriptor 连接到 gpiochip；需要中断时，GPIO controller/irqchip 通过 irq_domain 把 hwirq 映射为 Linux IRQ，consumer 最终调用 `request_threaded_irq()`。
 
-同一根物理引脚在上电后可能仍是复用功能，可能浮空，可能被 GPIO hog 占用，也可能已经作为 GPIO 工作却没有接入中断控制器。
+本篇只建立 pinctrl、gpiolib 和通用 IRQ 框架，不负责 Input 事件语义。低电平按键仅作为可观察信号源；第 10 篇实践 LED，第 11 篇才完成 gpio-keys/Input/debounce/wakeup。
 
-从按键到应用程序，信号要依次经过引脚复用和电气配置、GPIO 控制器、IRQ domain、驱动线程，再进入 Linux input 子系统。
-
-本章只做一件事：为一颗普通的、低电平有效的板级按键建立一条可测量、可解绑、可休眠恢复的事件链。
-
-按钮只是最容易观察的外设。把这条链走通后，插拔检测、传感器 data-ready、模块唤醒脚和故障告警脚都可以按相同方法排查。
-
-## 1. 先把按键的物理链路和验收结果画出来
+## 一、从物理引脚到 Linux IRQ 的框架层次
 
 在改设备树和写驱动以前，先确认原理图中按键的真实连接。
 
@@ -102,7 +96,7 @@ Linux 的 descriptor API 会结合设备树中的 GPIO_ACTIVE_LOW 标记给出�
 
 这样驱动代码不必在每个判断中写反号。
 
-## 2. 第一步：在设备树中建立 default 与 sleep 两个 pinctrl 状态
+## 二、用 pinctrl state 管理复用和电气状态
 
 pinctrl 负责把 SoC 管脚从“某个引脚编号”变成具有明确功能和电气属性的信号。
 
@@ -239,7 +233,7 @@ flowchart LR
 
 不要通过强行释放 GPIO 或修改驱动申请顺序来掩盖资源冲突。
 
-## 3. 第二步：用 descriptor API 取得 GPIO 并转换为 Linux IRQ
+## 三、用 GPIO descriptor 和 gpiochip 管理所有权
 
 驱动不应在新代码中硬编码全局 GPIO 号码。
 
@@ -394,7 +388,7 @@ sequenceDiagram
 
 先从 dmesg 中确认提供方是否实际注册、设备树 phandle 是否指向正确 controller，以及 required module 是否已装载。
 
-## 4. 第三步：在 threaded IRQ 中完成消抖并报告 input event
+## 四、irq_domain、irqchip 与 consumer handler
 
 机械按键在按下和松开瞬间会短暂反复接通、断开。
 
@@ -444,35 +438,9 @@ static irqreturn_t board_key_irq_thread(int irq, void *data)
 
 如果驱动手动对 value 取反，又会把已经由 descriptor layer 完成的极性转换做第二次。
 
-### 用 input 子系统表达用户可见事件
+### Input 是上层 consumer，不属于本篇框架实现
 
-按键不是一个自定义字符设备协议。
-
-Linux input 子系统提供了标准 event 节点、按键码、状态同步和用户态工具，可以让桌面、终端程序或守护进程使用同一种接口。
-
-事件流如下。
-
-```mermaid
-flowchart LR
-    A[GPIO edge] --> B[threaded IRQ]
-    B --> C[稳定采样 logical value]
-    C --> D[input_report_key]
-    D --> E[input_sync]
-    E --> F[input core]
-    F --> G[/dev/input/eventX]
-    G --> H[evtest]
-```
-
-先用 input registration 的日志或 /proc/bus/input/devices 找到设备，再使用 evtest 观察事件。
-
-```sh
-grep -A8 -B2 longway-board-key /proc/bus/input/devices
-evtest /dev/input/eventX
-```
-
-按下时应看到 KEY_ENTER value 1，松开时看到 value 0。
-
-若 eventX 编号改变，不要把编号硬编码进量产脚本。应该按设备名称、udev 规则或应用自身的设备枚举方式匹配。
+到这里，框架篇只需要证明 logical GPIO value、Linux IRQ 映射、触发和 threaded handler 正确。按键 code、debounce、input_report_key、event node 与 wakeup policy 放在第 11 篇，避免把 irqchip 架构和具体 Input 驱动混成一章。
 
 ### 选择线程处理还是硬中断处理
 
@@ -522,7 +490,7 @@ sequenceDiagram
 
 错误地把普通噪声线设为 wake source，会造成系统反复伪唤醒，问题往往只在长时间待机后出现。
 
-## 5. 第四步：用中断计数、事件记录和解绑回归完成验收
+## 五、用 debugfs、IRQ 计数和解绑验证生命周期
 
 按键驱动完成编译并不代表链路正确。
 
@@ -643,5 +611,15 @@ flowchart TD
 - 如何用 /proc/interrupts、evtest 和 unbind/rebind 证明整条事件链真实可用。
 
 当一根管脚的功能、电气状态、逻辑极性、中断映射和事件语义都能被单独验证时，GPIO 中断问题就不再是靠改标志位碰运气。
+
+**参考资料**
+
+- [PINCTRL subsystem](https://docs.kernel.org/driver-api/pin-control.html)
+- [GPIO Descriptor Consumer Interface](https://docs.kernel.org/driver-api/gpio/consumer.html)
+- [Linux generic IRQ handling](https://docs.kernel.org/core-api/genericirq.html)
+
+## 六、小结
+
+pinctrl 管理复用/电气状态，gpiolib 管理逻辑 GPIO 与所有权，gpiochip/irqchip/irq_domain 把硬件中断编号接入 Linux IRQ。Consumer 只应使用 descriptor 和 Linux IRQ，不依赖全局 GPIO 号或 datasheet hwirq。后两篇将在该框架上分别完成 LED 与按键实践。
 
 > 🏷️ Linux BSP · pinctrl · GPIO descriptor · irq domain · threaded IRQ · debounce · input subsystem
