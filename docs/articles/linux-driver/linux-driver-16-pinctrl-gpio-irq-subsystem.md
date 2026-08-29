@@ -45,7 +45,7 @@ flowchart LR
     D --> E[irq domain]
     E --> F[threaded IRQ handler]
     F --> G[input_report_key]
-    G --> H[/dev/input/eventX]
+    G --> H["/dev/input/eventX"]
     H --> I[evtest 或应用]
 ```
 

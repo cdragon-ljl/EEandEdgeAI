@@ -42,7 +42,7 @@ flowchart LR
     D --> E[serial 控制器驱动]
     E --> F[serial core]
     F --> G[TTY 层]
-    G --> H[/dev/ttySx]
+    G --> H["/dev/ttySx"]
     F --> I[kernel console]
     I --> J[启动日志]
 ```
@@ -287,7 +287,7 @@ flowchart TB
     D --> E[uart_driver]
     E --> F[TTY core]
     F --> G[line discipline]
-    G --> H[/dev/ttySx]
+    G --> H["/dev/ttySx"]
     D --> I[console helper]
     I --> J[printk 输出]
 ```

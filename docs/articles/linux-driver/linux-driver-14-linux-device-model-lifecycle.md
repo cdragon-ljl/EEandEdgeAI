@@ -235,10 +235,10 @@ sysfs 的目录和符号链接反映 device model 的关系。
 
 ```mermaid
 flowchart LR
-    A[/sys/devices: 物理父子层级] --> D[同一个 device 对象]
-    B[/sys/bus/platform/devices: bus 视图] --> D
-    C[/sys/bus/platform/drivers: driver 视图] --> D
-    E[/sys/class: 功能接口视图] --> D
+    A["/sys/devices: 物理父子层级"] --> D[同一个 device 对象]
+    B["/sys/bus/platform/devices: bus 视图"] --> D
+    C["/sys/bus/platform/drivers: driver 视图"] --> D
+    E["/sys/class: 功能接口视图"] --> D
 ```
 
 许多路径是同一对象的符号链接，而不是复制出的多个设备。
@@ -596,8 +596,8 @@ flowchart TB
     A --> E[struct class]
     B --> F[设备 sysfs 目录]
     C --> G[driver sysfs 目录]
-    D --> H[/sys/bus 视图]
-    E --> I[/sys/class 功能视图]
+    D --> H["/sys/bus 视图"]
+    E --> I["/sys/class 功能视图"]
 ```
 
 用户态属性应放在语义正确的位置。
@@ -640,10 +640,10 @@ ATTRIBUTE_GROUPS(board_lab);
 ```mermaid
 flowchart LR
     A[device 实例状态] --> B[device attribute group]
-    B --> C[/sys/devices 中的属性]
+    B --> C["/sys/devices 中的属性"]
     C --> D[按 bus 视图的符号链接]
     D --> E[用户态只读观察]
-    F[子系统接口] --> G[/sys/class 或 /dev]
+    F[子系统接口] --> G["/sys/class 或 /dev"]
     G --> H[稳定功能 ABI]
 ```
 

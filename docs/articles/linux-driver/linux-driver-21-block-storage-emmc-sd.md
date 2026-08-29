@@ -88,7 +88,7 @@ flowchart TD
     B --> C[MMC core initializes card]
     C --> D[mmcblk block device registered]
     D --> E[partition table scanned]
-    E --> F[/dev/mmcblkXpY and by-partuuid links]
+    E --> F["/dev/mmcblkXpY and by-partuuid links"]
 ```
 
 启动后先收集识别信息，而不是立刻跑性能测试。

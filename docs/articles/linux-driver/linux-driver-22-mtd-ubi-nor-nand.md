@@ -145,7 +145,7 @@ flowchart TD
     D --> E[logical erase blocks LEB]
     E --> F[UBI volume]
     F --> G[UBIFS filesystem]
-    G --> H[/data]
+    G --> H["/data"]
 ```
 
 在生产镜像和测试系统中，UBI attach 参数必须统一，例如 MTD 分区编号、VID header offset、fastmap 配置和 volume 名称。
