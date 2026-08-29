@@ -1,6 +1,6 @@
 ---
 title: "嵌入式知识体系 · PCIe 驱动开发实战 #06 · PCI Explorer、Capability、BAR 与 sysfs"
-description: "以 Linux 6.12 为基线，用只读 PCI Explorer 安全检查配置头、标准与扩展 Capability、BAR Resource 和 sysfs，并解释未知设备为何不能试写。"
+description: "用只读 PCI Explorer 把 BDF、配置头、标准/扩展 Capability、BAR Resource、lspci 与 sysfs 对应起来，再解释未知设备访问和配置并发边界。"
 pubDate: "2026-08-29"
 series: pcie
 order: 6
@@ -8,81 +8,23 @@ tags: ["PCIe", "Explorer", "Linux 6.12"]
 draft: false
 ---
 
-学习 PCI Core 时，最有价值的第一份 Driver 不是立即控制 DMA，而是安全地观察 `pci_dev` 已经包含什么。
+前五篇已经介绍了配置空间、BAR、`pci_dev` 和 `probe()`，但读者仍可能只在概念层理解它们。现在需要一个低风险观察点：不启动 DMA、不修改设备寄存器，只把 PCI Core 已经解析出的身份、Capability 和 Resource 输出出来。
 
-只读 PCI Explorer 可以把以下事实关联起来：
+PCI Explorer 的价值不是再造一个 `lspci`，而是把用户看到的 BDF 和配置字段，与驱动回调中的 `struct pci_dev` 关联起来。通过这一步，读者可以验证“枚举完成后，功能驱动究竟拿到了什么”，再进入 IRQ 和 DMA。
 
-- BDF 与配置头身份。
-- Standard Capability 与 Extended Capability。
-- BAR 的 Bus Address、Linux Resource 与属性。
-- Power State、PCIe Link、MSI/MSI-X 和 AER 能力。
-- sysfs 与 `lspci` 能证明的边界。
+本文以 Linux 6.12 和仓库配套的 `pci_explorer.c` 为基础。Explorer 只匹配显式教学 ID，只读取标准 Configuration Space 与 Linux Resource；RTL8822CE/RTL8821CE 只用于展示标准 `lspci` 格式，不读取或写入它们的私有 BAR。
 
-Explorer 的第一原则是：对未知硬件不写配置空间、不写 BAR、不启用 Bus Master、不触发 reset。
+## 一、先看问题：lspci 的一行怎样对应到 pci_dev
 
-本文固定以 Linux 6.12 为基线，配套 `pci_explorer.c` 只匹配显式教学 ID，并仅输出安全信息。
+假设系统显示下面的代表性格式：
 
-## 一、为什么未知 PCIe 设备不能“试写看看”
-
-配置空间与 BAR 中的写操作可能：
-
-- 关闭 Memory Space/Bus Master。
-- 改写 BAR 地址，破坏资源路由。
-- 触发 Function Level Reset。
-- 修改 MSI-X Table/Mask。
-- 清除 W1C Error Status。
-- 启动 DMA Engine。
-- Pop FIFO 或确认不可恢复事件。
-
-同一个 offset 在不同 Device 上语义完全不同。
-
-没有公开 Programming Manual 就不能把别的设备寄存器模板套上去。
-
-Explorer 只读通用 PCI Header/Capability，并把任何可选 BAR 读取限制在明确白名单协议。
-
-## 二、Explorer 在 PCI Driver Model 中的位置
-
-Explorer 仍是普通 `pci_driver`。
-
-它通过 `pci_device_id` 匹配显式 VID/DID，probe 接收 `pci_dev`。
-
-```mermaid
-flowchart TD
-    ENUM[PCI Core enumeration] --> PDEV[pci_dev]
-    PDEV --> MATCH[explicit pci_device_id whitelist]
-    MATCH --> PROBE[pci_explorer probe]
-    PROBE --> CFG[read-only configuration inspection]
-    PROBE --> RES[read BAR resources, no writes]
-    PROBE --> SYS[read-only sysfs attributes]
-    UNBIND[driver unbind] --> REMOVE[remove sysfs group and references]
+```text
+01:00.0 Network controller [0280]: Realtek Semiconductor Co., Ltd. Device [10ec:c822]
 ```
 
-不使用 Class-only ID 匹配所有网卡/存储/显示设备。
+这行文字并不是 `lspci` 扫描了厂商业务寄存器。Linux PCI Core 已经通过配置访问创建 `pci_dev`，sysfs 暴露标准属性，`lspci` 再读取 Configuration Space 与 PCI ID Database 进行解码。
 
-否则 Explorer 会抢占真实功能驱动，导致系统网络、磁盘或显示失效。
-
-实验可用保留教学 ID 或通过 `new_id` 只对一块确认安全的设备动态绑定。
-
-## 三、probe 不需要启用 Bus Master
-
-读取 PCI Configuration Header 使用 PCI Core 配置访问，不需要 Device 发 DMA。
-
-读取 `pci_resource_*()` 也只是读取 Core 已解析的 Resource 对象。
-
-因此 Explorer 默认不调用：
-
-- `pci_set_master()`。
-- DMA Mask/Allocation API。
-- `pci_alloc_irq_vectors()`。
-- Device 私有 BAR 写。
-
-若只读取配置，也不必 `pci_iomap()`。
-
-最小权限减少错误影响范围。
-
-## 四、读取配置头身份
-
-`pci_dev` 已缓存：
+在 Driver `probe(struct pci_dev *pdev, ...)` 中，对应信息已经缓存为：
 
 ```c
 pdev->vendor;
@@ -91,305 +33,218 @@ pdev->subsystem_vendor;
 pdev->subsystem_device;
 pdev->class;
 pdev->revision;
+pdev->bus;
 pdev->devfn;
 ```
 
-也可以使用 `pci_read_config_*()` 读取标准 Header Offset，对照缓存值。
+因为这些字段来自通用 Header，所以读取它们不需要先 `pci_iomap()`，也不需要启用 Bus Master。Explorer 的第一条设计原则就是按最小权限观察：如果目标只是证明枚举和资源结果，就不要获得 DMA、IRQ 或设备私有寄存器的控制权。
 
-```mermaid
-sequenceDiagram
-    participant E as Explorer probe
-    participant P as pci_dev
-    participant C as PCI config access
-    E->>P: read cached vendor/device/class
-    E->>C: pci_read_config_word PCI_COMMAND
-    E->>C: pci_read_config_byte PCI_HEADER_TYPE
-    C-->>E: values or PCIBIOS status
-    E->>E: format read-only report
-```
+## 二、Explorer 仍然是普通 pci_driver
 
-每次读取检查返回值。
-
-配置访问失败时不要把未初始化 value 输出为真实寄存器。
-
-## 五、pci_cfg_access_lock 的用途
-
-配置空间可能与 reset、AER Recovery、Power Transition 或其他管理访问并发。
-
-`pci_cfg_access_lock(pdev)`/`pci_cfg_access_unlock(pdev)` 可在需要一致快照时序列化配置访问。
-
-Explorer 不应长期持锁，也不能在锁内等待用户输入。
-
-推荐：
-
-1. 进入一次短读取函数。
-2. 锁住配置访问。
-3. 读取少量 Header/Capability 字段到私有 snapshot。
-4. 解锁。
-5. 在锁外格式化 sysfs 输出。
-
-如果 Device 已进入不可访问的 D3cold，应返回错误，不强行恢复一个绑定到其他管理策略的设备。
-
-## 六、Standard Capability 链
-
-Status Register 的 Capabilities List bit 表示存在链。
-
-Header 中 Capability Pointer 指向第一个节点。
-
-每个节点前两个字节是 ID 与 Next Pointer。
-
-常见 ID：
-
-- `PCI_CAP_ID_PM`
-- `PCI_CAP_ID_MSI`
-- `PCI_CAP_ID_EXP`
-- `PCI_CAP_ID_MSIX`
-
-使用 `pci_find_capability(pdev, id)`。
-
-不要手写无限循环遍历外部提供的 next pointer。
-
-```mermaid
-flowchart LR
-    PTR[Capability Pointer] --> PM[PM Capability]
-    PM --> MSI[MSI Capability]
-    MSI --> PCIE[PCI Express Capability]
-    PCIE --> MSIX[MSI-X Capability]
-    MSIX --> END[Next = 0]
-    HELP[pci_find_capability] --> PM
-    HELP --> MSI
-    HELP --> PCIE
-    HELP --> MSIX
-```
-
-Capability 顺序不固定。
-
-缺少某能力应显示 absent，而不是假设 offset。
-
-## 七、PCIe Capability 的只读字段
-
-PCIe Capability 可读取：
-
-- Device/Port Type。
-- Device Capabilities：MPS Supported、Extended Tag 等。
-- Device Control/Status：MPS、MRRS、Error Reporting。
-- Link Capabilities：Maximum Speed/Width、ASPM。
-- Link Control/Status：Current Speed/Width、Training、DLLLA。
-
-使用 `pcie_capability_read_word/dword()`。
-
-Explorer 可以输出“能力”和“当前配置”两列。
-
-例如 Max Speed Gen4、Current Speed Gen3 表示链路降级或上游限制，不应把二者混成“支持 Gen3”。
-
-## 八、MSI 与 MSI-X 能力只观察不申请
-
-MSI Capability 可显示支持的 Multiple Message 数、64-bit Address 与 Mask Capability。
-
-MSI-X Capability 可显示 Table Size、Function Mask、Enable，以及 Table/PBA 的 BAR Indicator/Offset。
-
-Explorer 不调用 `pci_alloc_irq_vectors()`，因为它没有要服务的硬件中断。
-
-也不映射/写 MSI-X Table。
-
-读取 Table Size 能帮助理解设备能力，但真实向量数还受 Linux、IRQ Domain、平台与 Driver 请求限制。
-
-## 九、Extended Capability 链
-
-Extended Capability 从 offset 0x100 开始。
-
-Header 包含 ID、Version、Next Offset。
-
-常见：
-
-- AER。
-- Device Serial Number。
-- ACS。
-- ARI。
-- SR-IOV。
-- ATS。
-- PRI。
-- PASID。
-
-使用 `pci_find_ext_capability()`。
+Explorer 使用 `pci_driver` 的原因是它需要在受控绑定生命周期中访问 `pci_dev`，并创建与设备共同生灭的 sysfs Attribute。它并没有绕过 Driver Model，也不能同时与真实功能驱动绑定同一个 Function。
 
 ```mermaid
 flowchart TD
-    X100[0x100 Extended Capability] --> AER[AER]
-    AER --> ACS[ACS]
-    ACS --> SRIOV[SR-IOV]
-    SRIOV --> ATS[ATS]
-    ATS --> PASID[PASID]
-    PASID --> ZERO[Next = 0]
-    API[pci_find_ext_capability] --> AER
-    API --> SRIOV
-    API --> ATS
+    ENUM[PCI Core enumeration] --> PDEV[pci_dev]
+    PDEV --> MATCH[explicit teaching pci_device_id]
+    MATCH --> PROBE[Explorer probe]
+    PROBE --> SNAP[read standard config snapshot]
+    PROBE --> RES[read Linux BAR resources]
+    PROBE --> SYS[create read-only sysfs attributes]
+    UNBIND[driver unbind] --> REMOVE[remove sysfs group]
 ```
 
-读取 AER Status 可能涉及 W1C 语义，但纯 read 不清 bit。
+若 Explorer 使用 Class-only ID 匹配所有网络或存储设备，它可能抢占系统网卡、NVMe 或 GPU，导致业务功能消失。因此示例必须使用保留的教学 VID/DID，或者只在明确知道后果时通过 `new_id` 对一块测试设备动态绑定。
 
-Explorer 不主动 clear，以免破坏 AER Service/真实 Driver 的证据。
+即便通过 `new_id` 绑定真实设备，原功能驱动也会先解绑。解绑可能停止网络、卸载存储或破坏正在使用的设备，因此“只读 Explorer 本身安全”不等于“驱动切换过程没有影响”。
 
-## 十、BAR Resource 应从 pci_dev 读取
+## 三、最小 probe() 先取得一致快照
 
-遍历 `PCI_STD_NUM_BARS`：
+只读 Explorer 不调用 `pci_set_master()`、DMA Allocation、`pci_alloc_irq_vectors()` 或设备私有 BAR 写。它只需要保存 `pdev`、读取标准配置字段，并发布只读 Attribute：
 
 ```c
-for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
-	resource_size_t start = pci_resource_start(pdev, bar);
-	resource_size_t len = pci_resource_len(pdev, bar);
-	unsigned long flags = pci_resource_flags(pdev, bar);
+static int explorer_probe(struct pci_dev *pdev,
+                          const struct pci_device_id *id)
+{
+    struct explorer *exp;
+    int ret;
+
+    exp = devm_kzalloc(&pdev->dev, sizeof(*exp), GFP_KERNEL);
+    if (!exp)
+        return -ENOMEM;
+
+    exp->pdev = pdev;
+    pci_set_drvdata(pdev, exp);
+
+    ret = explorer_take_snapshot(exp);
+    if (ret)
+        return ret;
+
+    return sysfs_create_group(&pdev->dev.kobj,
+                              &explorer_attr_group);
 }
 ```
 
-输出：
+`explorer_take_snapshot()` 把少量配置字段读取到 Driver Private Memory，sysfs Show Callback 只格式化这份快照。因为 Show 可能由任意用户线程反复调用，所以不应每次都持有配置锁、唤醒设备或遍历可能变化的链表。
 
-- BAR Number。
-- Start/End/Length。
-- IORESOURCE_IO 或 IORESOURCE_MEM。
-- 64-bit/Prefetchable 等 flags。
-- 当前是否有 Driver Resource Owner（通过系统资源视图辅助判断）。
+一次快照只能证明某个时间点的状态。Link Speed、Power State、AER Status 和 Command Register 可能后来改变，因此需要实时信息时，应明确使用动态读取并处理设备离线，而不是把静态快照标成当前状态。
 
-Length 为 0 表示未实现或未分配，不应 `pci_iomap()`。
+## 四、配置头读取要检查返回状态
 
-## 十一、为什么 Explorer 默认不读 BAR 内容
+虽然 `pci_dev` 已缓存身份字段，Explorer 仍可读取少量标准寄存器与缓存值对照：
 
-即使只 `readl()`，某些 Register 也可能：
+```c
+u16 command;
+u8 header_type;
+int ret;
 
-- Clear-on-Read。
-- Pop Completion FIFO。
-- Latch/Unlock 下一个状态。
+ret = pci_read_config_word(pdev, PCI_COMMAND, &command);
+if (ret)
+    return pcibios_err_to_errno(ret);
 
-所以“只读 MMIO”也不一定无副作用。
-
-Explorer 默认只报告 BAR Resource，不读取 BAR 内字节。
-
-只有教学硬件公开指定一个 side-effect-free ID/Version Register 时，才能通过模块参数显式允许映射小范围读取。
-
-该选项应同时检查 VID/DID、BAR、Offset、Length 与 Device Power State。
-
-## 十二、sysfs 属性的生命周期
-
-Explorer 可用 `sysfs_create_group()` 或 Device Attribute Group 暴露只读 snapshot：
-
-```text
-identity
-capabilities
-extended_capabilities
-bars
-link
+ret = pci_read_config_byte(pdev, PCI_HEADER_TYPE, &header_type);
+if (ret)
+    return pcibios_err_to_errno(ret);
 ```
 
-show callback 可能与 remove 并发。
+Configuration Access 返回的可能是 `PCIBIOS_*` 状态，不总是 Linux errno。若忽略返回值并输出局部变量，访问失败会被伪装成随机寄存器值。因此 Explorer 必须先判断状态，再把字段写入有效 Snapshot。
 
-Device Core 在 Attribute Removal 与 callback 生命周期上提供框架保证，但私有 snapshot 仍需按绑定寿命管理。
-
-remove 先 `sysfs_remove_group()`，再释放 snapshot/private。
-
-不要让 sysfs show 在持配置锁时输出大量文本。
-
-## 十三、lspci 与 Explorer 的互补
-
-`lspci -nnvvxxxx -s BDF`：
-
-- 通用、无需专用 Driver。
-- 解码 Header/Capability。
-- 可读取原始配置空间。
-
-Explorer：
-
-- 展示 Kernel `pci_dev` 缓存和 API 视角。
-- 可演示 config access lock 与 sysfs 生命周期。
-- 可固定白名单和输出格式。
-
-二者都不能证明：
-
-- BAR 内业务协议正确。
-- DMA 正确。
-- MSI-X 实际产生。
-- Link 物理信号质量。
-
-## 十四、安全绑定与恢复真实驱动
-
-如果目标 Function 已绑定真实 Driver，先确认停止业务和解绑影响。
-
-不要把 Root Filesystem NVMe、唯一网卡或显示 GPU 绑定到教学 Explorer。
-
-实验应使用独立 FPGA/Test Endpoint。
-
-结束后：
-
-1. 从 Explorer unbind。
-2. 删除 dynamic ID（若添加）。
-3. bind 回原 Driver 或执行正常 rescan。
-4. 验证业务与 PM/AER 状态恢复。
-
-## 十五、Explorer 的错误回滚
-
-probe 只分配 snapshot、创建 sysfs，不接管 DMA/IRQ/BAR。
-
-回滚：
+Header Type 决定 Type 0/Type 1 Layout，Command 表示 Memory/IO Decode 与 Bus Master 状态，Status 表示 Capability List 等通用状态。Explorer 可以解释这些标准位，但不能据此断言厂商 Firmware 或业务队列已经运行。
 
 ```mermaid
-flowchart TD
-    P[probe] --> A[allocate private snapshot]
-    A --> R[read config/capability]
-    R --> S[create sysfs group]
-    S --> D[pci_set_drvdata]
-    R -. fail .-> F[free snapshot]
-    S -. fail .-> F
-    D -. remove .-> RS[remove sysfs group]
-    RS --> F
+sequenceDiagram
+    participant PROBE as Explorer probe
+    participant PDEV as pci_dev cache
+    participant CFG as PCI config access
+    PROBE->>PDEV: read vendor device class BDF
+    PROBE->>CFG: read PCI_COMMAND and HEADER_TYPE
+    CFG-->>PROBE: PCIBIOS status + value
+    PROBE->>PROBE: store validated snapshot
+    PROBE-->>PROBE: format later in sysfs show
 ```
 
-`pci_set_drvdata()` 的发布点要与 sysfs 可见性顺序一致。
+## 五、Standard Capability 先形成一条可验证链
 
-remove 后没有 work、timer、IRQ 或 DMA，因此生命周期应保持简单。
+Status Register 的 Capabilities List Bit 表示标准 Capability 存在，Header 中的 Capability Pointer 指向第一个节点。每个节点前两个字节是 Capability ID 和 Next Pointer，因此软件可以顺链发现 PM、MSI、MSI-X 和 PCIe Capability。
 
-## 十六、不要把 Explorer 变成危险万能工具
+Explorer 不必手写遍历器。Linux 6.12 提供 `pci_find_capability()`，例如：
 
-不添加“任意 offset 写任意 value”的 sysfs/ioctl。
+```c
+int pm = pci_find_capability(pdev, PCI_CAP_ID_PM);
+int msi = pci_find_capability(pdev, PCI_CAP_ID_MSI);
+int msix = pci_find_capability(pdev, PCI_CAP_ID_MSIX);
+int exp = pci_find_capability(pdev, PCI_CAP_ID_EXP);
+```
 
-不提供任意 BAR mmap。
+返回值是 Capability 在 Configuration Space 中的 Offset，0 表示未找到。这个 Offset 不是通用对象地址，而是后续读取 Capability Register 的基准；不同设备的同一 Capability 可以位于不同位置。
 
-不自动 enable Bus Master。
+PCIe Capability 中的 `LnkCap` 和 `LnkSta` 能展示最大与当前 Speed/Width，`DevCap/DevCtl` 能展示 MPS/MRRS 能力与配置。因为 Capability 表示标准机制，所以这些字段适合 Explorer；但改变 ASPM、MPS 或 MSI Enable 会影响正在运行设备，不属于只读观察范围。
 
-不自动 reset。
+## 六、Extended Capability 从 0x100 继续扩展
 
-不清 AER Status。
+Extended Capability Header 从 Offset `0x100` 开始，包含 ID、Version 和 Next Pointer。常见 ID 包括 AER、ACS、ARI、SR-IOV、ATS、PRI、PASID 和 Resizable BAR。
 
-需要这些操作时，应为明确硬件协议编写专用 Driver，并定义权限、状态、锁和错误恢复。
+```c
+int aer = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_ERR);
+int ats = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_ATS);
+int pasid = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_PASID);
+```
 
-## 十七、Linux 6.12 源码阅读入口
+找到 Capability 只证明设备声明支持相关结构，不证明平台、Root Port、IOMMU 和 Driver 已经启用整条功能。例如 Endpoint 有 ATS Capability，但 IOMMU、PCI Core 策略或 Driver 未建立 ATS Translation Cache 时，不能据此声称 ATS 正在工作。
 
-- `include/linux/pci.h`
-- `drivers/pci/access.c`
-- `drivers/pci/pci.c`
-- `drivers/pci/probe.c`
-- `drivers/pci/msi/`
-- `drivers/pci/pcie/aer.c`
+Explorer 若需要通用遍历所有 Extended Capability，也要防止坏 Next Pointer、自环、未对齐和越界。Linux Helper 已经处理常规查找，教学代码应优先复用，而不是为了展示循环而降低鲁棒性。
 
-一手资料：
+## 七、BAR 应观察 Resource，不应盲读内容
+
+Explorer 可以安全读取 PCI Core 保存的 BAR Resource：
+
+```c
+for (int bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
+    resource_size_t start = pci_resource_start(pdev, bar);
+    resource_size_t len = pci_resource_len(pdev, bar);
+    unsigned long flags = pci_resource_flags(pdev, bar);
+
+    if (!len)
+        continue;
+    dev_info(&pdev->dev,
+             "BAR%d start=%pa len=%pa flags=%#lx\n",
+             bar, &start, &len, flags);
+}
+```
+
+这些 API 读取的是第 03 篇建立的 Linux Resource 结果，不会再次执行 BAR sizing，也不会申请 Region。因为只读 Explorer 不准备访问业务寄存器，所以通常不需要 `pci_request_regions()` 或 `pci_iomap()`。
+
+不要把“映射 BAR 后读取前 64 字节”设计成通用功能。某些 offset 是 Read-Clear 状态、FIFO、Doorbell Response 或访问后触发硬件动作；没有 Programming Manual 时，连读取都可能有副作用。因此 Explorer 的 BAR 报告止于 Start、Length 和 Flags。
+
+如果确实有一块公开协议的教学 Endpoint，可以额外定义 VID/DID、BAR Index、最小长度和只读 Offset 白名单。这个扩展属于该设备协议，不应混入标准 PCI Explorer 路径。
+
+## 八、sysfs 与 lspci 各自证明什么
+
+`/sys/bus/pci/devices/0000:01:00.0/` 把 Driver Model、Resource 和配置访问暴露给用户。常见属性包括 `vendor`、`device`、`class`、`resource`、`config`、`driver`、`iommu_group`、`current_link_speed` 和 `current_link_width`，具体文件取决于平台和能力。
+
+```bash
+DEV=/sys/bus/pci/devices/0000:01:00.0
+cat "$DEV/vendor" "$DEV/device" "$DEV/class"
+cat "$DEV/resource"
+readlink "$DEV/driver"
+readlink "$DEV/iommu_group"
+lspci -s 0000:01:00.0 -vv
+```
+
+`lspci -vv` 适合解码配置空间，sysfs 适合观察 Linux 对象、绑定和 Resource，Explorer 适合证明 Driver 回调拿到的 `pci_dev` 与这些输出一致。三者都不是协议抓包，也不能独立证明 DMA 数据是否正确传输。
+
+自定义 sysfs Attribute 的生命周期必须跟随 Driver Binding。`sysfs_create_group()` 成功后，`remove()` 先调用 `sysfs_remove_group()`，阻止新的 Show 进入，再释放其依赖状态。Show Callback 还应检查 Snapshot 有效性并使用 `sysfs_emit()` 控制缓冲区。
+
+## 九、正常读取完成后再讨论并发与电源边界
+
+配置空间可能与 Reset、AER Recovery、Power Transition 或其他管理访问并发。需要一组一致字段时，可在短临界区中使用 `pci_cfg_access_lock(pdev)` 与 `pci_cfg_access_unlock(pdev)`：锁内只读取到本地 Snapshot，锁外再格式化和等待用户。
+
+```text
+lock config access
+  -> read a bounded set of standard registers
+  -> validate every return status
+  -> copy into private snapshot
+unlock config access
+  -> format sysfs/debug output
+```
+
+不应长期持有配置锁，也不能在锁内等待 Runtime Resume 或用户输入。因为锁是配置访问序列化手段，不是设备在线保证，所以 Surprise Removal 时读取仍可能失败或返回全 1。
+
+D3cold 状态下 Function 的配置空间可能不可访问。Explorer 不应为了显示一项字段就擅自改变真实设备的 Runtime PM 策略；需要实时读取时，应通过合法 PM Reference 唤醒设备，并在完成后对称释放。对于只读教学模块，绑定时快照通常更安全。
+
+配置写入风险包括关闭 Memory Space/Bus Master、改写 BAR、触发 FLR、改变 MSI-X Mask、清除 W1C AER Status 或启动 DMA。因此未知设备上“试写看看”的影响远大于 Explorer 本身，通用文章不提供此类白名单外写入。
+
+## 十、remove 与错误回滚保持最小状态
+
+Explorer 的 Probe 状态很少：私有对象、Snapshot 和 sysfs Group。若 Snapshot 失败，尚未发布 Group，直接返回即可；若 Group 创建成功，remove 只需先删除 Group，再清理 Driver Data，Managed Private Object 最后释放。
+
+```c
+static void explorer_remove(struct pci_dev *pdev)
+{
+    struct explorer *exp = pci_get_drvdata(pdev);
+
+    sysfs_remove_group(&pdev->dev.kobj, &explorer_attr_group);
+    WRITE_ONCE(exp->online, false);
+    pci_set_drvdata(pdev, NULL);
+}
+```
+
+如果 Show Callback 可能并发执行，还要用适合的引用或同步保证 `exp` 在最后一个回调退出前有效。Managed Allocation 的释放时机通常晚于 Driver `remove()` 返回，但具体并发合同仍应在代码中明确，而不是依赖“通常不会同时发生”。
+
+## 十一、本篇检查点
+
+现在应当能够从一行 `lspci` 输出追到 `pci_dev` 的身份字段、Capability Offset、`resource[]` 和 sysfs 路径，并说明它们分别证明枚举、标准能力、资源分配和 Driver Binding 的哪一层事实。
+
+还应能够解释为什么只读配置观察不需要 Bus Master，为什么 Capability 存在不等于功能启用，为什么 BAR Resource 可以读取而 BAR 内容不能通用盲读，以及 `pci_cfg_access_lock()` 为什么要短持有并在锁外格式化。
+
+## 十二、小结：下一篇进入设备通知路径
+
+只读 Explorer 把前四篇的抽象对象落到了可观察证据：BDF 对应 `pci_dev`，标准/扩展 Capability 通过 Linux Helper 查找，BAR 通过 Resource API 报告，sysfs 和 `lspci` 从不同角度展示同一 Function。
+
+它同时建立了后续实验的安全边界：标准配置可按返回状态读取，未知 BAR 不盲读写，不启用不需要的 Bus Master、IRQ 和 DMA。下一篇将在设备协议明确的前提下进入中断，解释设备完成工作后怎样从 INTx、MSI 或 MSI-X 通知 CPU。
+
+**一手资料**
 
 - [Linux 6.12 PCI driver API](https://www.kernel.org/doc/html/v6.12/driver-api/pci/pci.html)
-- [Linux sysfs PCI ABI](https://docs.kernel.org/PCI/sysfs-pci.html)
-- [Linux stable PCI access source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci/access.c?h=linux-6.12.y)
-- [PCI-SIG specifications](https://pcisig.com/specifications)
-
-## 十八、小结
-
-PCI Explorer 的价值是安全地把 `pci_dev`、配置空间、Capability、BAR Resource 与 sysfs 连接起来。
-
-它使用显式 ID 白名单，不抢占任意 Class Device。
-
-配置快照可用 `pci_cfg_access_lock()` 短时序列化，读取失败必须保留错误语义。
-
-Standard/Extended Capability 使用 PCI Core helper 遍历，不假设固定 offset。
-
-BAR 默认只报告 Resource，不读取可能有 side effect 的 Device Register。
-
-Explorer 不启用 Bus Master、不申请 DMA/IRQ、不提供任意 write/mmap/reset。
-
-sysfs 属性在 remove 前撤销，私有 snapshot 只有一个清晰绑定寿命。
-
-在这条最小权限路径上理解 PCI Core，才适合进入真正控制 Device Queue、DMA 与中断的专用驱动。
+- [Linux PCI sysfs documentation](https://docs.kernel.org/PCI/sysfs-pci.html)
+- [Linux 6.12 PCI access source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci/access.c?h=linux-6.12.y)

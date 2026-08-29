@@ -1,6 +1,6 @@
 ---
 title: "嵌入式知识体系 · PCIe 驱动开发实战 #04 · Linux PCI Core：pci_bus、pci_dev 与 pci_ops"
-description: "以 Linux 6.12 为基线，系统拆解 PCI Host Bridge、pci_bus、pci_dev、pci_ops、配置空间访问、资源树、Capability 与 Linux 设备模型的关系。"
+description: "从枚举结果如何变成 Linux 对象出发，按创建顺序讲清 pci_host_bridge、pci_bus、pci_dev、pci_ops、Resource、Capability 与 Driver Model。"
 pubDate: "2026-08-29"
 series: pcie
 order: 4
@@ -8,505 +8,199 @@ tags: ["PCIe", "PCI Core", "Linux 6.12"]
 draft: false
 ---
 
-PCIe 设备驱动最常接触 `struct pci_dev`，但 `pci_dev` 并不是孤立对象。
+前三篇已经从协议和地址角度回答了设备怎样被发现、BAR 怎样得到地址，但功能驱动真正接收到的参数不是 Bus Number 或 BAR Register，而是一个 `struct pci_dev *`。这个对象是谁创建的，它与 Root Complex、Bridge 和 Linux Device Model 又是什么关系？
 
-它位于某个 `pci_bus`，由 Host Bridge 提供配置访问方法，经桥窗口和资源树获得地址，并作为 `struct device` 参加 Linux Driver Model。
+如果直接翻看 `struct pci_dev` 字段，会同时看到资源、Capability、PM、AER、DMA、IOMMU 和设备模型信息，读者很容易把它理解成“所有 PCIe 概念的容器”。更有效的方法是按对象创建顺序追踪：平台先提供 Host Bridge，PCI Core 才能创建 Bus；扫描 Bus 发现 Function，才创建 `pci_dev`；对象发布后，Driver 才可能匹配。
 
-如果只背 `pci_enable_device()` 与 `pci_iomap()`，很难解释：
+本文固定 Linux 6.12，并只解决 PCI Core 的对象与所有权问题。IRQ、DMA、PM 和 AER 在这里说明它们挂在哪里，但具体机制仍留给后续文章，避免在对象模型尚未建立时提前进入异常路径。
 
-- 为什么一个 BDF 会出现在某条 Bus。
-- ECAM 与非 ECAM 平台如何共享 PCI Core。
-- 桥的 Secondary/Subordinate Bus Number 如何限制扫描。
-- BAR 资源为何同时出现在 `pci_dev.resource[]` 与全局 iomem 树。
-- Capability 为什么存偏移而不是通用对象。
-- AER、PM、DMA 与 IOMMU 状态挂在哪里。
+## 一、先看问题：枚举结果在 Linux 中变成什么
 
-本文固定以 Linux 6.12 为代码基线，先建立 PCI Core 的对象和所有权模型。
-
-## 一、PCI Core 位于固件/控制器与功能驱动之间
-
-平台先提供 PCI Host Bridge：配置空间访问、Bus Number 范围、CPU/PCI 地址窗口、中断映射和控制器资源。
-
-PCI Core 使用这些能力扫描拓扑、创建设备、分配资源并匹配功能驱动。
-
-功能驱动只管理某个 Function 的 BAR、IRQ、DMA 与业务协议。
+第 02 篇中的枚举过程产生三类事实：平台有一条可扫描的 Root Bus，桥后还有 Child Bus，每个已发现 Function 拥有身份、配置空间和资源。Linux PCI Core 需要把这些事实保存成可引用、可匹配、可热插拔的对象。
 
 ```mermaid
 flowchart TD
-    FW[ACPI MCFG or Device Tree ranges] --> HOST[PCI Host Bridge driver]
-    HOST --> OPS[pci_ops config access]
-    HOST --> WIN[bus/resource windows]
-    OPS --> CORE[Linux PCI Core]
-    WIN --> CORE
-    CORE --> BUS[pci_bus tree]
-    BUS --> DEV[pci_dev functions]
-    DEV --> DRV[pci_driver]
-    DRV --> SUBSYS[net/block/gpu/fpga/custom]
+    FW[ACPI MCFG or Device Tree ranges] --> HOST[pci_host_bridge]
+    HOST --> RB[pci_bus root]
+    RB --> RP[pci_dev Root Port]
+    RP --> CB[pci_bus child]
+    CB --> EP[pci_dev Endpoint Function]
+    EP --> DEV[embedded struct device]
+    DEV --> DRV[pci_driver match and probe]
 ```
 
-PCI Core 不是某个 Root Complex 的寄存器驱动。
+因此 `pci_bus` 与 `pci_dev` 不是两种可互换的设备表示。`pci_bus` 表示一段 Bus Number 域和拓扑节点，`pci_dev` 表示该 Bus 上一个具体 Function。Bridge 自身是上游 Bus 上的 `pci_dev`，它的下游则是另一个 `pci_bus`。
 
-它是所有体系结构共享的枚举、对象、资源和驱动模型层。
+PCI Core 也不是 Root Complex 的寄存器驱动。控制器驱动负责时钟、复位、PHY、ATU、配置访问和 Host Window，PCI Core 则使用这些能力执行通用枚举、资源管理和 Driver Model 发布。把两者分开，才能理解为什么同一个 `pci_driver` 可以运行在 x86 ECAM、RK356x DesignWare 和其他 Host Controller 上。
 
-控制器差异通过 Host Bridge、`pci_ops`、IRQ domain、IOMMU 和体系结构 hook 接入。
+## 二、pci_host_bridge 是 Host 侧入口
 
-## 二、pci_host_bridge 表示主机侧入口
+`struct pci_host_bridge` 描述一个 PCI Host Hierarchy 的软件入口。它通常包含 Root Bus Number 范围、配置访问操作、CPU/PCI Resource Window、体系结构私有数据以及 MSI、DMA Range 等平台信息。
 
-`struct pci_host_bridge` 描述一个 Root Bus 的 Host 侧资源与策略。
+Device Tree 平台的 Host Controller Driver 会解析 `bus-range`、`ranges`、`dma-ranges`、Interrupt Map 等属性；ACPI 平台则可能从 MCFG、_CRS 和 Root Bridge 方法得到相同类别的信息。来源不同，但 PCI Core 最终需要的是“哪些 Bus 可以扫描、配置请求怎样发出、哪些地址范围可以分给下游”。
 
-它通常包含：
-
-- `bus`：扫描后创建的 Root `pci_bus`。
-- `windows`：可分配给下游的 I/O、Memory、Prefetchable 窗口。
-- `ops`：配置空间访问操作。
-- `sysdata`：体系结构/控制器私有数据。
-- `busnr`：Root Bus 起始编号。
-- MSI、DMA ranges 与策略信息。
-
-Device Tree 平台常由 `of_pci_get_host_bridge_resources()` 等路径解析 `bus-range`、`ranges`。
-
-ACPI 平台可能从 MCFG、_CRS 与 Root Bridge 方法获得信息。
-
-Host Bridge Driver 应先准备窗口与配置访问，再调用通用扫描接口。
-
-如果窗口错误，设备仍可能通过配置空间被发现，却无法正确分配 BAR。
-
-## 三、pci_bus 是一段编号域和拓扑节点
-
-`struct pci_bus` 表示一个 PCI Bus Number 对应的逻辑总线。
-
-Root Bus 由 Host Bridge 创建。
-
-PCI-to-PCI Bridge 的下游形成 Child Bus。
-
-重要关系：
-
-- `parent`：上级 Bus。
-- `children`：下级 Bus 链表。
-- `devices`：该 Bus 上的 `pci_dev`。
-- `self`：创建本 Bus 的 Bridge `pci_dev`；Root Bus 为 NULL。
-- `bridge`：Linux Device Model 中的桥设备。
-- `ops`：最终配置访问方法。
-- `number`、`primary`：Bus Number。
-- `resources`：该 Bus 可向设备分配的窗口。
-
-```mermaid
-flowchart TD
-    RB[pci_bus 00 root] --> RP[pci_dev 00:01.0 Root Port]
-    RP --> B1[pci_bus 01]
-    B1 --> EP1[pci_dev 01:00.0 Endpoint]
-    B1 --> SW[pci_dev 01:01.0 Switch Port]
-    SW --> B2[pci_bus 02]
-    B2 --> EP2[pci_dev 02:00.0 Endpoint]
+```text
+platform firmware / controller driver
+  -> allocate pci_host_bridge
+  -> fill bus number range
+  -> attach pci_ops
+  -> add CPU/PCI resource windows
+  -> call common host probe
+  -> create root pci_bus
 ```
 
-BDF 中的 Bus 字段来自 `pci_bus.number`。
+因为资源窗口与配置访问是扫描的前提，所以 Host Bridge Driver 必须先把它们准备完整。如果 `pci_ops` 正常但 Memory Window 错误，设备可能仍能通过配置空间被发现，却无法为 BAR 分配可访问地址；这个现象正好对应第 03 篇的 Config Path 与 Memory Path 区别。
 
-Device/Function Number 只在该 Bus 内有意义。
+## 三、pci_bus 表示编号域和拓扑节点
 
-`pci_dev->bus` 与 `pci_dev->devfn` 一起确定 Function 的拓扑地址。
+`struct pci_bus` 对应一个 Bus Number。Root Bus 由 Host Bridge 创建，PCI-to-PCI Bridge、Root Port 或 Switch Port 的下游形成 Child Bus。Bus 对象保存父子关系、该 Bus 上的 Function 列表、配置访问方法和可分配 Resource Window。
 
-## 四、Bridge 的 pci_dev 与 Child pci_bus 是两个对象
+关键关系可以按问题理解，而不必背完整结构体：
 
-一个 PCI-to-PCI Bridge 自身是上游 Bus 上的 Function，因此有 `pci_dev`。
-
-它的下游又是一个新的 `pci_bus`。
-
-Bridge 配置头中的 Primary、Secondary、Subordinate Bus Number 定义路由范围。
-
-`pci_bus.self` 指向这个 Bridge Function。
-
-不要把 Bridge `pci_dev` 的 BAR 与下游 Bus Window 混为一谈。
-
-Bridge Window 位于 Type 1 Header 的 I/O Base/Limit、Memory Base/Limit 与 Prefetchable Base/Limit。
-
-它们决定哪些下游地址事务可以穿过桥。
-
-Endpoint BAR 已分配但不落在桥窗口内，CPU 访问仍会失败。
-
-## 五、pci_dev 表示一个 Function
-
-`struct pci_dev` 对应一个 PCI Function，而不是整块卡。
-
-多功能设备的 Function 0..7 分别拥有独立 `pci_dev`、配置空间、BAR、Capability 和 Driver。
-
-常用字段按职责分类：
-
-| 类别 | 字段/内容 | 含义 |
+| 问题 | `pci_bus` 关系 | 含义 |
 | --- | --- | --- |
-| 拓扑 | `bus`、`subordinate`、`devfn` | 所属 Bus、桥下游、Device/Function |
-| 身份 | `vendor`、`device`、`subsystem_*`、`class` | 配置头身份与 Class Code |
-| 资源 | `resource[PCI_NUM_RESOURCES]` | BAR、ROM、Bridge Window 等 |
-| 能力 | `pm_cap`、`msi_cap`、`msix_cap`、PCIe 字段 | 常用 Capability 偏移与状态 |
-| 驱动 | `driver`、`driver_override` | 当前绑定关系 |
-| 电源/错误 | `current_state`、error state、saved config | PM/AER/恢复 |
-| 设备模型 | `dev` | 引用、sysfs、DMA、IOMMU、PM |
+| 这是哪条 Bus | `number`、`domain_nr()` | 形成 BDF 的 Domain/Bus 部分 |
+| 上游是谁 | `parent` | Root Bus 为 `NULL` |
+| 哪个桥创建了它 | `self` | 指向上游 Bus 上的 Bridge `pci_dev` |
+| 下游有哪些 Bus | `children` | 递归拓扑 |
+| Bus 上有哪些 Function | `devices` | `pci_dev` 列表 |
+| 配置请求怎样发出 | `ops` | 最终调用平台 `pci_ops` |
+| BAR 可分到哪里 | `resources` | Bridge/Host 可用窗口 |
 
-一个 Endpoint 可能暴露 SR-IOV Physical Function 与多个 Virtual Function。
+`pci_bus.self` 很容易被误解。对于 Child Bus，它指向创建该 Bus 的 Bridge Function；对于 Root Bus，没有上游 PCI Bridge，因此通常为 `NULL`。Bridge 的 BAR 与 Child Bus Window 也不是一回事，前者属于 Bridge Function 自己，后者控制下游事务能否穿过。
 
-每个 VF 也有独立 `pci_dev`，但资源和生命周期受 PF/SR-IOV Core 管理。
+因为 Bus Number 只在一个 Domain 中有意义，所以完整设备位置需要 Domain、Bus 和 `devfn` 一起确定。Linux 打印的 `0000:01:00.0` 正是从 `pci_bus` 和 `pci_dev->devfn` 组合出来，而不是设备永久烧录的地址。
 
-## 六、pci_dev 嵌入 struct device
+## 四、pci_dev 表示一个 Function
 
-`pci_dev.dev` 让 PCI Function 参加通用 Driver Core。
+`struct pci_dev` 对应 PCI Function。多功能设备的 Function 0～7 分别拥有独立配置空间、BAR、Capability、驱动和电源状态，因此“一块卡”可以同时出现多个 `pci_dev`，甚至由不同 Driver 管理。
 
-由此获得：
+`pci_dev` 的字段可以按产生阶段分组：
 
-- sysfs 目录与 uevent。
-- 引用计数和 release。
-- parent/child 关系。
-- DMA mask、IOMMU group 与 DMA ops。
-- runtime/system PM。
-- device link 与 managed resource。
+| 阶段 | 典型信息 | 来源 |
+| --- | --- | --- |
+| 发现 | `vendor`、`device`、`class`、`revision` | Type 0/1 Header |
+| 拓扑 | `bus`、`devfn`、`subordinate` | 递归扫描 |
+| 资源 | `resource[]` | BAR sizing 与分配 |
+| 能力 | `pm_cap`、`msi_cap`、`msix_cap`、PCIe 字段 | Capability 链 |
+| 驱动 | `driver`、`driver_data`、`dev` | Driver Model 匹配 |
+| 运行状态 | Enable、Bus Master、Power/Error 状态 | PCI Core 与功能驱动 |
 
-转换 helper：
+这张表的重点是时间顺序：`probe()` 被调用时，身份、拓扑、资源和常用 Capability 已经由 PCI Core 建立。功能驱动不应重新扫描 Bus，也不应自行计算 BAR Size；它通过 `pci_dev` 读取枚举结果，并只管理这个 Function 的业务状态。
 
-```c
-struct pci_dev *pdev = to_pci_dev(dev);
-struct device *dev = &pdev->dev;
-```
+`pci_dev` 内嵌 `struct device dev`，所以 PCI Function 同时参加 Linux Device Model。sysfs 路径、uevent、Driver Link、DMA API、Runtime PM 和设备生命周期都通过这个通用 `struct device` 接入，而 PCI 专有信息仍保存在外层 `pci_dev`。
 
-DMA API 接收 `&pdev->dev`，因为 DMA 映射属于通用 Device/IOMMU 模型。
+## 五、pci_ops 只抽象配置空间访问
 
-PCI 配置与资源 API 接收 `pdev`，因为它们需要 PCI Function 语义。
-
-## 七、pci_ops 抽象配置空间访问
-
-`struct pci_ops` 的核心是 read/write：
+`struct pci_ops` 的核心职责是按 Bus、`devfn` 和 Offset 读取或写入 Configuration Space。它不提供设备 BAR 业务访问，也不替功能驱动管理 Queue、IRQ 或 DMA。
 
 ```c
 struct pci_ops {
-	int (*map_bus)(struct pci_bus *bus, unsigned int devfn,
-		       int where, void __iomem **addr);
-	int (*read)(struct pci_bus *bus, unsigned int devfn,
-		    int where, int size, u32 *val);
-	int (*write)(struct pci_bus *bus, unsigned int devfn,
-		     int where, int size, u32 val);
+    int (*map_bus)(struct pci_bus *bus,
+                   unsigned int devfn,
+                   int where,
+                   void __iomem **addr);
+    int (*read)(struct pci_bus *bus,
+                unsigned int devfn,
+                int where,
+                int size,
+                u32 *val);
+    int (*write)(struct pci_bus *bus,
+                 unsigned int devfn,
+                 int where,
+                 int size,
+                 u32 val);
 };
 ```
 
-具体字段会随内核版本/配置有所差异，Linux 6.12 头文件是最终依据。
+不同内核版本和 Host 实现选择的成员组合可能不同，功能驱动不应直接调用这些回调。通用代码使用 `pci_bus_read_config_byte/word/dword()`、`pci_bus_write_config_*()`，已绑定 Function 的驱动则通常使用 `pci_read_config_*()` 和 `pci_write_config_*()`。
 
-ECAM 平台可将 BDF 与 offset 映射为 MMIO 地址。
-
-另一些 SoC Root Complex 使用专用 Address/Data 寄存器、ATU Window 或 Firmware Call。
-
-上层 `pci_bus_read_config_*()` 和 `pci_read_config_*()` 不需要知道硬件方法。
+调用关系如下：
 
 ```mermaid
 sequenceDiagram
-    participant C as PCI Core/Driver
-    participant B as pci_bus_read_config_dword
-    participant O as pci_ops
-    participant H as Host Controller/ECAM
-    C->>B: bus, devfn, offset
-    B->>B: validate size/alignment/range
-    B->>O: read(bus, devfn, where, 4)
-    O->>H: ECAM MMIO or controller transaction
-    H-->>O: value or device-not-found status
-    O-->>B: PCIBIOS status
-    B-->>C: status + value
+    participant CORE as PCI Core
+    participant BUS as pci_bus
+    participant OPS as pci_ops
+    participant HOST as ECAM / RC config window
+    CORE->>BUS: pci_bus_read_config_word(bus, devfn, where)
+    BUS->>OPS: read or map_bus
+    OPS->>HOST: architecture-specific config access
+    HOST-->>OPS: value or PCIBIOS status
+    OPS-->>CORE: status + value
 ```
 
-## 八、配置访问有三种常见入口层级
+因为配置访问可能返回 `PCIBIOS_*` 状态，而普通驱动 API 习惯 Linux errno，所以代码应使用相应 Helper 转换或检查返回值。读取失败时输出未初始化变量，会把访问异常伪装成真实寄存器内容。
 
-Bus 级：
+## 六、resource[] 把 BAR 接入系统资源树
 
-```c
-pci_bus_read_config_byte(bus, devfn, where, &value8);
-pci_bus_read_config_word(bus, devfn, where, &value16);
-pci_bus_read_config_dword(bus, devfn, where, &value32);
-```
-
-Device 级：
-
-```c
-pci_read_config_word(pdev, where, &value16);
-pci_write_config_dword(pdev, where, value32);
-```
-
-Capability 级 helper：
-
-```c
-pci_read_config_word(pdev, pdev->pcie_cap + PCI_EXP_DEVCTL, &ctl);
-pcie_capability_read_word(pdev, PCI_EXP_LNKSTA, &status);
-```
-
-功能驱动已有 `pdev` 时优先使用 Device/Capability helper。
-
-Host Bridge/枚举代码尚未创建 `pci_dev` 时使用 Bus 级接口。
-
-返回通常是 PCIBIOS 状态，不一定是负 errno。
-
-调用者必须按 API 合同解释。
-
-## 九、配置空间读取也需要序列化
-
-配置访问可能与 reset、power transition、AER recovery 或用户空间 sysfs 并发。
-
-`pci_cfg_access_lock()`/`pci_cfg_access_unlock()` 可阻止其他配置访问穿过需要独占的阶段。
-
-它不是功能驱动随便保护私有寄存器的通用 mutex。
-
-`pci_block_cfg_access()` 等内部机制在恢复路径阻断访问。
-
-设备进入 D3cold 后配置空间可能不可访问。
-
-读取全 `0xffff` 或 `0xffffffff` 既可能是设备不存在，也可能是链路/电源/路由失败。
-
-不能在该状态下继续写 Capability 试图“唤醒”。
-
-## 十、枚举如何创建 pci_dev
-
-扫描逻辑对每个 devfn 读取 Vendor ID。
-
-不存在的 Function 通常返回全 1。
-
-发现后分配 `pci_dev`，读取配置头、Header Type、Class、Subsystem、BAR 与 Capability，并加入 Bus 列表。
-
-Bridge Function 会触发子 Bus 扫描。
-
-典型调用概念链：
-
-```text
-pci_scan_root_bus_bridge
-  -> pci_scan_child_bus
-  -> pci_scan_slot
-  -> pci_scan_single_device
-  -> pci_setup_device
-  -> pci_read_bases / capability setup
-```
-
-具体内部辅助函数随内核演进，但 Linux 6.12 的对象边界保持上述逻辑。
-
-设备对象在资源与属性准备后注册到设备模型，随后才触发 `pci_driver` 匹配。
-
-## 十一、resource[] 把 BAR 变成 Linux 资源对象
-
-配置头 BAR 是编码寄存器。
-
-PCI Core 探测大小、类型和地址后，填充 `pdev->resource[]`。
-
-每个 `struct resource` 包含 start、end、flags、parent/child/sibling 关系。
-
-常用访问：
-
-```c
-resource_size_t start = pci_resource_start(pdev, bar);
-resource_size_t len = pci_resource_len(pdev, bar);
-unsigned long flags = pci_resource_flags(pdev, bar);
-```
-
-资源还要插入全局 I/O Port 或 iomem Resource Tree。
-
-`pci_request_regions()`/`pci_request_region()` 声明驱动占用，防止其他驱动重叠映射。
-
-BAR 地址有效不代表驱动已经拥有它。
-
-## 十二、Bus Window 与 Endpoint Resource 的包含关系
-
-下游 Endpoint Memory BAR 应被每级 Bridge Memory Window 包含，并最终落在 Host Bridge 可达窗口。
+第 03 篇讲过 BAR Address Path，`pci_dev->resource[]` 就是该结果在 Function 对象中的保存位置。它不仅包含 Endpoint BAR，也可能包含 ROM、Bridge Window 等 Resource，因此索引和 Flags 必须结合 Function/Header Type 解释。
 
 ```mermaid
-flowchart TD
-    CPU[CPU physical address window] --> HB[Host Bridge outbound window]
-    HB --> BW0[Root Port memory window]
-    BW0 --> BW1[Switch downstream memory window]
-    BW1 --> BAR[Endpoint BAR resource]
-    BAR --> MMIO[device register aperture]
+flowchart LR
+    CFG[BAR in configuration space] --> SIZE[PCI Core sizing]
+    SIZE --> ASSIGN[Host / Bridge window allocation]
+    ASSIGN --> RES[pci_dev resource array]
+    RES --> REQ[pci_request_region ownership]
+    REQ --> MAP[pci_iomap CPU mapping]
 ```
 
-Linux Resource Tree 能显示声明关系，但 ATU 与硬件路由还必须正确编程。
+`pci_resource_start()`、`pci_resource_len()` 和 `pci_resource_flags()` 读取 Core 已保存的 Resource，不会再次执行 BAR sizing。`pci_request_region()` 再从系统 Resource Tree 声明 Driver 所有权，`pci_iomap()` 才建立 CPU I/O Mapping。
 
-嵌入式 RC 常出现 `lspci` 可见、BAR 地址也有值，但 MMIO 读全 1 或 abort；这时要同时检查 Resource Tree 与 outbound ATU。
+因此“`resource[]` 有值”只证明分配结果存在，不能证明 Driver 已经申请、Command Memory Enable 已打开、ATU 正确或设备响应。把这些状态分开记录，才能在 Probe 失败时知道应该撤销哪一步。
 
-## 十三、Capability 用链表偏移表达
+## 七、struct device 把 Function 发布给 Driver Model
 
-标准 Capability 位于前 256 字节，通过 Capability Pointer 单链表连接。
-
-PCIe、PM、MSI、MSI-X 等都有 Capability ID。
-
-Extended Capability 从 0x100 开始，每个头包含 ID、Version 与 Next Offset。
-
-AER、SR-IOV、ATS、PRI、PASID 等位于扩展空间。
-
-`pci_find_capability()` 和 `pci_find_ext_capability()` 返回偏移。
-
-返回 0 表示未找到。
-
-PCI Core 会缓存部分常用 offset，但驱动仍应使用 helper，不要假设固定地址。
-
-能力链来自设备，遍历必须检查对齐、范围和环。
-
-Linux 通用 helper 已实现这些防御，驱动不应重复手写不安全链表遍历。
-
-## 十四、pci_dev 的引用与查找
-
-`pci_get_device()`、`pci_get_class()` 等查找函数返回带引用的 `pci_dev`。
-
-使用后调用 `pci_dev_put()`。
-
-驱动 probe 参数对应的设备在绑定期间由 Driver Core 保证寿命，但把指针交给长期异步对象仍需遵守驱动自己的取消规则。
-
-引用只保护内存，不保证：
-
-- Link 仍为 L0。
-- 设备仍在 D0。
-- BAR 仍可访问。
-- reset 没有发生。
-
-Hotplug/remove 会先让驱动停止数据面、解绑并释放资源，最终才释放对象。
-
-## 十五、sysfs 是 PCI Core 对象的可观察投影
-
-典型目录：
+PCI Core 完成 `pci_dev` 基本初始化后，通过 `device_add()` 把内嵌 `struct device` 发布到 Linux Driver Model。此后 sysfs 出现设备目录，uevent 包含 modalias，Bus Type 的 Match 回调可以把设备与 `pci_driver.id_table` 比较。
 
 ```text
-/sys/bus/pci/devices/0000:01:00.0/
+pci_setup_device
+  -> identity and header parsed
+  -> BAR resources recorded
+  -> capabilities cached
+  -> device_add(&pdev->dev)
+  -> pci_bus_type.match
+  -> pci_device_id match
+  -> PCI driver probe wrapper
+  -> driver->probe(pdev, id)
 ```
 
-常用属性：
+因为 Match 发生在对象发布之后，所以 `lspci` 能看到设备但没有 Driver Link，说明配置访问、扫描和 `pci_dev` 创建已经完成。下一步应检查 modalias、模块是否加载、ID Table 是否匹配和 Probe 返回值，而不是继续排查 LTSSM。
 
-- `vendor`、`device`、`class`。
-- `config`：配置空间二进制文件。
-- `resource` 与 `resourceN`。
-- `enable`。
-- `power/`。
-- `driver` 链接。
-- `iommu_group` 链接。
-- `msi_irqs/`。
-- `reset`、`reset_method`（按设备能力）。
+`pci_set_drvdata()` 最终把功能驱动私有对象挂到通用 Device Driver Data 上，`pci_get_drvdata()` 在 Remove、PM 和 Error Handler 中取回。它不是设备硬件内存，也不由 PCI Core替驱动分配。
 
-sysfs 读取配置或资源也受权限和设备状态约束。
+## 八、Capability、PM、AER 和 DMA 在对象建立后接入
 
-用户空间写 config/resourceN 可能破坏正在运行的驱动，不是普通调试首选。
+PCI Core 在枚举阶段遍历标准与扩展 Capability，并缓存常用 Offset 或状态。功能驱动使用 `pci_find_capability()`、`pci_find_ext_capability()` 或专用 Helper，而不是自己假设 MSI、AER、PM 固定在某个地址。
 
-## 十六、modalias 与 pci_driver 匹配
+PM 和 AER 看起来像 `pci_dev` 的“额外字段”，实际代表其他生命周期参与者。Runtime PM 通过内嵌 `struct device` 计数和回调，PCI Power State 通过配置能力改变 Function；AER Recovery 则由 Port Service、PCI Core 和功能驱动 Error Handler 协作。
 
-PCI uevent 产生包含 Vendor、Device、Subsystem 与 Class 的 modalias。
+DMA API 接收 `&pdev->dev`，因为地址限制、IOMMU Domain 和 DMA Ops 属于 Linux Device Model；`pci_set_master()` 则改变 PCI Command 中 Bus Master Enable。两者一个建立系统地址映射规则，一个允许设备发起事务，不能互相替代。
 
-`MODULE_DEVICE_TABLE(pci, ids)` 生成模块 alias。
+本篇只需要建立挂接关系：这些子系统都以已经存在且引用有效的 `pci_dev`/`struct device` 为中心。后续文章会逐一解释状态变化，而不是把所有异常分支塞进对象创建过程。
 
-`struct pci_device_id` 可以按：
+## 九、引用、热插拔与对象销毁
 
-- Vendor/Device。
-- Subvendor/Subdevice。
-- Class/Mask。
+热插拔和 Surprise Removal 说明 `pci_dev *` 不是永久有效的裸指针。内核通过 Device Model Reference Count 管理对象生命周期；异步 Worker、用户文件或跨函数缓存若需要延长引用，应使用 PCI/Device Helper，而不是假设 Driver 绑定期间所有外部任务都会自动停止。
 
-匹配成功后 Driver Core 调用 PCI Core probe 包装，再进入 `pci_driver.probe()`。
+正常移除的顺序是先解除 Driver 绑定，让 `remove()` 停止业务、IRQ 和 DMA，再从 Bus/Device Model 删除对象。Bridge 被移除时，其 Child Bus 和下游 Function 也按拓扑撤销。因此删除顺序与创建顺序相反，并且必须先停止所有可能访问 MMIO 或 `pci_dev` 的执行上下文。
 
-匹配只证明 ID 表接受设备，不证明 BAR、DMA Mask、IRQ 或私有协议可用。
+Surprise Removal 时配置空间可能已经读全 1，清理路径不能依赖设备对 Stop 命令作出响应。因为软件对象可能仍需完成引用释放，所以“硬件不响应”与“可以立刻释放所有内存”不是同一个结论。
 
-probe 仍必须验证全部运行前提。
+## 十、本篇检查点
 
-## 十七、PM、AER 与 reset 状态为何属于 pci_dev
+现在应当能够从平台入口按顺序讲出对象创建链：Host Controller/Firmware 提供配置访问和资源窗口，PCI Core 创建 `pci_host_bridge` 与 Root `pci_bus`，递归扫描发现 Function 并创建 `pci_dev`，将 BAR 放入 `resource[]`，再通过内嵌 `struct device` 发布给 Driver Model。
 
-Power Management Capability、PCIe Capability 与 AER Capability 都位于配置空间，但 Linux 需要跨驱动协调。
+还应能解释四个边界：`pci_ops` 只抽象配置空间访问；`pci_bus` 表示编号域而 `pci_dev` 表示 Function；`resource[]` 是分配结果而不是 Driver 所有权；`lspci` 可见但 Driver 未绑定时，故障层已经从枚举移动到 Match/Probe。
 
-因此 `pci_dev` 保存 current power state、saved state、error state、reset 方法和 Capability offset。
+## 十一、小结：下一篇沿 probe() 改变设备状态
 
-功能驱动提供 `dev_pm_ops` 与 `pci_error_handlers`，PCI Core 负责调用时机和通用状态迁移。
+Linux PCI Core 把平台差异收敛到 Host Bridge 和 `pci_ops`，把拓扑保存为 `pci_bus` 树，把每个 Function 保存为 `pci_dev`，再借助 `struct device` 接入统一 Driver Model。资源、Capability、PM、AER 和 DMA 都建立在这些对象已经存在的前提上。
 
-驱动不应绕过 Core 直接写 PMCSR 后继续访问 BAR。
+本文解释了对象怎样产生，但对象出现不等于设备已经可用。下一篇将跟随一个 `pci_driver` 从注册、匹配到 `probe()`，逐步观察 Enable、Request Region、Map BAR、DMA Mask、IRQ 和业务发布如何改变状态，以及失败时为什么必须逆序回滚。
 
-也不应在 AER recovery 中忽略 `pci_channel_io_frozen` 等通用状态。
-
-## 十八、DMA 与 IOMMU 通过 struct device 接入
-
-PCI Function 发起 DMA 时，使用：
-
-```c
-dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
-dma_map_single(&pdev->dev, buffer, len, DMA_TO_DEVICE);
-```
-
-`pdev->dev` 关联 DMA ops、IOMMU domain、NUMA node 和 coherent mask。
-
-PCI Core 负责设备发现与 bus mastering 开关，DMA API 负责 CPU 地址到 DMA Address 的平台转换。
-
-BAR MMIO Address 与 DMA Address 是两个不同地址域。
-
-把 `virt_to_phys()` 结果写进设备描述符会绕过 IOMMU/SWIOTLB，属于严重错误。
-
-## 十九、Host Bridge 与体系结构代码的边界
-
-x86 常有标准 ECAM/固件生态。
-
-ARM/ARM64 SoC 可能使用 DesignWare PCIe、Cadence、Rockchip 等控制器，结合 Device Tree `ranges`、ATU 与 MSI domain。
-
-RISC-V 平台也可能通过 ECAM 或特定控制器接入。
-
-通用 PCI Core 不负责打开某块板的 REFCLK/PERST#，也不理解某个 RC 的 LTSSM 寄存器。
-
-Host Controller Driver 完成硬件 Bring-up 并提供通用接口后，扫描与功能驱动才有共同语义。
-
-## 二十、对象释放与热插拔顺序
-
-设备移除的大致责任链：
-
-1. Hotplug/链路事件进入 PCI Core。
-2. 停止新 driver probe 与用户访问。
-3. 调用功能驱动 remove，停止 IRQ/DMA/用户接口。
-4. 释放 BAR/IRQ/managed resources。
-5. 从 sysfs 与 Bus 列表移除 `pci_dev`。
-6. 对 Bridge 递归移除 Child Bus。
-7. 最后引用归零释放对象。
-
-驱动 remove 返回后，不应再有中断、timer、work 或 DMA completion 访问 `pdev` 私有状态。
-
-PCIe Hotplug 通常比 USB 拔出更依赖平台插槽控制与 AER，但内存寿命与硬件在线状态仍需分开。
-
-## 二十一、阅读 Linux 6.12 源码的路线
-
-建议按对象追踪：
-
-1. `include/linux/pci.h`：`pci_bus`、`pci_dev`、`pci_driver`。
-2. `drivers/pci/probe.c`：Host Bridge、扫描与设备创建。
-3. `drivers/pci/access.c`：配置空间访问。
-4. `drivers/pci/setup-bus.c`：资源与 Bridge Window。
-5. `drivers/pci/pci-driver.c`：匹配、probe/remove 与 PM。
-6. `drivers/pci/search.c`：对象查找与引用。
-7. 体系结构/控制器目录：具体 `pci_ops` 与地址窗口。
-
-对每个函数记录输入对象状态、获得的引用/资源、发布点和错误回滚。
-
-## 二十二、一手资料
+**一手资料**
 
 - [Linux 6.12 PCI driver API](https://www.kernel.org/doc/html/v6.12/driver-api/pci/pci.html)
-- [Linux PCI bus subsystem](https://docs.kernel.org/PCI/index.html)
-- [Linux stable PCI probe source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci/probe.c?h=linux-6.12.y)
-- [PCI-SIG specifications](https://pcisig.com/specifications)
-
-## 二十三、对象销毁按拓扑从叶子向根收敛
-
-```mermaid
-flowchart BT
-    DRV[pci_driver remove completes] --> DEV[pci_dev removed from driver model]
-    DEV --> LIST[removed from pci_bus device list]
-    CHILD[child pci_bus devices removed] --> BR[bridge pci_dev]
-    BR --> PB[parent pci_bus]
-    LIST --> REF[last pci_dev reference]
-    REF --> FREE[release object]
-```
-
-Bridge 的 Child Bus 必须先清空，不能先释放提供下游路由的 Bridge Function。
-
-## 二十四、小结
-
-Linux PCI Core 的核心不是几组 enable/map API，而是一棵对象和资源树。
-
-`pci_host_bridge` 提供 Root Bus 的配置访问与地址窗口。
-
-`pci_bus` 表示编号域和拓扑节点，Bridge `pci_dev` 与其 Child Bus 是不同对象。
-
-`pci_dev` 表示一个 Function，并嵌入 `struct device` 接入 sysfs、DMA、IOMMU 与 PM。
-
-`pci_ops` 隔离 ECAM、控制器寄存器和 Firmware 等配置访问差异。
-
-`resource[]` 把 BAR/Bridge Window 转化为 Linux Resource Tree。
-
-Capability 是配置空间偏移链，应通过通用 helper 访问。
-
-对象引用只保护内存，不保证 Link、电源、BAR 或 DMA 仍可用。
-
-掌握这些边界后，下一篇的 Driver Lifecycle 才能解释每个 API 在修改哪个对象、取得什么资源，以及失败时为何必须逆序撤销。
+- [Linux 6.12 PCI probe source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci/probe.c?h=linux-6.12.y)
+- [Linux Driver Model overview](https://docs.kernel.org/driver-api/driver-model/overview.html)
