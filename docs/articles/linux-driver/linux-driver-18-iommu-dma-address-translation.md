@@ -8,15 +8,13 @@ tags: ["Linux BSP", "IOMMU", "DMA", "IOVA", "DMA-BUF"]
 draft: false
 ---
 
-图像采集驱动拿到一块 buffer 后，CPU 能访问它，不代表 ISP、RGA、编码器和 NPU 都能访问同一个地址。
+图像采集驱动拿到一块 buffer 后，CPU 能访问它，不代表 ISP、RGA、编码器和 NPU 都能使用同一个地址。理解这条数据路径，需要依次建立七个概念：设备看到的是 IOVA；映射属于某个 iommu_domain；共享隔离边界由 IOMMU group 描述；地址翻译结果会进入 IOTLB；越界访问会形成 fault；跨设备共享对象通常使用 dma-buf；异步任务的完成顺序则由 dma_fence 表达。
 
-同一段存储在 CPU 虚拟地址、物理地址、设备 DMA 地址和 IOMMU 虚拟地址空间中可能有不同表示。
+这些概念不能被压缩成“开了 IOMMU，物理地址换成另一个地址”。同一段存储在 CPU 虚拟地址、物理地址和设备 DMA 地址空间中可能有不同表示，而映射还受具体 `struct device`、方向和生命周期约束。驱动若把 `phys_addr_t`、`virt_to_phys()` 结果或内核指针直接写进设备描述符，在简单平台上或许偶然可用，启用地址转换、DMA window 或外部设备后便可能出现错帧、翻译异常或随机覆写。
 
-驱动若把 phys_addr、virt_to_phys 结果或内核指针直接写进设备描述符，简单平台上或许偶然可用，启用 IOMMU、memory encryption、DMA window 或外部设备后就会出现错帧、IOMMU fault 或随机覆写。
+本章以一帧图像从 CSI 采集、经过处理模块、最终交给应用的路径为主线，讲清地址、映射与所有权三条边界。目标不是手工操作页表，而是理解为什么驱动必须通过 DMA API 取得设备地址，以及多设备零拷贝为什么仍然需要显式同步。
 
-本章用一帧图像从 CSI 采集、经过处理模块、最终交给应用的路径，建立“地址由 DMA API 产生，所有权由同步机制保护”的工作方法。
-
-## 1. 先将一帧图像的四种地址分开记录
+## 一、先把 CPU 地址、物理地址、DMA 地址与 IOVA 分开
 
 假设采集端为一帧 YUV 图像准备了若干离散页面。
 
@@ -69,7 +67,7 @@ flowchart TD
 
 零拷贝不等于“没有同步”；它只是避免把像素复制到另一块存储。
 
-## 2. 第一步：让 DTS 和 DMA framework 表达设备的寻址能力
+## 二、iommu_domain、设备归属与寻址能力
 
 IOMMU 通常以一个 provider 和若干 client 的关系出现在设备树中。
 
@@ -154,7 +152,7 @@ CMA 通常用于需要物理连续 buffer 的场景，但不是解决所有 DMA 
 | 多设备共享图像 | dma-buf | 每个 importer 的 attachment 与 fence |
 | 用户态分配共享 buffer | dma-buf heap 或子系统 allocator | format、stride、对齐与同步 |
 
-## 3. 第二步：用 DMA API 管理 mapping，而不是手工换算地址
+## 三、由 DMA API 建立和撤销设备映射
 
 coherent allocation 适合小型、频繁被 CPU 和设备共同访问的控制结构，例如 DMA ring descriptor。
 
@@ -249,7 +247,7 @@ sequenceDiagram
 
 同一 buffer 被设备多次分段访问时，可保持 mapping 并在 CPU/设备交接处使用与方向一致的 dma_sync_single_for_cpu 和 dma_sync_single_for_device。
 
-## 4. 第三步：多设备共享时使用 dma-buf 和 fence，而不是复制地址
+## 四、用 dma-buf attachment 与 dma_fence 组织共享链路
 
 当 CSI、ISP、RGA、VENC、NPU 或显示设备要处理同一帧，dma-buf 提供跨驱动共享 buffer 的框架。
 
@@ -330,7 +328,7 @@ CPU 要访问由设备异步处理的 dma-buf 时，也应使用 dma_buf_begin_c
 
 这既处理必要的 cache 同步，也让 exporter 有机会协调迁移或等待。
 
-## 5. 第四步：用地址日志、IOMMU fault 和压力测试验证路径
+## 五、从 IOTLB 与 fault 日志定位映射生命周期错误
 
 调试 DMA 问题时，不要打印一个十六进制数字就宣布“地址正确”。
 
@@ -374,6 +372,14 @@ flowchart TD
 
 同时测试无 IOMMU 与有 IOMMU 的配置时，应把两种模式都视为不同的寻址环境，不应以其中一种偶然成功为结论。
 
+关闭 IOMMU 只能暂时移除地址翻译和隔离，不能证明驱动使用物理地址的做法正确。错误映射在关闭保护后甚至可能不再产生清晰 fault，而是直接演变成静默的内存破坏，因此“关掉后能跑”只能作为定位线索，不能作为修复方案。
+
+## 官方资料
+
+- [Dynamic DMA mapping Guide](https://docs.kernel.org/core-api/dma-api-howto.html)
+- [DMA-BUF sharing framework](https://docs.kernel.org/driver-api/dma-buf.html)
+- [VFIO - Virtual Function I/O](https://docs.kernel.org/driver-api/vfio.html)
+
 ### 本章练习
 
 选择一条实际图像或数据 DMA 路径，为每个 producer 和 consumer 列出它使用的 struct device、DMA direction 和 buffer 所有权。
@@ -383,6 +389,12 @@ flowchart TD
 对一个可安全停用的 client，采集 IOMMU fault 的完整日志并确认 fault 地址对应哪一个 frame/job。
 
 最后完成连续 buffer 流转、停止流、unbind/rebind 和内存压力下的回归，确认没有 IOMMU fault、残留 mapping 或错帧。
+
+## 六、小结与验收
+
+IOMMU 并没有改变 DMA API 的基本责任：驱动仍然针对具体设备建立 mapping，硬件仍然只能在 mapping 有效期间使用返回的 DMA 地址。它增加的是可控的设备地址空间、隔离和故障证据。跨设备共享时，每个 importer 都要建立自己的 attachment 和 mapping，dma_fence 则负责描述 producer 与 consumer 之间的完成依赖。
+
+完成本章后，不应只会解释缩写，而应能从一条 fault 日志反查设备、地址、buffer 和 job，并判断错误来自未建立映射、过早解除映射、DMA mask、stream ID 还是同步顺序。
 
 ### 本章验收
 

@@ -8,15 +8,13 @@ tags: ["Linux BSP", "RTC", "NVMEM", "EEPROM", "eFuse", "Manufacturing"]
 draft: false
 ---
 
-一块板子的 MAC 地址、序列号、sensor 校准参数和生产批次，不是驱动里可以随手写死的常量。
+板级长期数据并不都是同一种“掉电不丢的字节”。RTC 维护会变化的时间状态；Linux 通过 NVMEM provider 抽象底层非易失存储，再由 NVMEM cell 把一段原始布局命名为序列号、MAC 或标定参数；EEPROM 适合受控更新但存在写入寿命；eFuse/OTP 适合不可逆身份与安全位；这些数据最终都必须经过长度、格式、版本和完整性校验才能交给消费者。
 
-它们需要跨越 bootloader、Linux、应用、升级和量产工站，并且不同字段有完全不同的可写性和安全级别。
+这组边界决定了谁能写、何时写以及写坏后能否恢复。一块板子的 MAC 地址、序列号、传感器标定参数和生产批次需要跨越 bootloader、Linux、应用、升级和量产工站，不能由各层分别硬编码或猜测偏移。
 
-RTC 保存的是随时间变化的时钟状态；EEPROM 适合可更新但写入次数有限的板级数据；NVMEM 是 Linux 统一消费非易失单元的接口；eFuse/OTP 则常用于不可逆身份或安全配置。
+本章以“Linux 启动后可靠取得该板身份、时间与标定数据”为目标，先建立数据来源和字段协议，再讲设备树 cell、consumer API、量产写入及长期回读。重点不是展示一个能读取 sysfs 的命令，而是让同一份数据在整个产品生命周期中保持唯一、可验证和可追溯。
 
-本章以“Linux 启动后可靠取得该板身份与校准数据”为唯一目标，建立存储来源、字段格式、设备树引用、读写权限和工站验收的闭环。
-
-## 1. 先定义每种板级数据的唯一来源和可写规则
+## 一、先定义每类板级数据的权威来源
 
 先列出产品真正需要的字段，再选择存储位置。
 
@@ -65,7 +63,7 @@ flowchart LR
 
 一旦产品需要网络注册、授权或远程运维，随机 fallback 必须显式打警告并让生产验证失败，而不是静默进入量产。
 
-## 2. 第一步：用 NVMEM cell 将硬件存储布局变成有名字的字段
+## 二、用 NVMEM cell 将存储布局变成具名字段
 
 NVMEM provider 可以来自 eFuse 控制器、EEPROM、SPI flash 分区或其他非易失存储驱动。
 
@@ -131,7 +129,7 @@ flowchart TD
 
 具名 cell 让设备树成为布局的可审查接口，也让驱动在字段移动时只需跟随 binding，而不必散布魔数。
 
-## 3. 第二步：在驱动中读取、校验并复制 NVMEM 数据
+## 三、在驱动中读取、校验并复制 NVMEM 数据
 
 consumer 通过 cell 名称取得数据，读取后先校验长度和格式，再复制到自身拥有的内存。
 
@@ -230,7 +228,7 @@ RTC 电池掉电、首次生产和时区设置都会影响它的值，所以日�
 
 对 RTC 的验收应包括断主电、保留电池、重启后读时、alarm 唤醒和时间校正流程；不要把它与 EEPROM 序列号写入混成同一个工具。
 
-## 4. 第三步：将 EEPROM 写入与 eFuse 烧录隔离成量产动作
+## 四、将 EEPROM 写入与 eFuse 烧录隔离成量产动作
 
 eFuse/OTP 的写入不可逆，错误 bit、错误电压或错误批次都会造成永久损失。
 
@@ -298,7 +296,7 @@ static int manufacturing_write_calibration(struct nvmem_cell *cell,
 
 任何一个检查失败都应停止，不要提供“忽略失败继续烧录”的快捷选项。
 
-## 5. 第四步：用启动、升级和生产回读证明数据能长期使用
+## 五、用启动、升级和生产回读证明数据能长期使用
 
 板级信息的真正验收不是在工站读到一次正确字节，而是经过 bootloader、Linux、网络、升级和断电后仍保持一致。
 
@@ -329,6 +327,12 @@ flowchart LR
 
 对于 MAC 和 serial，可记录受控的哈希或掩码形式，满足追溯同时减少泄露。
 
+## 官方资料
+
+- [Non-Volatile Memory (NVMEM) subsystem](https://docs.kernel.org/driver-api/nvmem.html)
+- [Real Time Clock (RTC) Drivers for Linux](https://docs.kernel.org/admin-guide/rtc.html)
+- [NVMEM device tree bindings](https://github.com/torvalds/linux/tree/master/Documentation/devicetree/bindings/nvmem)
+
 ### 本章练习
 
 为一个真实板卡编写数据字典，至少包含 serial、MAC、一个校准 block 和 RTC 时间来源。
@@ -338,6 +342,12 @@ flowchart LR
 实现长度、magic、版本、CRC 与范围校验，分别测试全 0、全 0xff、截断、旧版本和 CRC 错误。
 
 设计一个只写一次的 EEPROM staging/commit 记录，完成写入、断电恢复、回读和 Linux 启动验证。
+
+## 六、小结与验收
+
+NVMEM 的价值不是把所有存储都变成一个裸字节文件，而是将 provider、cell 和 consumer 的责任拆开。provider 处理具体介质，cell 固化字段边界，consumer 只按名字取得数据并执行自身格式检查。RTC、可改写记录与不可逆配置则必须保持不同权限和验收流程。
+
+量产数据真正完成的标志也不是写接口返回成功，而是写前身份匹配、写后回读、异常掉电可识别、系统升级不覆盖、业务驱动能够按同一协议消费，并且敏感字段不会出现在普通日志中。
 
 ### 本章验收
 

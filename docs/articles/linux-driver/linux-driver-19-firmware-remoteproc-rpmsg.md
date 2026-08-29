@@ -8,17 +8,13 @@ tags: ["Linux BSP", "Firmware", "Remoteproc", "RPMsg", "AMP"]
 draft: false
 ---
 
-SoC 中的“另一个核”不是 Linux 线程。
+SoC 中的“另一个核”不是 Linux 线程。它可能运行 RTOS、裸机程序或厂商固件，拥有独立的复位、时钟、内存视图和故障状态。Linux 与它协作时，首先通过 request_firmware 取得镜像，再由 remoteproc 管理装载和启停；镜像中的 resource table 描述共享资源，框架据此建立 virtio 设备；其中的 rpmsg 总线承载消息服务，每个服务通过 endpoint 收发数据；远端发生 crash 后，旧通道和业务状态都必须失效并重新建立。
 
-它可能运行 RTOS、裸机任务或厂商固件，拥有独立的复位、时钟、内存视图和调试接口。
+这条链路包含文件装载、处理器生命周期、共享内存传输和应用协议四层。任何一层“成功”都不能替下一层背书：找到镜像不等于处理器运行，处理器运行不等于消息服务已公告，通道出现也不等于双方协议兼容。
 
-Linux 要让它承担传感器实时采样、低延迟控制或特定加速任务，至少要解决四件事：取得可信固件、启动和停止远端处理器、建立消息通道、在远端崩溃时保护本地系统。
+本章以“Linux 请求实时协处理器完成板级采样服务”为主线，逐层建立可观测状态和回滚路径。具体 SoC 是否提供主线内核支持，以及 memory carveout、mailbox、镜像格式和启动寄存器如何描述，仍必须以对应平台 binding、内核驱动与硬件手册为准。
 
-本章以“Linux 请求一个实时协处理器完成板级采样服务”为主线，把 request_firmware、remoteproc 和 rpmsg 放入同一个可测试的生命周期。
-
-实际 RV1126 SDK 是否公开了可由 mainline remoteproc 管理的协处理器，以及其 memory carveout、mailbox 和 firmware 格式，必须以厂商内核与硬件文档为准。
-
-## 1. 先区分设备固件、远端处理器与消息服务
+## 一、先区分固件装载、远端处理器与消息服务
 
 普通设备固件的典型流程是：驱动通过 request_firmware 读取一个二进制，校验后把它写入网卡、触摸屏或传感器内部存储。
 
@@ -69,7 +65,7 @@ flowchart LR
 
 一开始不要允许 Linux 任意写远端物理地址、任意寄存器或任意执行入口。远端本身可能拥有较宽硬件访问权限，协议边界就是安全边界。
 
-## 2. 第一步：把固件作为可追溯、可校验的发布物
+## 二、把固件作为可追溯、可校验的发布物
 
 固件文件名、版本、hash、来源和对应硬件 revision 应进入发布记录。
 
@@ -143,7 +139,7 @@ sequenceDiagram
 
 这能避免“远端没有响应”时在文件路径、mailbox 和协议层之间盲目跳转。
 
-## 3. 第二步：让 remoteproc 管理远端核的启动资源
+## 三、让 remoteproc 管理远端核的资源与启停
 
 remoteproc 将平台相关的电源、复位、firmware load、mailbox kick 和 crash detection 收敛在 rproc driver 中。
 
@@ -240,7 +236,7 @@ static void sampler_client_stop(struct rproc *rproc)
 
 实际代码应把 rproc 指针保存到私有数据，确保只有已成功 boot 的实例调用 shutdown，并让 remove、错误回滚和 PM 路径各自恰好释放一次。
 
-## 4. 第三步：把 rpmsg channel 当成有版本和长度边界的协议
+## 四、把 rpmsg channel 当成有版本和长度边界的协议
 
 remote firmware 通过 name service 宣告服务后，rpmsg bus 才会创建对应 device 并使 Linux rpmsg driver probe。
 
@@ -324,7 +320,7 @@ static int sampler_rpmsg_cb(struct rpmsg_device *rpdev, void *data,
 
 远端 firmware 可能崩溃、版本不匹配或出现缺陷；Linux 把它视为不可信通信对端，能减少一个远端错误扩大为内核漏洞。
 
-## 5. 第四步：把远端崩溃、重启和解绑纳入验收
+## 五、把远端崩溃、重启和解绑纳入生命周期
 
 远端核一旦异常复位，原先的 rpmsg endpoint、vring 和业务状态可能都已失效。
 
@@ -363,6 +359,12 @@ flowchart TD
 
 再验证 Linux client 是否能在 timeout 后停止业务、向上层报告明确状态，并在服务重新公告后完成重新握手。
 
+## 官方资料
+
+- [Firmware search paths and request APIs](https://docs.kernel.org/driver-api/firmware/fw_search_path.html)
+- [Remote Processor Framework](https://docs.kernel.org/staging/remoteproc.html)
+- [Remote Processor Messaging](https://docs.kernel.org/staging/rpmsg.html)
+
 ### 本章练习
 
 选择一个不会控制安全关键硬件的协处理器或仿真 remoteproc 场景，梳理其 firmware 文件、memory carveout、mailbox 和 service name。
@@ -372,6 +374,12 @@ flowchart TD
 实现一个长度受限、带 sequence 的 GET_STATUS 请求，验证错误版本、截断 payload、超时和服务重启都不会导致内核越界或永久阻塞。
 
 最后完成 rproc boot、service announce、正常 stop、异常服务消失和重新发现的完整记录。
+
+## 六、小结与验收
+
+协处理器功能的可靠性取决于一条完整状态链，而不是一次 `rproc_boot()` 调用。镜像需要可追溯，resource table 与 reserved memory 必须匹配，virtio/rpmsg 通道要经过协议握手，服务消失或远端异常后还要撤销旧 endpoint、终止等待者并重新建立状态。
+
+因此排查时应先确定失败停在哪一层，再查看那一层的证据。把“固件加载失败”“远端未启动”“服务未公告”“协议超时”混成同一个错误码，只会让偶发问题无法复现。
 
 ### 本章验收
 

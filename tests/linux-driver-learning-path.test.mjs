@@ -53,6 +53,10 @@ const qualityContractFiles = new Set([
   'linux-driver-09-spi-driver-transfers.md',
   'linux-driver-10-uart-tty-console-driver.md',
   'linux-driver-11-pwm-adc-watchdog.md',
+  'linux-driver-12-dma-cache-coherency.md',
+  'linux-driver-18-iommu-dma-address-translation.md',
+  'linux-driver-19-firmware-remoteproc-rpmsg.md',
+  'linux-driver-20-rtc-nvmem-eeprom-efuse.md',
 ]);
 const introOrder = {
   'linux-driver-02-first-kernel-module-and-char-device.md': ['内核空间', '模块', 'Kbuild', '字符设备', 'file_operations'],
@@ -71,6 +75,10 @@ const introOrder = {
   'linux-driver-09-spi-driver-transfers.md': ['spi_controller', 'spi_device', 'spi_message', 'spi_transfer', 'chip select', 'DMA'],
   'linux-driver-10-uart-tty-console-driver.md': ['UART', 'serial_core', 'TTY', 'console', 'termios', 'DMA'],
   'linux-driver-11-pwm-adc-watchdog.md': ['PWM framework', 'IIO', 'ADC', 'watchdog', 'runtime PM'],
+  'linux-driver-12-dma-cache-coherency.md': ['DMA mapping API', 'dma_set_mask', 'dma_alloc_coherent', 'dma_map_single', 'DMAengine', 'dma_request_chan', 'ownership'],
+  'linux-driver-18-iommu-dma-address-translation.md': ['IOVA', 'iommu_domain', 'IOMMU group', 'IOTLB', 'fault', 'dma-buf', 'dma_fence'],
+  'linux-driver-19-firmware-remoteproc-rpmsg.md': ['request_firmware', 'remoteproc', 'resource table', 'virtio', 'rpmsg', 'endpoint', 'crash'],
+  'linux-driver-20-rtc-nvmem-eeprom-efuse.md': ['RTC', 'NVMEM provider', 'NVMEM cell', 'EEPROM', 'eFuse', '校验'],
 };
 const diagramMinimum = new Map([
   ['linux-driver-02-first-kernel-module-and-char-device.md', 2],
@@ -89,6 +97,10 @@ const diagramMinimum = new Map([
   ['linux-driver-09-spi-driver-transfers.md', 3],
   ['linux-driver-10-uart-tty-console-driver.md', 3],
   ['linux-driver-11-pwm-adc-watchdog.md', 3],
+  ['linux-driver-12-dma-cache-coherency.md', 4],
+  ['linux-driver-18-iommu-dma-address-translation.md', 3],
+  ['linux-driver-19-firmware-remoteproc-rpmsg.md', 3],
+  ['linux-driver-20-rtc-nvmem-eeprom-efuse.md', 2],
 ]);
 const officialSourcePattern = /https:\/\/(?:docs\.kernel\.org|www\.kernel\.org|git\.kernel\.org|github\.com\/torvalds\/linux|devicetree-specification\.readthedocs\.io)/gi;
 
@@ -150,6 +162,17 @@ test('rewritten foundation articles introduce concepts in dependency order', () 
       previous = current;
     }
   }
+});
+
+test('DMA and IOMMU articles preserve official API boundaries', () => {
+  const dma = bodyOf('linux-driver-12-dma-cache-coherency.md');
+  assert.match(dma, /DMA mapping API[\s\S]+DMAengine[\s\S]+不同/);
+  assert.match(dma, /coherent[\s\S]+不(?:代表|保证)[\s\S]+有序/i);
+  assert.doesNotMatch(dma, /可直接复用内核栈内存/);
+
+  const iommu = bodyOf('linux-driver-18-iommu-dma-address-translation.md');
+  assert.match(iommu, /关闭 IOMMU[\s\S]+内存破坏/);
+  assert.match(iommu, /dma-buf[\s\S]+attachment[\s\S]+dma_fence/i);
 });
 
 export { learningPath };

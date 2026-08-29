@@ -8,25 +8,11 @@ tags: ["Linux BSP", "DMA", "Cache Coherency"]
 draft: false
 ---
 
-DMA 问题最危险的地方，是它可能在短时间、小数据量或某个编译选项下看起来完全正常。
+Linux DMA mapping API 解决“某个设备如何安全访问一块内存”：先 `dma_set_mask_and_coherent()`，控制结构可用 `dma_alloc_coherent()`，普通 payload 使用 `dma_map_single()`/SG。DMAengine 是另一个子系统，解决“通用 DMA controller 如何分配 channel 和提交 memcpy/slave descriptor”，consumer 从 `dma_request_chan()` 开始。两者接口不同，但都必须定义 buffer ownership。
 
-随后在连续视频帧、缓存压力或 IOMMU 开启时出现花屏、随机错误、地址 fault 或数据复用过早。
+本篇先讲 mapping API 的 address/cache/ownership，再单独讲 DMAengine。Coherent 表示 CPU/Device 可见性由平台维护，**不代表或保证访问有序**，descriptor/doorbell 仍需 barrier。跨 V4L2/ISP/编码器/NPU 的共享则使用 DMA-BUF attachment/map 和 dma_fence 同步。
 
-这类问题通常不是“缓存写得不够多”，而是驱动没有把 buffer 的所有权交接说清楚。
-
-本章以一个可验证的 DMA 事务为主线。
-
-先用 coherent 内存建立小型描述符控制路径。
-
-再用 streaming 映射处理普通数据 buffer。
-
-最后说明在 V4L2、ISP、编码器和 NPU 之间共享大 buffer 时，DMA-BUF 与 fence 为什么仍然需要明确同步。
-
-所有示例仅说明 Linux DMA API 的结构。
-
-实际 DMA 位宽、IOMMU 配置、控制器寄存器、描述符格式与完成中断必须以当前 SoC、驱动和 SDK 为准。
-
-## 1. 先把一次 DMA 事务的地址和所有权写清楚
+## 一、区分 DMA mapping API、DMAengine 与所有权
 
 开始写 API 前，先回答三个问题。
 
@@ -162,7 +148,7 @@ flowchart LR
 
 这样当问题出现时，能够知道是控制器、内存映射、缓存交接还是跨设备同步导致。
 
-## 2. 第一步：用 coherent 内存完成一个可观察的描述符路径
+## 二、用 coherent 内存建立描述符控制路径
 
 先从一个小的、固定大小的描述符或控制块开始。
 
@@ -306,7 +292,7 @@ if (priv->desc_cpu) {
 
 coherent 描述符路径的错误通常更容易通过控制器手册和地址记录查清。
 
-## 3. 第二步：用 streaming 映射建立数据 buffer 的所有权协议
+## 三、用 streaming/SG mapping 管理数据 buffer
 
 普通数据 buffer 通常不应永久分配为 coherent 内存。
 
@@ -524,7 +510,51 @@ flowchart TD
 
 不要通过关掉 IOMMU 把问题留到量产环境。
 
-## 4. 第三步：在 DMA-BUF 与 IOMMU 场景中保持跨设备同步
+## 四、用 DMAengine 提交通用 DMA controller 事务
+
+DMAengine Provider Driver 把 SoC DMA controller 注册为 `struct dma_device` 和 channel；外设 Consumer Driver 根据 DT `dmas/dma-names` 请求 channel。它不替代 `dma_map_single()` 的地址/缓存语义，具体 buffer 是否需要 mapping 取决于 DMAengine API、controller 和子系统约定。
+
+```c
+chan = dma_request_chan(dev, "rx");
+if (IS_ERR(chan))
+    return dev_err_probe(dev, PTR_ERR(chan), "no rx DMA channel\n");
+
+desc = dmaengine_prep_slave_single(chan, dma_addr, len,
+                                   DMA_DEV_TO_MEM,
+                                   DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
+if (!desc)
+    return -EIO;
+
+desc->callback = rx_dma_complete;
+desc->callback_param = priv;
+cookie = dmaengine_submit(desc);
+ret = dma_submit_error(cookie);
+if (ret)
+    return ret;
+dma_async_issue_pending(chan);
+```
+
+准备 slave transaction 前，peripheral address、bus width、burst 和 direction 通过 `dma_slave_config()` 配置。提交返回 cookie 不表示完成；completion callback/`dma_async_is_tx_complete()` 才定义回收边界。
+
+Terminate 也有同步语义差异。Remove/error 时先停止外设 request source，再用 `dmaengine_terminate_sync()` 等待 channel callback/硬件收敛，最后 unmap/free buffer 和 `dma_release_channel()`。在 callback 中调用可能睡眠的同步 terminate 会死锁。
+
+```mermaid
+sequenceDiagram
+    participant C as Consumer driver
+    participant E as DMAengine core/provider
+    participant H as DMA controller
+    C->>E: dma_request_chan and slave_config
+    C->>E: prep descriptor and dmaengine_submit
+    C->>E: dma_async_issue_pending
+    E->>H: program channel
+    H-->>E: completion IRQ
+    E-->>C: callback/cookie complete
+    C->>E: terminate_sync and release on remove
+```
+
+DMAengine Descriptor 与设备自己的硬件 Ring Descriptor 不是同一种结构。前者是 Linux DMA controller 框架对象，后者由具体外设协议定义；文档必须注明正在讨论哪一个。
+
+## 五、在 DMA-BUF 与 IOMMU 场景中保持跨设备同步
 
 摄像头、ISP、RGA、编码器和 NPU 之间传递的大帧数据，不应由每个驱动各自重新分配和复制。
 
@@ -599,7 +629,7 @@ IOMMU fault 也不一定是 IOMMU 本身的错误。
 
 先找到 exporter、importer 和每一段的完成通知，再判断应在哪一层修改。
 
-## 5. 第四步：用日志、故障注入和压力测试完成 DMA 回归
+## 六、用日志、故障注入和压力测试完成 DMA 回归
 
 DMA 路径在一次小数据事务成功后仍可能不可靠。
 
@@ -773,5 +803,15 @@ sequenceDiagram
 - 遇到花屏、随机数据或 IOMMU fault 时，如何从地址、长度、direction 与所有权开始定位。
 
 只要每个 buffer 的交接能被日志、完成事件和数据校验共同证明，DMA 调试就不再依赖“偶尔正常”的侥幸。
+
+**参考资料**
+
+- [Dynamic DMA mapping Guide](https://docs.kernel.org/core-api/dma-api-howto.html)
+- [DMAengine controller documentation](https://docs.kernel.org/driver-api/dmaengine/index.html)
+- [DMA-BUF sharing framework](https://docs.kernel.org/driver-api/dma-buf.html)
+
+## 七、小结
+
+DMA mapping API 管理设备可见地址、cache 与 buffer ownership；DMAengine 管理通用 DMA controller channel/descriptor/callback；DMA-BUF/fence 管理跨设备共享和完成同步。Coherent 不代表有序，streaming map 期间 CPU 不得违反 ownership，remove 必须先停止硬件与 callback 再解除 mapping。
 
 > 🏷️ Linux BSP · DMA · cache coherency · IOMMU · DMA-BUF · buffer 生命周期 · 驱动调试
