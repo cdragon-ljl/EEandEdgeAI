@@ -319,9 +319,27 @@ test('validates every existing textbook draft', () => {
   if (!existsSync(draftDirectory)) return;
 
   const manifestByFile = new Map(plannedArticles.map((article) => [article.file, article]));
-  const draftFiles = readdirSync(draftDirectory).filter((file) => file.endsWith('.md'));
+  const draftFiles = readdirSync(draftDirectory)
+    .filter((file) => file.endsWith('.md') && file !== 'linux-driver-framework.md');
   for (const file of draftFiles) {
     const source = readFileSync(join(draftDirectory, file), 'utf8');
     validateDraft(source, file, manifestByFile.get(file));
   }
+});
+
+test('draft framework lists all 30 lessons in order', () => {
+  const frameworkPath = join(draftDirectory, 'linux-driver-framework.md');
+  if (!existsSync(frameworkPath)) return;
+
+  const framework = readFileSync(frameworkPath, 'utf8');
+  let previous = -1;
+  for (const article of plannedArticles) {
+    const current = framework.indexOf(`](${article.file})`);
+    assert.ok(current > previous, `${article.file} must appear in framework order`);
+    previous = current;
+  }
+
+  const prose = withoutFencedCode(framework);
+  for (const heading of prose.match(/^##\s+.*$/gm) ?? [])
+    assert.match(heading, /^## \d+\. /);
 });
