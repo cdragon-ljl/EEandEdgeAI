@@ -8,19 +8,11 @@ tags: ["Linux BSP", "UART", "TTY"]
 draft: false
 ---
 
-串口是 BSP 开发中最早出现、也最容易被误判为“已经没问题”的外设。
+UART 是硬件控制器；Linux `serial_core` 把控制器驱动统一成 uart_port/uart_driver；TTY 提供用户可见字符终端语义；console 从串口端口中选择启动/内核日志通道；termios 配置波特率、数据位和流控；高吞吐收发还可能使用 DMA。
 
-屏幕上出现几行 U-Boot 日志，只能证明某一段启动软件能向某一组引脚发送字符。
+本篇先建立 earlycon 到正式 console 的接管证据，再用独立 UART 完成 TTY 收发、IRQ/DMA、termios 和协议验证。产品二进制协议不得与异步 kernel console 日志共用同一端口。
 
-它不能证明内核接管了同一个 UART，也不能证明 /dev/ttyS* 的收发、中断、DMA、流控和用户态协议正常。
-
-本章只追求一个清晰结果：先让一条启动 console 在冷启动时完整可靠，再把另一条 UART 作为独立的板级通信口完成收发验证。
-
-不要在产品协议和内核 console 共用同一个端口上做实验。
-
-console 输出会插入异步日志，任何二进制帧都有被破坏的可能。
-
-## 1. 先建立一条可信的启动控制台
+## 一、从 UART hardware 到 serial_core、TTY 与 console
 
 开始改设备树或驱动前，先把“健康状态”保存下来。
 
@@ -148,7 +140,7 @@ console 参数的一般形式是 console=设备名,串口参数。
 
 当开始正常、运行一段时间后丢字，再进入 IRQ、FIFO、流控或 DMA 的排查。
 
-## 2. 第一步：在设备树中描述 UART 并验证 probe
+## 二、用 Device Tree 描述 UART 并验证 probe
 
 UART 控制器能否被 Linux 驱动使用，首先取决于设备树是否正确描述了控制器资源。
 
@@ -277,7 +269,7 @@ flowchart TD
 
 这张表是后续 getty、应用配置、产线治具和故障定位的共同输入。
 
-## 3. 第二步：理解 serial core、TTY 与 console 的边界
+## 三、实现 serial_core 操作并完成 console 接管
 
 多数 SoC UART 不需要从零实现一个通用 TTY 驱动。
 
@@ -387,7 +379,7 @@ flowchart LR
 
 这个判断应在阅读内核同类驱动、确认协议与硬件能力后再做。
 
-## 4. 第三步：完成独立 UART 的收发与流控实验
+## 四、验证 TTY、termios、流控与 IRQ/DMA 收发
 
 选择一条不承担 kernel console 的 UART 作为实验端口。
 
@@ -504,7 +496,7 @@ cat /tmp/uart-pattern.bin > /dev/ttySx
 
 它能区分“流控确实工作”和“软件设置看起来已经打开”。
 
-## 5. 第四步：完成冷启动、协议与恢复回归
+## 五、完成冷启动、协议、PM 与恢复回归
 
 UART 通过一次回环并不等于板级适配完成。
 
@@ -580,5 +572,15 @@ dmesg -T | grep -Ei 'console|serial|tty'
 - 当收发失败时，如何按物理链路、设备树、probe、TTY 设置和协议边界依次排查。
 
 这些答案应来自你的板端日志、设备树和真实波形，而不是来自一段能偶尔打印字符的示例程序。
+
+**参考资料**
+
+- [The Serial Driver Layer](https://docs.kernel.org/driver-api/serial/driver.html)
+- [TTY Internals](https://docs.kernel.org/driver-api/tty/tty_internals.html)
+- [Linux serial console](https://docs.kernel.org/admin-guide/serial-console.html)
+
+## 六、小结
+
+UART 是硬件，serial_core 管理端口驱动，TTY 提供终端 ABI，console 负责内核日志。可靠验证必须区分 bootloader/earlycon/正式 driver，检查 termios 与物理波形，并让 IRQ/DMA、PM 和错误恢复在独立业务口上闭环。
 
 > 🏷️ Linux BSP · UART · TTY · serial core · console · earlycon · 设备树 · 串口调试

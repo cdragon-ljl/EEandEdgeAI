@@ -8,11 +8,11 @@ tags: ["Linux BSP", "I2C", "regmap", "Sensor Driver"]
 draft: false
 ---
 
-本篇完成一个明确任务：让板载 I2C 传感器被 Linux 发现，驱动能读到身份寄存器和一份有效数据，并能解释失败发生在电源、I2C 总线、地址、寄存器协议还是用户态接口哪一层。
+Linux 用 I2C adapter 表示控制器/总线，用 `i2c_client` 表示地址上的从设备，传输由一个或多个 `i2c_msg` 组成。寄存器型设备可在 client 上创建 regmap，统一寄存器宽度、端序、缓存和锁；runtime PM 则让上电/首读/空闲恢复形成同一生命周期。
 
-传感器驱动不能从 `i2c_smbus_read_byte_data()` 开始。先确认原理图、电源、上拉、地址脚和复位时序，再确定 Device Tree 节点；regmap 只是把寄存器访问和缓存、锁、格式化能力组织起来，不会替代硬件验证。
+本篇以板载传感器为例，从原理图、上拉、7-bit 地址和电源开始，建立 adapter/client/message/regmap 对象，再验证 chip ID、数据、IRQ 和 PM。regmap 组织软件协议，不替代真实 I2C 波形与器件时序。
 
-## 1. 先确认器件连接和最小验收结果
+## 一、从电气条件到 I2C adapter/client/message
 
 准备传感器数据手册、原理图、当前 DTB、示波器或 I2C 分析仪。建立这张表：
 
@@ -45,7 +45,7 @@ find /sys/bus/iio/devices /sys/class/hwmon -maxdepth 2 -type f 2>/dev/null | hea
 
 不要直接对未知地址执行写入扫描。I2C 总线上有些地址对应 EEPROM、PMIC 或会对探测命令产生副作用的设备，先从原理图和已有 DTS 确认安全的观察方式。
 
-## 2. 第一步：写 I2C 节点并证明总线已经连通
+## 二、用 Device Tree 创建设备并证明总线连通
 
 I2C 设备由控制器节点和子设备节点共同描述。设备节点的 `reg` 是 7-bit 从地址，不是传感器内部寄存器地址；这是初学者最容易混淆的两层地址。
 
@@ -95,7 +95,7 @@ readlink -f /sys/bus/i2c/devices/$DEV/driver 2>/dev/null
 
 总线“能看到设备”还不等于“寄存器协议正确”。在允许的开发环境中，可用分析仪观察地址、读写方向、ACK、重复起始和 NACK 位置；不要把没有 ACK 简化成“驱动代码错了”。
 
-## 3. 第二步：用 regmap 实现寄存器协议和 probe
+## 三、用 regmap 实现寄存器协议和 probe
 
 先根据数据手册确定寄存器地址宽度、值宽度、是否支持 auto-increment、哪些寄存器可缓存、哪些读取有副作用。随后配置 `regmap_config`，再通过 `devm_regmap_init_i2c()` 建立访问层。
 
@@ -178,7 +178,7 @@ flowchart TD
     I --> J["注册 IIO/hwmon"]
 ```
 
-## 4. 第三步：读取数据、处理中断和电源管理
+## 四、读取数据、处理中断并接入 runtime PM
 
 身份寄存器正确后，再读一个会随环境变化的测量寄存器。先用手册换算原始值，不要先接入复杂用户接口。若传感器支持 data-ready IRQ，可在 handler 中记录事件，在线程或 workqueue 中通过 regmap 读数据。
 
@@ -226,7 +226,7 @@ stateDiagram-v2
 3. IRQ wake 与传感器 data-ready 需求不会互相冲突。
 4. 关闭 regulator 前，采样 work、buffer 和 IRQ 已停止。
 
-## 5. 第四步：用总线波形和用户接口完成回归
+## 五、用波形、IIO/hwmon 接口和错误注入完成回归
 
 先在内核侧保存身份读取和初始化日志，再验证标准接口：
 
@@ -343,3 +343,13 @@ dmesg -T | rg -i -C 5 'i2c|regmap|sensor|regulator|reset'
 同时保存电源、reset 和 SDA/SCL 波形的状态。
 
 传感器数据还要注明原始值到工程单位的换算。
+
+**参考资料**
+
+- [I2C and SMBus Subsystem](https://docs.kernel.org/i2c/summary.html)
+- [I2C device driver binding control](https://docs.kernel.org/i2c/instantiating-devices.html)
+- [Regmap API](https://docs.kernel.org/driver-api/regmap.html)
+
+## 六、小结
+
+I2C 驱动由 adapter、client 和 message 建立总线传输，regmap 在其上管理寄存器语义，IIO/hwmon 暴露标准数据接口，runtime PM 管理供电状态。Chip ID、原始数据和总线波形必须能相互解释，不能用 regmap cache 掩盖硬件未响应。

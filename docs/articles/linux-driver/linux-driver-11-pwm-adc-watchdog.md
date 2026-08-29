@@ -8,27 +8,11 @@ tags: ["Linux BSP", "PWM", "IIO", "Watchdog"]
 draft: false
 ---
 
-PWM、ADC 与 watchdog 分别负责输出、采集和故障恢复。
+PWM framework 管理周期/占空比输出；IIO（Industrial I/O）为 ADC 提供 channel、raw/scale 和 buffer/event；ADC 把模拟电压转换为原始码；watchdog framework 管理 timeout、ping 和复位；runtime PM 则控制这些 controller 的空闲时钟/电源。
 
-它们在原理图上分散，在 Linux 中也属于不同框架。
+三者不是同一数据路径，本篇用“板级健康监测”把它们放进一个实验，但分别解释框架边界：PWM 用波形验收，IIO ADC 用标定验收，watchdog 用受控停止喂狗和重启原因验收。
 
-若按框架逐条罗列 API，很容易学完后仍不知道一块板子是否真的安全工作。
-
-本章把它们组织成一个板级健康监测实验。
-
-PWM 产生一条可测量的状态或控制波形。
-
-ADC 读取一个已知电压并建立原始码与真实物理量的对应关系。
-
-watchdog 只在应用确认关键路径仍健康时被喂狗。
-
-最终验收不是“sysfs 文件存在”，而是示波器、万用表、内核状态和受控复位结论彼此一致。
-
-所有控制器节点、通道号、供电名称和电压范围都必须从当前板卡原理图、设备树和 SDK 核实。
-
-本章中的 uart、pwm 和 adc 名称都只是结构示例，不代表任何特定 RV1126 板卡。
-
-## 1. 先定义硬件连接、风险边界和验收基线
+## 一、定义三个框架的硬件边界与安全基线
 
 实验开始前，画出实际信号路径。
 
@@ -139,7 +123,7 @@ flowchart LR
     E -- 是 --> G[记录可回归基线]
 ```
 
-## 2. 第一步：从设备树到示波器完成 PWM 验证
+## 二、从 PWM framework 到示波器验证输出
 
 PWM 不是“百分比输出”。
 
@@ -310,7 +294,7 @@ flowchart TD
 
 软件框架只能配置控制器，不能替代原理图中的供电和电平设计。
 
-## 3. 第二步：用 IIO 建立 ADC 原始码和真实电压的关系
+## 三、用 IIO 建立 ADC raw、scale 与真实电压
 
 ADC 的第一个读数不是电压，而是转换器输出的原始码。
 
@@ -505,7 +489,7 @@ if (ret)
 
 如果读数随机跳变，优先检查接触、参考源噪声、输入阻抗和采样时序。
 
-## 4. 第三步：让 watchdog 只对真实健康状态负责
+## 四、让 watchdog 只对真实健康状态负责
 
 watchdog 的目的是在系统失去自恢复能力时促成恢复。
 
@@ -645,7 +629,7 @@ flowchart TD
 
 这一步必须回到芯片手册、设备树和原理图核对。
 
-## 5. 第四步：把三项实验收敛为可重复的板端回归
+## 五、把 runtime PM、异常复位与三项实验纳入回归
 
 此时已经分别证明了 PWM、ADC 和 watchdog 的最小行为。
 
@@ -743,5 +727,15 @@ sequenceDiagram
 - 当系统异常重启或不重启时，如何在设备树、内核框架、原理图和物理测量之间建立证据链。
 
 将这四类证据与版本号一起保存，才得到可交接、可复现的 BSP 结论。
+
+**参考资料**
+
+- [Pulse Width Modulation interface](https://docs.kernel.org/driver-api/pwm.html)
+- [Industrial I/O](https://docs.kernel.org/driver-api/iio/index.html)
+- [WatchDog Module Parameters](https://docs.kernel.org/watchdog/watchdog-parameters.html)
+
+## 六、小结
+
+PWM、IIO ADC 和 watchdog 是三个独立框架：分别用实际波形、标定数据和受控复位证明正确性。把它们组合成健康监测时，喂狗条件必须来自真实业务状态，runtime PM 和异常路径也要进入回归，不能只检查 sysfs 节点存在。
 
 > 🏷️ Linux BSP · PWM · IIO · ADC · watchdog · 设备树 · 板级健康监测

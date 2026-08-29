@@ -49,6 +49,10 @@ const qualityContractFiles = new Set([
   'linux-driver-04-gpio-led-subsystem.md',
   'linux-driver-05-keys-interrupt-input-subsystem.md',
   'linux-driver-17-clock-reset-regulator-power-sequence.md',
+  'linux-driver-08-i2c-regmap-sensor-driver.md',
+  'linux-driver-09-spi-driver-transfers.md',
+  'linux-driver-10-uart-tty-console-driver.md',
+  'linux-driver-11-pwm-adc-watchdog.md',
 ]);
 const introOrder = {
   'linux-driver-02-first-kernel-module-and-char-device.md': ['内核空间', '模块', 'Kbuild', '字符设备', 'file_operations'],
@@ -63,6 +67,10 @@ const introOrder = {
   'linux-driver-04-gpio-led-subsystem.md': ['电气', 'gpio-leds', 'LED class', 'trigger', '自定义驱动'],
   'linux-driver-05-keys-interrupt-input-subsystem.md': ['gpio-keys', 'IRQ', 'debounce', 'input_event', 'wakeup'],
   'linux-driver-17-clock-reset-regulator-power-sequence.md': ['regulator', 'clock', 'reset', 'pinctrl', 'deferred probe', 'runtime PM'],
+  'linux-driver-08-i2c-regmap-sensor-driver.md': ['I2C adapter', 'i2c_client', 'i2c_msg', 'regmap', 'runtime PM'],
+  'linux-driver-09-spi-driver-transfers.md': ['spi_controller', 'spi_device', 'spi_message', 'spi_transfer', 'chip select', 'DMA'],
+  'linux-driver-10-uart-tty-console-driver.md': ['UART', 'serial_core', 'TTY', 'console', 'termios', 'DMA'],
+  'linux-driver-11-pwm-adc-watchdog.md': ['PWM framework', 'IIO', 'ADC', 'watchdog', 'runtime PM'],
 };
 const diagramMinimum = new Map([
   ['linux-driver-02-first-kernel-module-and-char-device.md', 2],
@@ -77,6 +85,10 @@ const diagramMinimum = new Map([
   ['linux-driver-04-gpio-led-subsystem.md', 2],
   ['linux-driver-05-keys-interrupt-input-subsystem.md', 2],
   ['linux-driver-17-clock-reset-regulator-power-sequence.md', 3],
+  ['linux-driver-08-i2c-regmap-sensor-driver.md', 3],
+  ['linux-driver-09-spi-driver-transfers.md', 3],
+  ['linux-driver-10-uart-tty-console-driver.md', 3],
+  ['linux-driver-11-pwm-adc-watchdog.md', 3],
 ]);
 const officialSourcePattern = /https:\/\/(?:docs\.kernel\.org|www\.kernel\.org|git\.kernel\.org|github\.com\/torvalds\/linux|devicetree-specification\.readthedocs\.io)/gi;
 

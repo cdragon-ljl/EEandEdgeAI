@@ -8,11 +8,11 @@ tags: ["Linux BSP", "SPI", "spi_driver", "Bus Transfer"]
 draft: false
 ---
 
-本篇完成一个明确任务：让一颗板载 SPI 外设被 Linux 正确创建和匹配，驱动能够读到身份寄存器并完成一次可靠的数据传输。
+Linux 用 `spi_controller` 表示主控制器，用 `spi_device` 表示某个片选上的外设。一次原子协议请求由 `spi_message` 组织，内部包含一个或多个 `spi_transfer`；controller 负责 chip select、clock、PIO/DMA 和 completion。
 
-SPI 没有统一的设备发现机制，片选、时钟极性、采样边沿、字长、最高频率和命令帧都由外设数据手册决定。驱动能发送波形，不代表外设理解波形；必须把原理图、DTS、spi_device 参数和逻辑分析仪放在同一条验证路径中。
+SPI 没有统一发现/命令格式。Mode、频率、字长、CS 时序和 command frame 来自数据手册。本篇从对象模型与协议表开始，完成首个 ID transfer、复杂 message、buffer 生命周期和逻辑分析仪验证。
 
-## 1. 先确定外设协议和验收结果
+## 一、先定义协议帧和 SPI 对象模型
 
 准备原理图、数据手册、当前 DTB、逻辑分析仪和目标 rootfs。先写出这张协议表：
 
@@ -46,7 +46,7 @@ find /dev -maxdepth 1 -name '*spi*' -o -name '*sensor*'
 
 不要先用任意用户态工具写入未知 SPI 地址。SPI 没有地址 ACK，片选拉低后即可能改变外设状态；先用数据手册确定一条无副作用的 ID 读取事务。
 
-## 2. 第一步：在 DTS 中描述控制器、片选和 spi_device
+## 二、用 DTS 描述 controller、chip select 和 spi_device
 
 SPI 子节点的 `reg` 通常表示片选编号，不是外设内部寄存器地址。`spi-max-frequency` 是当前设备允许的最大 SCK，`spi-cpol`/`spi-cpha` 共同表达 mode；具体属性以 controller 和设备 binding 为准。
 
@@ -92,7 +92,7 @@ readlink -f /sys/bus/spi/devices/$DEV/driver 2>/dev/null
 
 没有 SPI master 时，先修 controller 的 clock、reset、pinctrl 和 Kconfig；有 master 没有 child 时，检查最终 DTB 和片选；child 存在但没有 driver 时，检查 `compatible`、模块和匹配表。
 
-## 3. 第二步：实现 probe 和第一条安全传输
+## 三、在 probe 中完成第一条安全传输
 
 SPI 驱动通常保存 `struct spi_device *`，在 probe 中设置 bits per word、mode 和最大速度，然后读取身份寄存器。不要把速度和 mode 写成全局常量覆盖其他 spi_device，每个设备实例可能有不同协议。
 
@@ -153,7 +153,7 @@ static int spi_demo_probe(struct spi_device *spi)
 
 这里的命令字节、ID 长度和期望值来自数据手册。示例中的占位频率必须替换成已经通过波形验证的值；高速率应在低速率 ID 读取成功后逐步增加。
 
-## 4. 第三步：组织复杂传输并验证 buffer 生命周期
+## 四、用 spi_message/spi_transfer 组织复杂事务与 DMA
 
 当一个事务包含 command、address、dummy 和 data，使用 `spi_message` 与多个 `spi_transfer` 表达帧边界。是否保持 CS、是否在 transfer 之间插入间隔，取决于 controller 和设备协议。
 
@@ -201,7 +201,7 @@ flowchart TD
 
 如果传输成功但数据全为 `0xff` 或固定值，先看 CS、MOSI/MISO 方向、mode 和外设是否需要 dummy cycle；如果传输返回错误，查看 controller 日志和电源/pinctrl，而不是立刻换一个寄存器地址。
 
-## 5. 第四步：用逻辑分析仪和回归矩阵完成验收
+## 五、用逻辑分析仪、错误注入和 PM 完成验收
 
 逻辑分析仪至少抓取一次 ID 读取和一次数据读取，标记 CS、SCK、MOSI、MISO。把解码器的 mode、bit order、频率和帧边界与数据手册逐项对照。
 
@@ -345,3 +345,13 @@ flowchart TD
 不要覆盖原始实验文件。
 
 保留失败样本有助于判断回归。
+
+**参考资料**
+
+- [Serial Peripheral Interface](https://docs.kernel.org/spi/spi-summary.html)
+- [SPI userspace API](https://docs.kernel.org/spi/spidev.html)
+- [SPI controller binding](https://docs.kernel.org/devicetree/bindings/spi/spi-controller.yaml)
+
+## 六、小结
+
+SPI Driver 不直接控制裸寄存器，而是让 spi_device 提供协议参数、spi_message 定义事务边界、spi_transfer 描述各阶段，controller 决定 PIO/DMA 和 CS。可靠性来自协议表、buffer ownership、波形和返回长度同时一致。
