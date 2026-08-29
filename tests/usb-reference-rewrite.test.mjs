@@ -94,3 +94,20 @@ test('USB legacy slugs redirect to one canonical rewritten article', () => {
   assert.match(source, /location\.replace/);
 });
 
+test('USB teaching modules expose the documented Linux 6.12 lifecycle', () => {
+  const sourceDir = 'docs/articles/usb/src/linux-6.12';
+  const contracts = {
+    'usb_example_common.h': ['enum usb_example_state', 'usb_find_common_endpoints', 'usb_endpoint_maxp'],
+    'usb_hid_boot.c': ['usb_to_input_id', 'input_register_device', 'usb_alloc_coherent', 'usb_submit_urb', 'usb_kill_urb'],
+    'usb_bulk_char.c': ['usb_register_dev', 'kref', 'wait_queue_head_t', 'poll_wait', 'usb_anchor_urb', 'usb_autopm_get_interface'],
+    Makefile: ['obj-m += usb_hid_boot.o', 'obj-m += usb_bulk_char.o'],
+  };
+
+  for (const [file, markers] of Object.entries(contracts)) {
+    const path = join(sourceDir, file);
+    assert.ok(existsSync(path), `${path} must exist`);
+    const source = readFileSync(path, 'utf8');
+    for (const marker of markers) assert.ok(source.includes(marker), `${file} is missing ${marker}`);
+    assert.doesNotMatch(source, /TODO|TBD|placeholder/i);
+  }
+});

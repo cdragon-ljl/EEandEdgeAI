@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · USB 驱动开发实战 #04 · URB 与数据传输机制"
+title: "嵌入式知识体系 · USB 驱动开发实战 #07 · URB 生命周期、完成上下文与并发取消"
 description: "前面已经建立 USB 架构、Linux Host 对象和描述符模型。本篇继续进入真实数据路径：USB packet 如何组成 transaction 和 transfer，Linux 又如何用 URB 把异步请求交给 HCD。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: usb
-order: 4
-tags: ["USB", "Linux Driver"]
+order: 7
+tags: ["USB", "URB", "Concurrency", "Linux 6.12"]
 draft: false
 ---
 描述符只说明设备“有哪些通道”，真正的数据收发还需要 Host 按总线时间调度 transaction。Linux 不让 Interface Driver 直接构造 token/data/handshake packet，而是用 URB 描述一次异步 I/O 请求，再由 usbcore 和 HCD 转换成控制器 schedule。
+
+本文对 URB 字段、API 与取消语义的讨论固定以 Linux 6.12 为基线。
 
 这篇最重要的不是记 API，而是建立四个层次：packet 是线上的最小协议单元，transaction 完成一次方向明确的交换，transfer 表达 Control/Bulk/Interrupt/Isochronous 语义，URB 则是 Linux 提交给 USB 栈的异步软件对象。混淆这些层次会直接造成长度、完成和取消语义错误。
 
@@ -315,7 +317,69 @@ usbmon 中只有 submit 没有 complete，可能是设备长期 NAK、链路无�
 - [USB 2.0 Specification - USB-IF](https://www.usb.org/document-library/usb-20-specification)
 - [Writing USB Device Drivers](https://docs.kernel.org/driver-api/usb/writing_usb_driver.html)
 
-## 八、小结
+## 八、unlink、kill 与 poison 的同步语义不同
+
+`usb_unlink_urb()` 请求异步取消并立即返回。
+
+URB completion 仍会在之后运行，常见 status 为 `-ECONNRESET`。
+
+调用者在 unlink 后不能立刻释放 URB、缓冲或 context。
+
+`usb_kill_urb()` 会请求取消并同步等待 completion 结束。
+
+它适合 disconnect、suspend 和确定性 stop，但调用上下文必须允许睡眠。
+
+`usb_poison_urb()` 在同步停止基础上阻止后续提交，直到 `usb_unpoison_urb()`。
+
+它适合明确的长期停用边界，不能被当作普通一次取消。
+
+```mermaid
+flowchart TD
+    STOP[need to stop URB] --> C{must wait until callback returns?}
+    C -- no --> U[usb_unlink_urb]
+    U --> L[lifetime remains until completion]
+    C -- yes --> R{also forbid later submit?}
+    R -- no --> K[usb_kill_urb]
+    R -- yes --> P[usb_poison_urb]
+    P --> UP[usb_unpoison_urb before restart]
+```
+
+无论使用哪种 API，都要先设置 running/online 状态，阻止 completion 重提交。
+
+否则取消只解决当前提交，回调会马上创建下一次提交。
+
+## 九、URB、PM 引用与对象引用必须闭合
+
+在途 URB 的 context 指向驱动私有对象。
+
+驱动要证明从 submit 到 completion 返回期间，该对象始终存活。
+
+常见方式是 URB 与私有对象具有同一绑定寿命，并在 disconnect 中先 kill 再释放。
+
+动态 write URB 则可让每个请求持有 kref，completion 最后 `kref_put()`。
+
+Runtime PM 引用也要覆盖设备必须保持活动的阶段。
+
+```mermaid
+sequenceDiagram
+    participant T as submitter
+    participant PM as runtime PM
+    participant U as URB
+    participant C as completion
+    T->>PM: get interface usage
+    T->>U: usb_anchor_urb + usb_submit_urb
+    U-->>C: complete or cancel
+    C->>C: publish result / drop request kref
+    C->>PM: put interface usage when activity ends
+```
+
+若 submit 失败，anchor、kref 和 PM 引用都要在同步错误路径撤销。
+
+若 disconnect 先发生，kill 等待 completion 完成后才能释放 coherent buffer。
+
+这三类引用分别保护请求分组、内存对象和设备电源，不能互相替代。
+
+## 十、小结
 
 URB 是 Linux 对 USB transfer 的异步描述，不是线上的 packet。提交成功后，HCD 与设备拥有请求和 buffer 的访问权；只有 completion 或同步取消完成后，驱动才能安全复用或释放资源。Transfer 类型决定调度与完成语义，short packet、ZLP、NAK、STALL 和 Isochronous packet status 都必须结合协议解释。
 

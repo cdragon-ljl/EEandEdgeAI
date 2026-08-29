@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · USB 驱动开发实战 #09 · USB Host 控制器与设备树 Bring-up"
+title: "嵌入式知识体系 · USB 驱动开发实战 #13 · xHCI、DWC3、PHY 与设备树 Bring-up"
 description: "USB Host Bring-up 需要同时打通 VBUS、PHY、clock/reset、Controller IP、设备树、HCD 和 root hub。本篇从原理图一路走到 usbcore。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: usb
-order: 9
-tags: ["USB", "Linux Driver"]
+order: 13
+tags: ["USB", "HCD", "Device Tree", "Linux 6.12"]
 draft: false
 ---
 前面的文章默认 Host Controller 已经工作。本篇处理更靠近 BSP 的问题：新板第一次插入 U 盘时没有任何反应，应该从哪里开始？答案不是先改 USB Class Driver，而是证明从连接器到 root hub 的每一层都已建立。
+
+本文的 HCD、DWC3 与设备树语义固定以 Linux 6.12 为基线。
 
 Host Bring-up 横跨原理图、供电、PHY、clock/reset、控制器 Device Tree、平台驱动和 HCD。只要其中一层未初始化，usbcore 就收不到端口变化，也不会创建 `usb_device`。
 
@@ -170,7 +172,156 @@ cat /proc/interrupts | grep -Ei 'xhci|ehci|dwc|usb'
 - [Linux USB Power Management](https://docs.kernel.org/driver-api/usb/power-management.html)
 - [USB 2.0 Specification - USB-IF](https://www.usb.org/document-library/usb-20-specification)
 
-## 八、小结
+## 八、xHCI 用 Ring、TRB 与 Event Ring 承载请求
+
+xHCI Driver 不把一个 URB 直接对应成单个硬件描述符。
+
+它把 Transfer 分解为 Transfer Request Block（TRB），放入每个 Endpoint 的 Transfer Ring。
+
+控制器消费 TRB，通过 Event Ring 报告命令、传输与端口状态事件。
+
+```mermaid
+flowchart LR
+    URB[URB from usbcore] --> TD[Transfer Descriptor]
+    TD --> TRB0[Normal/Setup TRB]
+    TD --> TRB1[Data/Status TRB]
+    TRB0 --> RING[Endpoint Transfer Ring]
+    TRB1 --> RING
+    DB[Doorbell] --> HC[xHCI Controller]
+    RING --> HC
+    HC --> ER[Event Ring]
+    ER --> IRQ[xhci interrupt handler]
+    IRQ --> DONE[giveback URB]
+```
+
+Command Ring 用于配置 Slot、Endpoint、Address Device 等控制器命令。
+
+DCBAA、Device Context 与 Endpoint Context 保存控制器可见状态。
+
+驱动调试时要区分 USB 协议错误与 xHCI ring/context 错误。
+
+Host Controller 停止、Event Ring 不前进或 Doorbell 未生效，会让所有上层 Class 都表现超时。
+
+## 九、DWC3 是 Controller Core，角色 glue 负责平台集成
+
+DWC3 IP 可以工作在 Host、Device 或 OTG/dual-role 模式。
+
+Host 模式通常创建/连接 xHCI 平台设备，让 xHCI HCD 管理 Host 数据面。
+
+Device 模式注册 DWC3 UDC，进入 Gadget Core。
+
+平台 glue 驱动负责 SoC 特有 clock、reset、PHY、syscon、电源域与 role switch。
+
+```mermaid
+flowchart TD
+    DT[Device Tree DWC3 node] --> GLUE[SoC glue driver]
+    GLUE --> RES[clock/reset/PHY/regulator]
+    GLUE --> CORE[DWC3 core]
+    CORE --> ROLE{dr_mode / role switch}
+    ROLE -- host --> XHCI[xHCI platform HCD]
+    ROLE -- peripheral --> UDC[DWC3 UDC]
+    XHCI --> RH[Root Hub]
+    UDC --> GADGET[Gadget Core]
+```
+
+`dr_mode = "host"` 只表达期望角色，不会自动修复缺失 VBUS regulator 或 PHY。
+
+`dr_mode = "peripheral"` 时也要保证 Device 侧能检测 VBUS/session，并正确控制 pull-up。
+
+dual-role 系统还需要 Type-C Port Controller、extcon 或 `usb-role-switch` 提供角色事实。
+
+## 十、设备树资源具有依赖和时序
+
+常见属性/资源：
+
+- `reg` 与中断。
+- `clocks`、`clock-names`。
+- `resets`、`reset-names`。
+- `phys`、`phy-names`。
+- `power-domains`。
+- `vbus-supply`。
+- `dr_mode`。
+- `maximum-speed`。
+- `usb-role-switch`。
+
+资源 provider 尚未 probe 时，consumer 应返回 `-EPROBE_DEFER`。
+
+把 defer 当成永久错误会让控制器在启动顺序变化时偶发缺失。
+
+反之，无限 defer 表示依赖 phandle、provider 驱动或配置缺失，需要检查 deferred probe 列表。
+
+设备树描述硬件连接，不应包含 Linux 私有“先 sleep 100 ms”式补丁来掩盖电源时序。
+
+真正需要的上电/复位延迟应由 binding、regulator、PHY 或硬件数据手册表达。
+
+## 十一、VBUS、PHY 和角色必须形成闭环
+
+Host 角色应驱动 VBUS 并监测过流。
+
+Device 角色不应与外部 Host 同时驱动 VBUS。
+
+Type-C 角色还受 CC/PD 协商结果约束。
+
+```mermaid
+stateDiagram-v2
+    [*] --> None
+    None --> Host: role=host and VBUS source ready
+    Host --> None: detach or role transition
+    None --> Device: role=device and VBUS detected
+    Device --> None: VBUS lost or detach
+    Host --> Device: stop HCD / disable source / switch PHY / start UDC
+    Device --> Host: disconnect gadget / stop UDC / switch PHY / enable source
+```
+
+角色切换不是只改一个寄存器。
+
+旧角色的 HCD/UDC、Endpoint、DMA 和用户接口必须先停止，再切 PHY 与电源，最后启动新角色。
+
+## 十二、Runtime PM 不能让端口事件消失
+
+控制器 runtime suspend 前要保证没有活动请求，或硬件能保留必要唤醒检测。
+
+Root Hub/port wakeup、远程唤醒与平台电源域必须协同。
+
+若电源域关闭后连接检测也消失，插入设备无法唤醒控制器。
+
+resume 顺序通常是电源域、clock、reset/PHY、Controller State、IRQ/Event Ring、Root Hub 状态。
+
+顺序错误会出现恢复后第一次传输超时、端口假断开或 xHCI context state error。
+
+## 十三、Bring-up 的验收证据
+
+按以下顺序验收：
+
+1. 原理图确认 VBUS 开关、过流、差分线、Type-C/ID/CC 连接。
+2. regulator、clock、reset、PHY provider 均成功 probe。
+3. Controller 平台驱动成功，`usb_add_hcd()` 完成。
+4. `/sys/bus/usb/devices/usbN` Root Hub 出现。
+5. Port status 能响应插拔。
+6. Low/Full/High/SuperSpeed 已知设备分别枚举。
+7. suspend/resume 与冷启动重复通过。
+8. 压力 I/O 无 xHCI、IOMMU 或 AER 类错误。
+
+每一步都有可观察证据，后一步不能替代前一步。
+
+## 十四、Linux 6.12 一手资料与源码入口
+
+重点源码：
+
+- `drivers/usb/core/hcd.c`
+- `drivers/usb/host/xhci*.c`
+- `drivers/usb/dwc3/core.c`
+- `drivers/usb/dwc3/host.c`
+- 对应 SoC glue 与 PHY Driver
+
+一手资料：
+
+- [Linux 6.12 USB HCD API](https://www.kernel.org/doc/html/v6.12/driver-api/usb/usb.html#host-side-api-for-usb)
+- [Linux Devicetree DWC3 binding](https://docs.kernel.org/devicetree/bindings/usb/snps,dwc3.yaml)
+- [Linux stable xHCI source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/usb/host/xhci.c?h=linux-6.12.y)
+- [USB 3.2 Specification](https://www.usb.org/document-library/usb-32-revision-11-june-2022)
+
+## 十五、小结
 
 USB Host Bring-up 是一条从 VBUS/connector、PHY、clock/reset、Controller IP、Device Tree、平台驱动、HCD 和 root hub 到 usbcore 的依赖链。`usb_create_hcd()` 建立软件对象，`usb_add_hcd()` 才把控制器和 root hub 交给 USB Core。
 

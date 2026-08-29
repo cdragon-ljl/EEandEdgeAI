@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · USB 驱动开发实战 #03 · USB 描述符深度解析"
-description: "做 USB 驱动时，很多问题表面看是 `probe()` 没进、端点找不到、bulk 传输超时、摄像头没有 `/dev/videoX`，但往根上追，往往都能回到同一个基础问题：**描述符没有看懂**。"
-pubDate: "2026-08-18"
+title: "嵌入式知识体系 · USB 驱动开发实战 #03 · 描述符层级、TLV 防御解析与 Linux 对象"
+description: "从 Device、Configuration、IAD、Interface、Alternate Setting、Endpoint、BOS 和类描述符出发，解释不可信 TLV 字节流如何映射为 Linux usbcore 对象。"
+pubDate: "2026-08-29"
 series: usb
 order: 3
-tags: ["USB", "Linux Driver"]
+tags: ["USB", "Descriptor", "Linux 6.12"]
 draft: false
 ---
 USB Host 在设备接入时面对的最初事实只有电气连接和 EP0。它不知道对面是键盘、摄像头还是复合设备，也不知道有哪些数据端点。描述符就是 Device 通过控制传输返回的自描述字节流，Host 据此创建软件对象并选择驱动。
+
+本文的软件结构与解析路径固定以 Linux 6.12 为基线。
 
 描述符不是供人阅读的配置文件，而是有严格长度、类型、字节序和包含关系的二进制协议。一个字段错误可能让后续所有字节失去边界，因此“设备能返回一些数据”不代表描述符合法。本文从原始字节开始，逐层映射到 Linux 内核对象和真实排错证据。
 
@@ -372,7 +374,66 @@ static const struct usb_device_id ids[] = {
 - [The Linux-USB Host Side API](https://docs.kernel.org/driver-api/usb/usb.html)
 - [USB Descriptor APIs in Linux](https://docs.kernel.org/driver-api/usb/usb.html#usb-standard-devices)
 
-## 八、小结
+## 八、防御式 TLV 解析必须有前进性和边界
+
+描述符解析器处理的字节来自外部设备，不能假设 `bLength` 与 `wTotalLength` 诚实。
+
+每一轮至少验证：剩余字节是否足够容纳公共头、`bLength >= 2`、`bLength <= remaining`，然后才按类型解释。
+
+```mermaid
+flowchart TD
+    P[offset at descriptor] --> H{remaining >= 2?}
+    H -- no --> TR[report truncated tail]
+    H -- yes --> L{bLength >= 2 and <= remaining?}
+    L -- no --> BAD[reject malformed chain]
+    L -- yes --> T{known descriptor type?}
+    T -- yes --> PARSE[validate type-specific minimum]
+    T -- no --> SKIP[keep or skip as extra descriptor]
+    PARSE --> ADV[offset += bLength]
+    SKIP --> ADV
+    ADV --> END{offset == wTotalLength?}
+    END -- no --> P
+    END -- yes --> OK[complete object graph]
+```
+
+`bLength == 0` 会让朴素循环永远不前进。
+
+类型已知也不能跳过最小长度检查，因为把 3 字节内容强转成 9 字节 Endpoint Descriptor 会越界读。
+
+未知类型不应一律视为错误。
+
+USB 的可扩展性依赖 Host 能跳过不理解的 Descriptor，并把 Class-specific 内容留给对应类驱动。
+
+Linux 6.12 的 `usb_get_extra_descriptor()` 正是从 extra 区域按类型安全查找的一种辅助方式。
+
+## 九、解析对象的所有权从原始字节转向 usbcore
+
+Configuration 读取成功后，usbcore 将原始描述符链组织为可被驱动使用的对象。
+
+驱动不拥有 `usb_host_config`、`usb_host_interface` 或 `usb_host_endpoint` 的内存。
+
+这些对象随 `usb_device`、Configuration 和 Alternate Setting 生命周期变化。
+
+```mermaid
+flowchart LR
+    RAW[raw configuration bytes] --> CFG[usb_host_config]
+    CFG --> CACHE[usb_interface_cache]
+    CACHE --> ALTS[usb_host_interface array]
+    ALTS --> HEP[usb_host_endpoint array]
+    HEP --> DRV[interface driver reads current descriptors]
+    SWITCH[SET_INTERFACE / SET_CONFIGURATION] --> ALTS
+    DISC[disconnect] --> FREE[usbcore releases graph]
+```
+
+驱动可以复制稳定的协议数值，例如 Endpoint Address、包长和 Interface Number。
+
+若保存对象指针，则必须证明在使用期间不会切换 Configuration/Alternate Setting，也不会越过 disconnect。
+
+解析完成不是“描述符永远不变”的承诺。
+
+Reset 后设备可能返回不一致身份，usbcore 会比较关键描述符并决定恢复还是断开重建。
+
+## 十、小结
 
 USB 描述符是一棵通过线性 TLV 字节流编码的能力树。Device Descriptor 建立全局身份和 EP0 参数，Configuration 用 `wTotalLength` 划定完整方案，Interface/Alternate 组织功能和带宽模式，Endpoint 定义数据通道，IAD/BOS/Class-specific Descriptor 负责跨 Interface 或新能力扩展。
 

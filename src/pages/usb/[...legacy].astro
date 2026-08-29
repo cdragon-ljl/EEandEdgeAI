@@ -1,0 +1,60 @@
+---
+import { withBase } from '../../lib/paths';
+
+export function getStaticPaths() {
+  const redirects = {
+    'usb-01-usb-architecture-enumeration': 'usb-01-topology-speed-transfers',
+    'usb-02-linux-usb-driver-framework': 'usb-04-linux-usb-subsystem-architecture',
+    'usb-03-usb-descriptors-deep-dive': 'usb-03-descriptor-hierarchy',
+    'usb-04-urb-and-data-transfer': 'usb-07-urb-lifecycle-concurrency',
+    'usb-05-usb-device-driver-practice': 'usb-10-vendor-bulk-character-driver',
+    'usb-06-usb-gadget-intro': 'usb-12-gadget-composite-configfs-functionfs',
+    'usb-07-usb-class-drivers': 'usb-11-class-drivers-hid-msc-cdc-uvc-uac',
+    'usb-08-usb-troubleshooting': 'usb-14-debugging-usbmon-cherryusb',
+    'usb-09-usb-host-controller-device-tree-bring-up': 'usb-13-host-controller-dwc3-xhci-devicetree',
+    'usb-10-mcu-usb-cherryusb-stack': 'usb-14-debugging-usbmon-cherryusb',
+  } as const;
+
+  return Object.entries(redirects).map(([legacy, canonical]) => ({
+    params: { legacy },
+    props: { canonical },
+  }));
+}
+
+interface Props {
+  canonical: string;
+}
+
+const { canonical } = Astro.props;
+const target = withBase(`/usb/${canonical}/`);
+const canonicalURL = new URL(target, Astro.site);
+---
+
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="refresh" content={`0;url=${target}`} />
+    <link rel="canonical" href={canonicalURL} />
+    <title>USB 文章已迁移</title>
+    <script is:inline define:vars={{ target }}>
+      window.location.replace(target);
+    </script>
+  </head>
+  <body>
+    <main>
+      <h1>USB 文章已迁移</h1>
+      <p>正在前往重写后的 Linux 6.12 系列文章。</p>
+      <a href={target}>前往新文章</a>
+    </main>
+  </body>
+</html>
+
+<style>
+  :global(body) { margin: 0; background: #fafafa; color: #111827; font-family: Inter, "Microsoft YaHei", sans-serif; }
+  main { margin: 18vh auto 0; max-width: 42rem; padding: 0 1.5rem; text-align: center; }
+  h1 { font-size: 1.5rem; line-height: 1.45; }
+  p { color: #6b7280; line-height: 1.7; }
+  a { color: #007aff; font-weight: 600; }
+</style>

@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · USB 驱动开发实战 #07 · USB 类驱动：HID、CDC、Mass Storage 与 UVC"
+title: "嵌入式知识体系 · USB 驱动开发实战 #11 · HID、MSC、CDC、UVC 与 UAC 类驱动"
 description: "USB Class 不是一组名称，而是描述符、控制请求、数据端点和 Host API 的完整契约。本篇统一分析 HID、CDC ACM、MSC、UVC 与 UAC。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: usb
-order: 7
-tags: ["USB", "Linux Driver"]
+order: 11
+tags: ["USB", "Class Driver", "Linux 6.12"]
 draft: false
 ---
 同一套 USB 总线能够承载键盘、串口、磁盘、摄像头和声卡，是因为 USB-IF 为常见功能定义了 Class 规范。Class 规范不仅分配 `bInterfaceClass`，还规定描述符、控制请求、数据格式、Endpoint 组合和错误恢复。
+
+本文的软件对象、驱动名称和调用边界固定以 Linux 6.12 为基线。
 
 Linux Class Driver 的价值是把这些通用协议映射为成熟子系统：HID 进入 input/hidraw，CDC ACM 进入 TTY，Mass Storage 进入 SCSI/block，UVC 进入 V4L2，UAC 进入 ALSA。理解 Class 时不能只看 `/dev` 节点，要沿控制面和数据面同时追踪。
 
@@ -157,7 +159,161 @@ flowchart TD
 - [The Linux-USB Host Side API](https://docs.kernel.org/driver-api/usb/usb.html)
 - [USB 2.0 Specification - USB-IF](https://www.usb.org/document-library/usb-20-specification)
 
-## 八、小结
+## 八、五类驱动的对象与数据调度对照
+
+Class Driver 的共同结构是：先用描述符建立协议对象，再把 USB 传输转换成 Linux 子系统请求。
+
+| Class | 绑定单位 | 核心运行时对象 | 数据调度 |
+| --- | --- | --- | --- |
+| HID | HID Interface | `hid_device`、Input Device | Interrupt IN/OUT，Control Feature |
+| MSC BOT | Mass Storage Interface | `us_data`、SCSI Host | CBW/Data/CSW 串行阶段 |
+| UAS | 多 Endpoint Interface | SCSI command/tag | Command/Status/Data Pipe 并发 |
+| CDC ACM | Control + Data Interface | `acm`、TTY Port | Interrupt notification + Bulk |
+| UVC | VC + VS Interface | `uvc_device`、video queue | Control negotiation + Iso/Bulk stream |
+| UAC | Audio Control + Streaming | ALSA PCM、clock entity | Iso data + feedback/sync |
+
+同为 Bulk Endpoint，MSC BOT 与 CDC ACM 的完成语义完全不同。
+
+BOT 必须保持 CBW、可选 Data、CSW 的命令边界。
+
+CDC Data 更接近连续字节流，还要由 TTY 处理 termios、hangup 与缓冲。
+
+同为 Isochronous，UVC 关心帧/负载头和视频 buffer，UAC 关心 sample clock、packet size 与反馈。
+
+## 九、控制面先建立数据面合同
+
+Class Driver 很少在 probe 后直接盲目提交数据 URB。
+
+HID 要读取 Report Descriptor 或选择 Boot Protocol。
+
+MSC 要取得 Max LUN、建立 SCSI Host 并处理 reset recovery。
+
+CDC ACM 要解析 Union Functional Descriptor，确认 Control/Data Interface 关系，并设置 line coding/control line state。
+
+UVC 通过 Probe/Commit 协商 format、frame、interval 和 payload size，再选择 Alternate Setting。
+
+UAC 根据 Clock Source、Format Type 与 Sample Rate 选择 Audio Streaming Alternate Setting。
+
+```mermaid
+flowchart TD
+    DESC[class-specific descriptors] --> MODEL[build class object model]
+    MODEL --> CTRL[class control negotiation]
+    CTRL --> ALT[select interface alternate setting]
+    ALT --> EP[validate active endpoints]
+    EP --> QUEUE[allocate and submit transfer queues]
+    QUEUE --> SUBSYS[publish Input/SCSI/TTY/V4L2/ALSA data]
+```
+
+控制面失败时，数据 Endpoint 即使存在也不能按预期解释。
+
+例如 UVC 未 Commit 就收数据，Host 不知道设备实际采用的帧间隔与 payload 上限。
+
+## 十、HID 的 Report Descriptor 决定字段而非端点
+
+Interrupt Endpoint 只给出报告传输通道。
+
+每个 bit 的 Usage、逻辑范围、单位、Report ID 和输入/输出属性来自 Report Descriptor。
+
+`usbhid` 负责 USB transport，HID Core 负责解析与通用对象，具体 HID Driver/quirk 再处理设备差异。
+
+复杂 HID 可能在一个 Interface 中有多个 Report ID。
+
+收到第一个字节后必须按 ID 选择布局，不能把最大包长当作固定报告长度。
+
+disconnect 时 transport 先停止 URB，HID Core 再撤销 hidraw 与 Input Device。
+
+## 十一、MSC BOT 与 UAS 的并发模型不同
+
+Bulk-Only Transport 使用：
+
+1. 31 字节 CBW。
+2. 可选 Data IN/OUT。
+3. 13 字节 CSW。
+
+CBW 的 tag 必须与 CSW 对应。
+
+STALL、错误 CSW 或 phase error 会触发 clear halt、Bulk-Only Mass Storage Reset 和队列恢复。
+
+UAS 使用多个 Endpoint 与命令 tag，可让多个 SCSI Command 并发。
+
+它对 stream、队列深度和乱序完成有更高要求。
+
+不能把 BOT 的单命令状态机直接扩大成多 URB，就称为 UAS。
+
+## 十二、CDC ACM 为什么需要两个 Interface
+
+CDC ACM 常用一个 Communication Class Interface 承载控制与 Serial State Notification，一个 Data Class Interface 承载 Bulk IN/OUT。
+
+Union Functional Descriptor 指出 master/slave Interface 关系。
+
+Control Driver probe 可能通过 `usb_driver_claim_interface()` 取得 Data Interface。
+
+```mermaid
+flowchart LR
+    CTRL[CDC Control Interface] --> UNION[Union Functional Descriptor]
+    UNION --> DATA[CDC Data Interface]
+    CTRL --> NOTIFY[Interrupt IN notifications]
+    DATA --> BIN[Bulk IN]
+    DATA --> BOUT[Bulk OUT]
+    CTRL --> ACM[cdc_acm private object]
+    DATA --> ACM
+    ACM --> TTY[TTY port]
+```
+
+任意一侧 disconnect 都要让共享 `acm` 对象进入 hangup/stop，并避免另一个 Interface 再提交。
+
+## 十三、UVC 与 UAC 都依赖 Alternate Setting 带宽
+
+UVC VideoStreaming Interface 常有 Alternate Setting 0 表示零带宽，其他设置提供不同 Isochronous Endpoint 包长。
+
+驱动根据 Probe/Commit 返回的 payload 需求选择能容纳它的最小 Alternate Setting。
+
+UAC AudioStreaming 也用 Alternate Setting 表达格式和 Endpoint 组合。
+
+异步音频 Endpoint 还可能需要 Feedback Endpoint，让 Host 根据设备时钟微调每帧样本数。
+
+带宽选择失败不应通过随意增大 URB 缓冲解决。
+
+要检查总线速度、Hub split transaction、其他周期性设备和 Endpoint Companion Descriptor。
+
+## 十四、类驱动的停止与错误恢复
+
+| Class | 正常停止 | 典型恢复 |
+| --- | --- | --- |
+| HID | kill interrupt URB，注销 Input | clear halt、reset_resume、重新读状态 |
+| MSC | quiesce SCSI queue，终止命令 | BOT reset/UAS task management |
+| CDC ACM | tty hangup，kill read/write URB | clear halt，重设 line coding |
+| UVC | STREAMOFF，返回全部 vb2 buffer | 重新 Probe/Commit、切 alt |
+| UAC | stop PCM、停止 Iso URB | 重设 clock/rate、重新 prepare |
+
+恢复必须遵守上层子系统合同。
+
+例如 UVC 停止时每个排队的 vb2 buffer 都必须以完成或错误状态归还。
+
+UAC xrun 要通过 ALSA 状态机报告，不能静默丢样后继续宣称连续。
+
+MSC 不能在 reset 后把旧 SCSI Command 当作新命令完成。
+
+## 十五、Linux 6.12 源码阅读入口
+
+建议分别阅读：
+
+- `drivers/hid/usbhid/` 与 `drivers/hid/hid-core.c`
+- `drivers/usb/storage/` 与 `drivers/usb/storage/uas.c`
+- `drivers/usb/class/cdc-acm.c`
+- `drivers/media/usb/uvc/`
+- `sound/usb/`
+
+对每一类都记录描述符入口、控制面状态、URB 队列、上层对象发布、disconnect 和 reset。
+
+一手资料：
+
+- [Linux 6.12 USB API](https://www.kernel.org/doc/html/v6.12/driver-api/usb/usb.html)
+- [Linux USB mass-storage design](https://docs.kernel.org/driver-api/usb/usb.html)
+- [Linux stable USB class sources](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/usb?h=linux-6.12.y)
+- [USB class specifications](https://www.usb.org/documents)
+
+## 十六、小结
 
 HID、CDC ACM、MSC、UVC 和 UAC 共用 USB Interface/Endpoint 框架，但各自通过 Class Descriptor 和 Control Request 定义业务协议。HID 的核心是 Report Descriptor，MSC 是 CBW/Data/CSW 或 UAS 命令队列，CDC ACM 是控制与数据 Interface 配对，UVC 是 Probe/Commit 后的帧 payload，UAC 则依赖 clock 与 feedback 长期同步。
 

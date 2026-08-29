@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · USB 驱动开发实战 #01 · USB 架构与枚举流程"
-description: "USB 是嵌入式 Linux 中最常见、也最值得系统学习的一类外设总线。U 盘、摄像头、USB 转串口、网卡、键盘、鼠标、采集卡，很多工程现场都会遇到它。对驱动开发来说，USB 不是“插上能用”这么简单，而是一套完整的体系：总线拓扑、角色分工、描述符、枚举、传输类型、驱动匹配、热插拔，缺一块都容易出问题。"
-pubDate: "2026-08-18"
+title: "嵌入式知识体系 · USB 驱动开发实战 #01 · 总线拓扑、速度、事务与四类传输"
+description: "从 Host 主导拓扑、速度代际和总线时间出发，分清 Packet、Transaction、Transfer、Endpoint 与 Pipe，并解释 Control、Bulk、Interrupt、Isochronous 的调度语义。"
+pubDate: "2026-08-29"
 series: usb
 order: 1
-tags: ["USB", "Linux Driver"]
+tags: ["USB", "Protocol", "Linux 6.12"]
 draft: false
 ---
 Universal Serial Bus，简称 USB，中文通常译为通用串行总线。它要解决的并不只是“用一根线传输数据”，而是让不同厂商、不同功能的外设在接入后能够被自动识别、分配资源，并通过统一协议长期工作。
+
+本文以 Linux 6.12 为软件映射基线，协议层同时对照 USB 2.0 与 USB 3.x 的公开规范。
 
 在 USB 出现之前，键盘、鼠标、打印机和存储设备往往使用不同连接器与驱动模型。USB 把连接检测、设备身份、功能描述、带宽调度、供电和热插拔放进同一套体系。理解这套体系后，才能解释为什么插入设备时先出现总线日志，随后才出现 `/dev/ttyUSB0`、`/dev/video0` 或块设备节点。
 
@@ -160,7 +162,196 @@ usbmon 记录 URB 提交与完成，可以确认 `GET_DESCRIPTOR`、`SET_ADDRESS
 - [The Linux-USB Host Side API](https://docs.kernel.org/driver-api/usb/usb.html)
 - [Linux USB Power Management](https://docs.kernel.org/driver-api/usb/power-management.html)
 
-## 七、小结
+## 七、Packet、Transaction 与 Transfer 必须分层
+
+Packet 是链路上带 PID、载荷与校验字段的基本协议单元。
+
+USB 2.0 常见 Packet 类别包括 Token、Data、Handshake 和 SOF。
+
+Token 指定地址、Endpoint 与方向。
+
+Data Packet 携带 DATA0/DATA1 等 Toggle 与有效载荷。
+
+Handshake 用 ACK、NAK、STALL、NYET 表示接收结果或暂时状态。
+
+Transaction 把若干 Packet 组合成一次有明确方向的总线交换。
+
+例如一个 Bulk OUT transaction 通常由 OUT Token、Data Packet 和 Handshake 组成。
+
+Transfer 是更高层请求，可以由多个 transaction 完成。
+
+一个 64 KiB Bulk Transfer 会被拆成许多最大包长以内的 transaction。
+
+```mermaid
+flowchart LR
+    APP[Driver transfer request] --> XFER[USB Transfer]
+    XFER --> T0[Transaction 0]
+    XFER --> T1[Transaction 1]
+    XFER --> TN[Transaction n]
+    T0 --> TOK0[Token]
+    T0 --> DAT0[Data]
+    T0 --> HS0[Handshake]
+```
+
+这三层的错误语义不同。
+
+CRC 或 PID 错误发生在 Packet。
+
+NAK 是某次 transaction 暂时未完成，不等于整个 Transfer 失败。
+
+URB completion 看到的是 Transfer 级聚合结果。
+
+驱动不能从一次 NAK 直接推断业务超时，也不能从 URB 成功反推每个 transaction 都没有重试。
+
+## 八、四类 Transfer 的保证与代价
+
+Control Transfer 固定包含 Setup、可选 Data 和 Status 阶段。
+
+它用于枚举、标准请求、Class Request 与 Vendor Request。
+
+Control 有重试和错误恢复，但 EP0 仍可能 STALL 或超时。
+
+Bulk 追求可靠搬运，不保证服务周期。
+
+总线空闲时它可以获得很高吞吐，周期性负载增加时会让出带宽。
+
+Interrupt Transfer 不是设备主动产生 CPU 中断。
+
+Host 仍按周期调度 IN/OUT transaction，只是调度器承诺不超过协商服务间隔。
+
+Isochronous Transfer 预留周期性带宽，并以确定时间到达为优先。
+
+它没有 transaction-level 重试，因为迟到的音视频样本通常比丢失更糟。
+
+| 类型 | 是否保证重试 | 是否保留周期机会 | 典型完成判断 |
+| --- | --- | --- | --- |
+| Control | 是 | 有控制调度规则 | 三阶段整体成功 |
+| Bulk | 是 | 否 | 字节数、短包、STALL |
+| Interrupt | 是 | 是 | 每次轮询报告 |
+| Isochronous | 否 | 是 | 每个 packet 独立状态 |
+
+选择传输类型是协议设计，不是性能开关。
+
+把实时音频放到 Bulk 上不能获得周期保证。
+
+把大文件搬运放到 Interrupt 上会占用周期预算并受最大包长限制。
+
+## 九、Frame、Microframe 与周期带宽
+
+Full-Speed 总线以 1 ms Frame 为主要调度单位。
+
+High-Speed 把每个 Frame 分为 8 个 125 us Microframe。
+
+Host Controller 在这些时间槽中安排周期性与非周期性 transaction。
+
+周期性 Endpoint 的 `bInterval` 解释依赖速度和传输类型。
+
+不能把所有设备的 `bInterval=4` 都机械解释为 4 ms。
+
+High-Speed 与 SuperSpeed 的周期常使用指数语义。
+
+HCD 会把描述符需求转换成自己的 schedule。
+
+若周期预算无法满足，启用 Alternate Setting 或提交 Isochronous URB 可能失败。
+
+端点描述符合法只证明设备提出需求，不证明当前拓扑仍有可用带宽。
+
+## 十、Hub 后的 split transaction
+
+High-Speed Hub 连接 Full/Low-Speed Device 时，需要 Transaction Translator。
+
+High-Speed Host 不能直接用 High-Speed transaction 与下游低速设备通信。
+
+Hub 通过 start-split 与 complete-split 在 High-Speed 上游和 Full/Low-Speed 下游之间桥接。
+
+本文统一把这一机制称为 split transaction。
+
+```mermaid
+sequenceDiagram
+    participant H as High-Speed Host
+    participant TT as Hub Transaction Translator
+    participant D as Full-Speed Device
+    H->>TT: Start-Split in one microframe
+    TT->>D: Full-Speed transaction
+    D-->>TT: data/handshake
+    H->>TT: Complete-Split in later microframe
+    TT-->>H: translated result
+```
+
+split 会消耗多个 Microframe 的调度机会。
+
+多个下游周期性设备还会争用 TT。
+
+Single-TT Hub 的多个端口共享一个 Translator，Multi-TT Hub 可为端口提供更独立的调度。
+
+因此某个 Full-Speed 音频设备直连正常、通过廉价 Hub 异常，可能不是驱动数据格式错误，而是 split 带宽与 Hub 实现问题。
+
+## 十一、Linux 如何表达包长和总线时间
+
+驱动解析 Endpoint 类型时应使用 `usb_endpoint_xfer_bulk()`、`usb_endpoint_xfer_int()` 与同类 helper。
+
+不要手写不透明的 `bmAttributes & 3` 并在代码各处重复。
+
+建立 pipe 后，`usb_maxpacket(udev, pipe)` 返回当前端点的有效最大包长。
+
+它依赖活动 Configuration 与 Alternate Setting。
+
+切换 Alternate Setting 后必须重新确认。
+
+usbcore/HCD 在周期带宽计算中使用速度、方向、Isochronous/Interrupt 属性、最大包长和 Hub 拓扑。
+
+Linux 6.12 中 `usb_calc_bus_time()` 提供对 USB 2.0 transaction 时间的核心估算。
+
+该估算包含协议开销，不是简单的 `bytes / link_rate`。
+
+它供 HCD 带宽管理使用，普通 Interface Driver 通常不直接据此自行预留时间。
+
+驱动的职责是提供合法 URB、interval 与 packet 长度，并正确处理带宽不足返回。
+
+## 十二、错误、重试与短包属于不同层
+
+以下现象不能混为一个“传输失败”：
+
+- Packet 校验或 bit stuffing 错误。
+- Transaction 收到 NAK 后重试。
+- Endpoint 返回 STALL。
+- Bulk IN 以 short packet 正常结束。
+- Isochronous 单个 packet 丢失。
+- 整个 URB 被 disconnect 取消。
+
+Bulk IN 的 short packet 是 Transfer 边界机制。
+
+如果业务协议要求固定长度，驱动必须累计读取并自行判断完整消息。
+
+Bulk OUT 在传输长度恰好是最大包长整数倍时，协议可能需要 Zero Length Packet。
+
+Linux URB 可使用 `URB_ZERO_PACKET` 表达该要求。
+
+STALL 表示 Endpoint halt 或请求不支持，常以 `-EPIPE` 到达驱动。
+
+是否 clear halt、重试还是上报业务错误，取决于 Class/Vendor 协议。
+
+Isochronous URB 则要逐项检查 `iso_frame_desc[i].status` 与 `actual_length`。
+
+URB 总 status 不能替代每个 packet 的结果。
+
+## 十三、从规范到 Linux 6.12 的阅读入口
+
+理解协议层后，可对照：
+
+- `include/uapi/linux/usb/ch9.h`：标准描述符与请求常量。
+- `include/linux/usb.h`：Endpoint helper、pipe、URB 与 `usb_maxpacket()`。
+- `drivers/usb/core/hcd.c`：HCD 公共调度与 `usb_calc_bus_time()`。
+- `drivers/usb/core/urb.c`：URB 提交校验。
+
+一手资料：
+
+- [USB 2.0 Specification](https://www.usb.org/document-library/usb-20-specification)
+- [USB 3.2 Specification](https://www.usb.org/document-library/usb-32-revision-11-june-2022)
+- [Linux 6.12 USB API](https://www.kernel.org/doc/html/v6.12/driver-api/usb/usb.html)
+- [Linux stable HCD core](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/usb/core/hcd.c?h=linux-6.12.y)
+
+## 十四、小结
 
 USB 是由 Host 统一调度的分层总线。Device 通过描述符说明自身能力，通过 Endpoint 暴露单向数据通道，通过四种 Transfer 获得不同的可靠性、时延和带宽语义。设备接入后，Linux 从 Hub 端口变化开始，经 EP0 控制传输、地址分配、配置读取和 interface 创建，最终才调用功能驱动的 `probe()`。
 

@@ -2,7 +2,7 @@ import { defineCollection, z } from 'astro:content';
 import { glob } from 'astro/loaders';
 
 const articles = defineCollection({
-  loader: glob({ pattern: '{cuda,ee-system,freertos,rknn,riscv,fpga,zephyr,bsp,linux-driver,usb,pcie,video-audio,deep-learning}/**/!(riscv-architecture-framework|fpga-xc7z020-framework|freertos-kernel-framework).md', base: './docs/articles' }),
+  loader: glob({ pattern: '{cuda,ee-system,freertos,rknn,riscv,fpga,zephyr,bsp,linux-driver,usb,pcie,video-audio,deep-learning}/**/!(riscv-architecture-framework|fpga-xc7z020-framework|freertos-kernel-framework|usb-framework|pcie-framework).md', base: './docs/articles' }),
   schema: z.object({
     title: z.string(),
     description: z.string(),

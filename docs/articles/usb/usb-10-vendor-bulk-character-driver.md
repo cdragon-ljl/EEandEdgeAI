@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · USB 驱动开发实战 #05 · USB 设备驱动实践：从匹配到数据收发"
+title: "嵌入式知识体系 · USB 驱动开发实战 #10 · Vendor Bulk 字符驱动与异步数据面"
 description: "本篇以一个 vendor-specific Bulk 设备为例，把 Interface 匹配、Endpoint 解析、URB、字符设备、read/poll、背压和 disconnect 串成一份可审计的 Linux USB 驱动。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: usb
-order: 5
-tags: ["USB", "Linux Driver"]
+order: 10
+tags: ["USB", "Bulk", "Character Driver", "Linux 6.12"]
 draft: false
 ---
 前四篇已经分别说明 USB 如何识别设备、Linux 如何绑定 Interface、描述符如何定义 Endpoint，以及 URB 如何异步完成。本篇把这些机制组合成一个可工作的驱动模型。
+
+本文的 API、并发与错误回滚以 Linux 6.12 为基线，配套源码使用重新编写的教学协议和实现。
 
 示例设备只有一个 vendor-specific Interface，包含一个 Bulk OUT 和一个 Bulk IN Endpoint。上层协议使用消息头 `{type, sequence, length}`，Host 发送命令，Device 异步返回响应或采样数据。明确协议很重要：驱动才能判断 short packet、消息边界、超时和背压，而不是把任意字节流都当成功。
 
@@ -423,7 +425,77 @@ KASAN 用于发现 use-after-free，lockdep 用于锁顺序，dynamic debug/trac
 - [The Linux-USB Host Side API](https://docs.kernel.org/driver-api/usb/usb.html)
 - [Linux USB Power Management](https://docs.kernel.org/driver-api/usb/power-management.html)
 
-## 八、小结
+## 八、三个对象域决定字符驱动能否热插拔
+
+字符驱动同时存在 Interface、file 与 request 三个对象域。
+
+Interface 域在 probe 到 disconnect 之间有效。
+
+file 域从 open 到 release，可能越过 disconnect。
+
+request 域从 URB 分配/提交到 completion 回收。
+
+```mermaid
+flowchart TD
+    INTF[usb_interface lifetime] --> PRIV[driver private object with kref]
+    FILE[file lifetime] --> PRIV
+    REQ[IN/OUT request lifetime] --> PRIV
+    DISC[disconnect] --> OFF[online=false and node removed]
+    OFF --> PRIV
+    CLOSE[last file release] --> FREE[kref reaches zero]
+    DONE[last request completion] --> FREE
+```
+
+disconnect 不能直接释放仍被 file 或 request 引用的私有对象。
+
+open file 也不能因为 kref 仍在，就继续向已关闭 Endpoint 提交 I/O。
+
+## 九、read 与 poll 共享同一个状态谓词
+
+阻塞 read 的等待条件应包含“FIFO 有数据或设备离线或发生不可恢复错误”。
+
+poll 必须基于同一组事实返回 `POLLIN`、`POLLOUT`、`POLLHUP` 和 `POLLERR`。
+
+```mermaid
+sequenceDiagram
+    participant U as userspace read/poll
+    participant F as FIFO/wait queue
+    participant C as Bulk IN completion
+    participant D as disconnect
+    U->>F: wait for data || !online || error
+    C->>F: push bytes and wake
+    F-->>U: copy_to_user / POLLIN
+    D->>F: online=false and wake all
+    F-->>U: -ENODEV / POLLHUP
+```
+
+若 read 与 poll 使用不同条件，会出现 poll 宣称可读而 read 永久阻塞，或拔出后 epoll 无法退出。
+
+## 十、发送背压从 URB 配额传播到用户空间
+
+异步 write 不能无限分配 URB。
+
+驱动应限制在途请求数或总字节数。
+
+达到上限时，阻塞 write 等待完成，`O_NONBLOCK` 返回 `-EAGAIN`，poll 暂时不报告 `POLLOUT`。
+
+```mermaid
+flowchart LR
+    WRITE[user write] --> Q{in-flight below limit?}
+    Q -- yes --> MAP[allocate/map request]
+    MAP --> SUB[submit Bulk OUT URB]
+    SUB --> COMP[completion]
+    COMP --> SLOT[return slot and wake writers]
+    Q -- no, blocking --> WAIT[wait queue]
+    Q -- no, O_NONBLOCK --> AGAIN[-EAGAIN]
+    SLOT --> WAIT
+```
+
+这一链条把设备/HCD 的有限队列容量稳定地传递到用户空间。
+
+如果 completion 因 disconnect 返回，仍要归还配额并唤醒等待者，否则最后一次 close 会卡住。
+
+## 十一、小结
 
 完整 USB Interface Driver 是一套并发所有权系统：probe 建立 Endpoint、私有对象和用户入口；RX completion 与 read/poll 通过 FIFO 协作；TX slot 把用户速度转换为有限 in-flight URB；disconnect、autosuspend 和 reset 通过统一停止顺序收敛异步请求；kref 让软件对象寿命独立于物理连接。
 

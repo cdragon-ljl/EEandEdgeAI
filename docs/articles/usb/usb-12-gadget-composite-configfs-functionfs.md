@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · USB 驱动开发实战 #06 · USB Gadget：让开发板变成 USB 设备"
+title: "嵌入式知识体系 · USB 驱动开发实战 #12 · Gadget、Composite、ConfigFS 与 FunctionFS"
 description: "Linux USB Gadget 让开发板工作在 Device 角色。本篇从 UDC、EP0、Composite Framework、ConfigFS、FunctionFS 和 usb_request 出发，走完设备侧枚举与数据生命周期。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: usb
-order: 6
-tags: ["USB", "Linux Driver"]
+order: 12
+tags: ["USB", "Gadget", "Linux 6.12"]
 draft: false
 ---
 前五篇都站在 Host 一侧：Linux 发现外设、绑定 Interface Driver 并提交 URB。本篇把视角翻转，让开发板成为 USB Device。此时 PC 才是 Host，开发板上的 USB Device Controller 响应 reset、Setup packet 和数据 token。
+
+本文以 Linux 6.12 Gadget Core、Composite Framework 和 ConfigFS 实现为基线。
 
 Linux 把 Device 侧框架称为 Gadget。Gadget 不是“把 Host 驱动反过来写”：Host 主动调度，Device 被动响应；Host 用 URB 描述请求，Device 侧用 `usb_request` 把 buffer 排入 Endpoint；Device 的描述符和控制请求处理决定 Host 最终会绑定什么驱动。
 
@@ -198,7 +200,129 @@ lsusb -v -d 1234:5678
 - [Linux USB Gadget ConfigFS](https://docs.kernel.org/usb/gadget_configfs.html)
 - [USB 2.0 Specification - USB-IF](https://www.usb.org/document-library/usb-20-specification)
 
-## 八、小结
+## 八、Composite Function 的 bind、set_alt 与 disable
+
+`usb_function` 不是一组静态描述符。
+
+它还定义 Function 在 Configuration 中分配 Interface/Endpoint、响应模式切换和停止数据面的生命周期。
+
+`bind()` 在组装阶段取得 Interface ID、自动配置 Endpoint 并准备描述符。
+
+Host 选择 Configuration/Alternate Setting 后，`set_alt()` 启用对应 Endpoint 并开始排队 `usb_request`。
+
+`disable()` 必须停止排队、使 completion 收敛并让 Function 回到可再次 set_alt 的状态。
+
+```mermaid
+stateDiagram-v2
+    [*] --> Allocated: function instance created
+    Allocated --> Bound: bind to configuration
+    Bound --> Enabled: set_alt after host configuration
+    Enabled --> Bound: disable / configuration cleared
+    Enabled --> Suspended: bus suspend
+    Suspended --> Enabled: resume
+    Bound --> Unbound: unbind configuration
+    Unbound --> [*]: free instance
+```
+
+Function 不能假设 `set_alt()` 只调用一次。
+
+Host 可以重设 Configuration、切换 Alternate Setting 或在 reset 后重新配置。
+
+## 九、EP0 setup 的接收者决定分发边界
+
+Setup Packet 的 `bmRequestType` 同时编码方向、类型和接收者。
+
+Gadget Core/Composite 层先处理标准 Device/Configuration 请求。
+
+Interface Recipient 的 Class/Vendor Request 再按 `wIndex` 的 Interface Number 分发给 Function。
+
+Endpoint Recipient 则需要定位 Endpoint 所属 Function。
+
+```mermaid
+flowchart TD
+    SETUP[EP0 Setup Packet] --> T{request type}
+    T -- standard --> COMP[Composite/Gadget standard handling]
+    T -- class/vendor --> R{recipient}
+    R -- device --> CDRV[composite driver setup]
+    R -- interface --> FUNC[usb_function setup by interface]
+    R -- endpoint --> FEP[function owning endpoint]
+    COMP --> DATA[optional EP0 data stage]
+    CDRV --> DATA
+    FUNC --> DATA
+    FEP --> DATA
+    DATA --> STATUS[status stage]
+```
+
+setup 回调必须验证 `wLength`、方向与接收者。
+
+Host 提供的长度不可信，不能让它越过 EP0 缓冲。
+
+延迟状态阶段需要使用 Composite Framework 规定的返回语义，不能让 Host 无限等待。
+
+## 十、usb_request 的所有权转移
+
+Device 侧使用 `usb_ep_alloc_request()` 分配 Request。
+
+Function 填充 `buf`、`length`、`complete`、`context` 后调用 `usb_ep_queue()`。
+
+queue 成功到 completion 返回期间，UDC 数据路径拥有 Request 与缓冲。
+
+Function 不能修改在途缓冲，也不能释放 Request。
+
+disable/unbind 时使用 `usb_ep_dequeue()` 或 Endpoint disable 让在途 Request 以取消状态完成。
+
+completion 依据 enabled/online 状态决定重新排队还是回收。
+
+这与 Host 侧 URB 所有权模型对称，但 API 和角色不同。
+
+## 十一、ConfigFS 改变组装策略而非协议责任
+
+ConfigFS 可以创建 Gadget、填写 VID/PID/字符串、创建 Configuration、实例化 Function，并通过符号链接组合。
+
+最后把 Gadget 名写入 `UDC` 属性才真正绑定控制器。
+
+ConfigFS 解决的是运行时组装，不会替 Function 实现协议状态机。
+
+FunctionFS 进一步允许用户空间处理自定义 Function 的描述符、setup 与数据 Endpoint。
+
+内核仍管理 UDC、EP0 公共状态与 Endpoint 文件，用户进程必须正确处理断开、重新绑定和短 I/O。
+
+FunctionFS 进程退出会影响该 Function 可用性，产品设计要定义守护、重启和 Host 已连接时的恢复策略。
+
+## 十二、角色切换和解绑的停止顺序
+
+Dual-role 控制器从 Device 切到 Host 前，必须先让 Gadget 与 UDC 解绑定。
+
+推荐顺序：
+
+1. 阻止 Function 新 queue。
+2. disable 所有活动 Function/Endpoint。
+3. 等待 completion 与用户空间 FunctionFS I/O 收敛。
+4. 断开 pull-up，让 Host 观察 disconnect。
+5. 解除 Gadget 与 UDC 绑定。
+6. 停止 Device Controller。
+7. 切换 PHY、VBUS 与控制器角色。
+
+跳过前几步会让旧 Device Request 在控制器已进入 Host 模式后访问寄存器或 DMA。
+
+## 十三、Linux 6.12 一手资料与源码入口
+
+重点源码：
+
+- `drivers/usb/gadget/udc/core.c`
+- `drivers/usb/gadget/composite.c`
+- `drivers/usb/gadget/configfs.c`
+- `drivers/usb/gadget/function/f_fs.c`
+- `include/linux/usb/gadget.h`
+
+一手资料：
+
+- [Linux 6.12 Gadget API](https://www.kernel.org/doc/html/v6.12/driver-api/usb/gadget.html)
+- [Linux Gadget ConfigFS](https://docs.kernel.org/usb/gadget_configfs.html)
+- [Linux stable composite.c](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/usb/gadget/composite.c?h=linux-6.12.y)
+- [USB 2.0 Specification](https://www.usb.org/document-library/usb-20-specification)
+
+## 十四、小结
 
 Gadget 框架把 Device 侧分为 UDC hardware adapter、Gadget Core、Composite Configuration/Function 和应用。EP0 负责 Host 对设备的控制，非零 Endpoint 通过 `usb_request` 队列搬运数据；`set_alt()`、`disable()`、suspend 和 unbind 则定义 Function 生命周期。
 

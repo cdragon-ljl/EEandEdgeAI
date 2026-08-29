@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · USB 驱动开发实战 #08 · USB 问题排查：从枚举失败到传输异常"
-description: "USB 故障跨越供电、角色、PHY、EP0、描述符、驱动绑定、URB、Class 协议和用户 API。本篇用证据链逐层缩小问题。"
-pubDate: "2026-08-18"
+title: "嵌入式知识体系 · USB 驱动开发实战 #14 · usbmon 证据链、系统调试与 CherryUSB 对照"
+description: "以 Linux 6.12 为基线建立从供电、PHY、枚举、URB、DMA/IOMMU 到 Class 协议的调试证据树，并用 CherryUSB 对照 MCU 侧 core/class/port 边界。"
+pubDate: "2026-08-29"
 series: usb
-order: 8
-tags: ["USB", "Linux Driver"]
+order: 14
+tags: ["USB", "usbmon", "Debugging", "CherryUSB", "Linux 6.12"]
 draft: false
 ---
 USB 故障难排，不是因为某个 API 隐蔽，而是一次业务操作会跨越多层：连接器与供电、角色和 PHY、Host Controller、EP0、描述符、Interface Driver、URB、Class 协议、用户 API。跳过前层直接修改后层，只会让现象变化，不能证明根因。
+
+本文的 Linux 工具、路径和错误语义固定以 Linux 6.12 为基线；文末再与固定版本 CherryUSB 的 MCU 架构对照。
 
 本篇不罗列“试试换线、重载驱动”之类经验，而是为每一层定义入口证据、检查手段、可能结果和进入下一层的条件。
 
@@ -156,7 +158,202 @@ runtime autosuspend 会让“设备仍插着但暂时不可访问”成为正常
 - [Linux USB Power Management](https://docs.kernel.org/driver-api/usb/power-management.html)
 - [USB 2.0 Specification - USB-IF](https://www.usb.org/document-library/usb-20-specification)
 
-## 八、小结
+## 八、usbmon 记录要按 URB 提交与完成配对
+
+usbmon 文本记录中的 `S` 表示 submit，`C` 表示 complete，`E` 表示 submit error。
+
+分析时先按 URB 标识配对，再解释 type、地址、Endpoint、Setup Packet、status 与实际长度。
+
+只截取 completion 行会丢失请求方向、期望长度和控制请求字段。
+
+```mermaid
+flowchart LR
+    CAP[usbmon capture] --> KEY[group by URB tag]
+    KEY --> S[submit record]
+    KEY --> C[complete/error record]
+    S --> REQ[bus/device/endpoint/type/setup/expected length]
+    C --> RES[status/actual length/data]
+    REQ --> JUDGE[compare protocol expectation]
+    RES --> JUDGE
+```
+
+Control Transfer 要同时解析 `bmRequestType`、`bRequest`、`wValue`、`wIndex` 与 `wLength`。
+
+Bulk/Interrupt 要结合 Endpoint Descriptor 和上层消息边界。
+
+Isochronous 的文本聚合信息可能不足以说明每个 packet，必要时使用二进制接口、tracepoint 或 HCD 级证据。
+
+Wireshark 能改善解码与过滤，但它看到的仍是 Host 软件路径记录，不等同于物理线上每个 Packet。
+
+要证明信号、重试和线级时序，仍需协议分析仪或示波器。
+
+## 九、错误码只能定位层级，不能单独宣布根因
+
+| 错误 | 可确认事实 | 不能单独确认 |
+| --- | --- | --- |
+| `-EPROTO` | 协议/链路层观察到异常 | 一定是线材或一定是固件 |
+| `-ETIMEDOUT` | 请求未在时限内完成 | 设备完全掉电 |
+| `-EPIPE` | Endpoint STALL/halt | 必然应该 clear halt |
+| `-EOVERFLOW` | 数据超过提交缓冲/协议预期 | 一定是 HCD bug |
+| `-ENODEV` | 当前对象不能继续 I/O | 设备从未枚举成功 |
+| `-ESHUTDOWN` | Endpoint/HCD 正在关闭 | 原始业务请求有错 |
+
+错误码需要放回时间线。
+
+枚举首个 8 字节描述符时的 `-EPROTO` 与稳定运行几小时后 Bulk URB 的 `-EPROTO`，调查范围完全不同。
+
+同一错误在所有端口复现更像设备/驱动问题，只在某个板端口复现更像供电、PHY 或布局问题，但这仍是待验证假设。
+
+## 十、动态调试、tracepoint 与内存检查各自证明什么
+
+dynamic_debug 可以按文件/函数打开 `pr_debug()`，适合观察 usbcore、HCD 与 Class Driver 内部分支。
+
+tracepoint 适合构建带时间戳的 submit/complete、PM、IRQ 或调度时间线。
+
+KASAN 发现越界与 use-after-free。
+
+KCSAN 发现部分数据竞争。
+
+lockdep 检查锁依赖和原子上下文睡眠。
+
+IOMMU fault 指出设备 DMA 访问了没有映射的 IOVA 或越权范围。
+
+这些工具回答的问题不同。
+
+KASAN 无报告不能证明协议正确；usbmon 数据正确也不能证明没有 completion UAF。
+
+## 十一、恢复动作也必须留下前后证据
+
+clear halt、Interface reset、Device reset、Port power cycle 和重新绑定驱动的影响范围逐级扩大。
+
+```mermaid
+flowchart TD
+    E[observed failure] --> CH{single endpoint stall?}
+    CH -- yes and protocol permits --> CLR[clear halt + reset toggle]
+    CH -- no --> IF{class state recoverable?}
+    IF -- yes --> CR[class-specific reset]
+    IF -- no --> DR[USB device reset]
+    DR --> OK{identity and configuration restored?}
+    OK -- no --> RE[disconnect/re-enumerate]
+    RE --> PW[port power cycle only if required]
+```
+
+每次恢复前记录最后成功事务、队列状态和错误计数。
+
+恢复后验证 Endpoint、generation、PM 与用户子系统状态是否重建。
+
+若“重载驱动后好了”却没有恢复前后证据，只能说明重载改变了状态，不能证明根因。
+
+## 十二、CherryUSB v1.6.1 的边界与目录
+
+MCU 侧对照固定使用 CherryUSB `v1.6.1`，提交 `c9625ffa773ad10b8824d1b5361bca2ccc1f3d1e`。
+
+该版本官方 Release 标记为冻结版本。
+
+CherryUSB 将实现拆成：
+
+- `core`：Device/Host 协议状态与对象。
+- `class`：CDC、MSC、HID、UVC/UAC 等类协议。
+- `port`：DCD/HCD 与具体 USB IP。
+- `osal`：线程、消息、信号量和临界区抽象。
+
+```mermaid
+flowchart TD
+    APP[MCU application] --> CLASS[CherryUSB class]
+    CLASS --> CORE[Device or Host core]
+    CORE --> OSAL[OSAL scheduling/synchronization]
+    CORE --> PORT[portable DCD/HCD contract]
+    PORT --> IP[MCU USB controller IRQ/FIFO/DMA]
+    IP --> WIRE[USB bus]
+```
+
+Linux 的 usbcore/HCD/Class Driver 与 CherryUSB 的层次可以对照，但不能逐函数等价。
+
+Linux 依赖设备模型、引用计数、DMA API 和通用 PM；MCU 栈通常由静态配置、RTOS 任务与芯片 port 承担更多边界。
+
+## 十三、DCD 把 Device Core 接到硬件事件
+
+Device Controller Driver 需要完成：
+
+- 控制器与 PHY 初始化。
+- EP0 Setup 接收。
+- Endpoint 配置、stall/clear 与启停。
+- FIFO/DMA 传输启动。
+- IRQ 中识别 reset、setup、transfer complete、suspend/resume。
+- 把事件上报 Device Core。
+
+`usb_dc_init()`、Endpoint start read/write 等接口体现 Core 与 Port 的合同。
+
+`usbd_initialize()` 启动 Device 栈后，描述符、Interface 与 Class 仍要按 EP0 状态机协作。
+
+DCD 调试首先证明硬件事件是否准确上报，再检查 Class 回调。
+
+如果 Bus Reset IRQ 都没有出现，修改 CDC ACM 描述符没有意义。
+
+## 十四、HCD 把 Host Core 接到 Root Hub 与 Pipe
+
+Host Controller Driver 需要提供：
+
+- Root Hub 端口状态、复位、供电与速度检测。
+- Control/Bulk/Interrupt/Isochronous Pipe 调度。
+- URB/请求提交、取消与完成。
+- 设备断开后的资源回收。
+- Split transaction、DMA/cache 等控制器特性。
+
+Host Core 通过 `usbh_initialize()` 建立枚举环境，通过 `usbh_submit_urb()` 等路径把请求交给 HCD。
+
+`CLASS_INFO_DEFINE` 等注册机制让枚举后的 Interface 匹配 Class Driver。
+
+MCU Host 常见问题是枚举任务、HCD IRQ 与 Class 线程之间的消息寿命不闭合。
+
+断开时若只释放设备对象、不先终止 HCD channel，延迟 IRQ 会访问已释放 context。
+
+## 十五、DMA、cache 与 IRQ 是 MCU 移植的高风险区
+
+无 cache MCU 上正常，不代表开启 D-cache 后仍正确。
+
+DMA OUT 前 CPU 写入的数据需要按平台规则 clean。
+
+DMA IN 后 CPU 读取前需要 invalidate，并考虑 cache line 对齐和相邻数据污染。
+
+描述符、buffer 与 DMA 地址必须满足控制器对齐要求。
+
+IRQ 与任务之间共享的完成标志、队列和对象需要临界区/OSAL 同步。
+
+不能用 `volatile` 代替所有权、内存屏障和缓存维护。
+
+调试时记录：
+
+- Buffer CPU 地址、DMA 地址、长度与对齐。
+- 提交前后 cache 操作。
+- IRQ 原始状态与清除顺序。
+- Core 收到的事件与请求 ID。
+- disconnect 后是否仍有完成事件。
+
+## 十六、Linux 与 CherryUSB 的证据对照
+
+| 问题 | Linux 6.12 | CherryUSB MCU |
+| --- | --- | --- |
+| 端口连接 | Root Hub sysfs、HCD trace | HCD root hub status/IRQ |
+| EP0 枚举 | usbmon、hub/config 日志 | Core log、Setup/Control event |
+| Interface 匹配 | modalias、driver link | Class registry/`CLASS_INFO_DEFINE` |
+| 数据请求 | URB submit/complete | `usbh_submit_urb` 或 DCD request |
+| DMA 错误 | IOMMU fault、DMA debug | cache log、控制器 DMA status |
+| 生命周期 | kref、KASAN、lockdep | OSAL queue、静态池、断开事件 |
+
+对照的价值是复用“分层证明”的方法，而不是把 Linux 命令照搬到 MCU。
+
+## 十七、一手资料与版本固定
+
+- [Linux 6.12 USB monitoring](https://www.kernel.org/doc/html/v6.12/usb/usbmon.html)
+- [Linux dynamic debug](https://docs.kernel.org/admin-guide/dynamic-debug-howto.html)
+- [Linux stable usbmon source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/usb/mon?h=linux-6.12.y)
+- [CherryUSB v1.6.1 source](https://github.com/cherry-embedded/CherryUSB/tree/v1.6.1)
+- [CherryUSB v1.6.1 release](https://github.com/cherry-embedded/CherryUSB/releases/tag/v1.6.1)
+
+后续若升级 CherryUSB，应重新核对 Core/Port API、cache 规则和 release note，不能只修改版本字符串。
+
+## 十八、小结
 
 USB 排错的核心是证据分层：先证明连接和角色，再证明 EP0 与描述符，再证明 Interface 绑定、URB、Class 协议和用户消费，最后处理 PM、热插拔和持续压力。每种工具只覆盖部分边界，错误码也必须放回请求阶段解释。
 

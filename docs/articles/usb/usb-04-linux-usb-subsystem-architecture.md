@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · USB 驱动开发实战 #02 · Linux USB 驱动框架"
-description: "上一讲我们把 USB 的整体架构和枚举流程搭起来了。这一讲进入真正的驱动开发核心：**Linux USB 驱动框架**。"
-pubDate: "2026-08-18"
+title: "嵌入式知识体系 · USB 驱动开发实战 #04 · Linux USB 子系统架构与调用路径"
+description: "以 Linux 6.12 为基线，解释 HCD、Root Hub、usbcore、设备模型、Interface Driver 与 Class Driver 的边界，并串起注册、枚举、匹配和 I/O 调用链。"
+pubDate: "2026-08-29"
 series: usb
-order: 2
-tags: ["USB", "Linux Driver"]
+order: 4
+tags: ["USB", "usbcore", "Linux 6.12"]
 draft: false
 ---
 上一讲已经说明：Host 通过 EP0 识别 Device，读取配置树并创建 Interface。Linux USB 驱动框架要解决的下一个问题是，如何把这棵协议对象树交给不同驱动管理，同时允许控制器、设备、用户进程和热插拔并发发生。
+
+本文所有对象与内部调用路径以 Linux 6.12 为基线。
 
 理解框架不能只背 `probe()` 和 `disconnect()`。需要先分清硬件控制器、HCD、usbcore、USB Device、Interface Driver 各自拥有的对象和责任，再沿一次绑定、数据提交、拔出与释放过程观察所有权如何变化。
 
@@ -218,7 +220,85 @@ cat /sys/kernel/debug/usb/devices
 - [Linux USB Power Management](https://docs.kernel.org/driver-api/usb/power-management.html)
 - [Writing USB Device Drivers](https://docs.kernel.org/driver-api/usb/writing_usb_driver.html)
 
-## 七、小结
+## 七、HCD 注册如何产生 Root Hub
+
+Host Controller 平台或 PCI 驱动先取得寄存器、IRQ、DMA、clock、reset 与 PHY 等资源。
+
+随后通过 `usb_create_hcd()` 创建 `struct usb_hcd`，填入控制器专用 `hc_driver` 操作，再调用 `usb_add_hcd()`。
+
+`usb_add_hcd()` 不只是注册一个中断。
+
+它把 HCD 加入 USB Core、初始化总线号与带宽信息、建立 Root Hub，并启动控制器。
+
+```mermaid
+sequenceDiagram
+    participant P as Platform/PCI HCD Driver
+    participant C as USB Core
+    participant H as usb_hcd
+    participant R as Root Hub
+    P->>C: usb_create_hcd
+    C-->>P: allocated usb_hcd
+    P->>C: usb_add_hcd
+    C->>H: reset/start hc_driver callbacks
+    C->>R: register root hub usb_device
+    R-->>C: port status/change service
+    C-->>P: HCD ready
+```
+
+Root Hub 没有通过外部 USB 线连接。
+
+HCD 用 hub status/control 回调模拟其 Class Request 与端口变化。
+
+usbcore 因而可以用近似统一的 Hub 状态机处理 Root Port 和外部 Hub。
+
+控制器驱动卸载时使用 `usb_remove_hcd()` 停止 Root Hub 与所有下游设备，再释放 `usb_hcd`。
+
+顺序错误会让下游 URB 在寄存器或 IRQ 已释放后仍到达 HCD。
+
+## 八、usb_bus_type 把 Interface 接入驱动模型
+
+枚举和 Configuration 激活后，每个 `usb_interface` 作为 `struct device` 发布到 `usb_bus_type`。
+
+`usb_device_match()` 根据 `usb_device_id`、动态 ID、授权与 Interface 条件判断匹配。
+
+匹配成功后，USB Core 的 probe 包装负责 PM 与序列化，再调用具体 `usb_driver.probe()`。
+
+```mermaid
+flowchart LR
+    ENUM[usb_set_configuration] --> ADD[device_add usb_interface]
+    ADD --> BUS[usb_bus_type]
+    BUS --> MATCH[usb_device_match]
+    MATCH --> WRAP[usb_probe_interface wrapper]
+    WRAP --> PROBE[usb_driver.probe]
+    PROBE --> CLASS[Input/TTY/SCSI/V4L2/ALSA/custom]
+    UNBIND[disconnect or driver unbind] --> DISC[usb_driver.disconnect]
+```
+
+Class Driver 与 Vendor Driver 都通过这一框架绑定。
+
+区别在于 ID 表和上层协议，不在于是否绕过 usbcore。
+
+同一 `usb_device` 下的多个 Interface 可以同时绑定不同驱动，HCD 对它们的 URB 统一调度。
+
+## 九、每层负责什么、不能负责什么
+
+| 层 | 拥有的事实 | 不应越界承担 |
+| --- | --- | --- |
+| HCD | 控制器队列、IRQ、DMA、Root Hub 端口 | HID/UVC 等业务解析 |
+| usbcore | 枚举、对象、匹配、URB 公共生命周期 | Vendor 消息语义 |
+| Interface Driver | 当前功能的端点、协议与用户接口 | 整条总线地址分配 |
+| Class Subsystem | Input/TTY/SCSI/V4L2/ALSA 抽象 | 控制器寄存器与 PHY |
+| 用户空间 | 策略、格式选择、业务数据 | 修复内核取消竞态 |
+
+分层不是为了画图。
+
+它直接决定故障应在哪一层修复。
+
+如果 Root Hub 没注册，修改 UVC Driver 没有意义。
+
+如果 usbmon 能看到正确 Report 而 Input Event 错误，PHY 与 HCD 已经不是首要怀疑对象。
+
+## 十、小结
 
 Linux USB Host 软件栈由 Host Controller、HCD、usbcore 和 Interface Driver 分层组成。驱动绑定的是功能 Interface，数据通过 URB 异步进入 HCD，热插拔则要求驱动把“软件对象仍被引用”和“硬件仍可访问”严格分开。
 
