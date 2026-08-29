@@ -17,6 +17,7 @@
 - Explain generic behavior against Linux 6.12 LTS and label RV1126 vendor-kernel differences separately.
 - Assume readers know C, Makefile, and common Linux commands but have no driver-development experience.
 - Use the teaching sequence: concrete problem, intuitive model, necessary kernel source, reproducible experiment, observed result, natural transition.
+- Number every prose H2 and H3 hierarchically when it exists: `## 1. Descriptive title` and `### 1.1 Descriptive title`, with each H3 aligned to its parent H2. This is structural numbering, not a process-step template, and it does not impose a minimum heading count.
 - Do not use article length, heading count, table count, code-block count, or diagram count as quality gates.
 - Do not restore the shared four-step template, repeated acceptance-question sections, or appended expansion prose.
 - Keep the current 28 published pages available until the final cutover.
@@ -186,10 +187,11 @@ The test scans `docs/drafts/linux-driver-textbook/*.md` if the folder exists. Ev
 - contain `series: linux-driver`, its manifest order, and `draft: true`;
 - avoid a duplicate H1 after frontmatter;
 - avoid `TBD`, `TODO`, `初学者扩展讲解`, `本章验收`, `验收问题`, and `建议保留`;
-- use fewer than four H2 headings containing `第一步/第二步/第三步/第四步`;
+- after fenced code is stripped, require each existing prose H2 to match `## <number>. <title>` and each existing prose H3 to match `### <parent>.<child> <title>`;
+- ignore heading-like lines inside fenced code when enforcing the numbering rule;
 - cite at least one Linux, kernel source, Devicetree, or official subsystem document.
 
-Do not test minimum lines, words, headings, tables, code blocks, or diagrams.
+Do not test minimum lines, words, headings, tables, code blocks, or diagrams. A draft with no H2 or H3 remains valid.
 
 - [ ] **Step 5: Run the new tests**
 

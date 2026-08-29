@@ -155,8 +155,14 @@ const validateDraft = (source, file, article) => {
   const body = withoutFencedCode(source.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, ''));
   assert.ok((body.match(/^#\s+/gm) ?? []).length <= 1, `${file} must have at most one H1`);
   assert.doesNotMatch(body, /TBD|TODO|初学者扩展讲解|本章验收|验收问题|建议保留/);
-  assert.ok((body.match(/^##\s+.*(?:第一步|第二步|第三步|第四步).*$/gm) ?? []).length < 4,
-    `${file} has too many numbered process H2 headings`);
+  for (const heading of body.match(/^##\s+.*$/gm) ?? []) {
+    assert.match(heading, /^## \d+\. /,
+      `${file} prose H2 headings must use hierarchical numbering`);
+  }
+  for (const heading of body.match(/^###\s+.*$/gm) ?? []) {
+    assert.match(heading, /^### \d+\.\d+ /,
+      `${file} prose H3 headings must use hierarchical numbering`);
+  }
   assert.match(source, /https?:\/\/(?:www\.)?(?:kernel\.org|docs\.kernel\.org|devicetree\.org|docs\.kernel\.org\/doc\/html\/latest\/)/,
     `${file} must cite an official Linux, kernel source, Devicetree, or subsystem document`);
 };
@@ -179,7 +185,7 @@ test('maps every historical slug to its exact redirect target', () => {
   assert.deepEqual(legacyRedirects, expectedRedirects);
 });
 
-test('accepts drafts without H1 and ignores headings inside fenced code', () => {
+test('accepts numbered prose H2 and H3 while ignoring fenced headings', () => {
   const source = `---
 series: linux-driver
 order: 1
@@ -187,13 +193,58 @@ draft: true
 ---
 This draft intentionally has no H1.
 
+## 1. Environment
+
+### 1.1 Build tree
+
 \`\`\`c
 # explanation
-## 第一步 implementation detail
+## unnumbered fenced H2
+### unnumbered fenced H3
 \`\`\`
 
 https://kernel.org/doc/html/latest/`;
   assert.doesNotThrow(() => validateDraft(source, plannedArticles[0].file, plannedArticles[0]));
+});
+
+test('accepts drafts with no prose H2 or H3', () => {
+  const source = `---
+series: linux-driver
+order: 1
+draft: true
+---
+This draft intentionally has no section headings.
+
+https://kernel.org/doc/html/latest/`;
+  assert.doesNotThrow(() => validateDraft(source, plannedArticles[0].file, plannedArticles[0]));
+});
+
+test('rejects an unnumbered prose H2', () => {
+  const source = `---
+series: linux-driver
+order: 1
+draft: true
+---
+## Environment
+
+https://kernel.org/doc/html/latest/`;
+  assert.throws(() => validateDraft(source, plannedArticles[0].file, plannedArticles[0]),
+    /prose H2 headings must use hierarchical numbering/);
+});
+
+test('rejects an unnumbered prose H3', () => {
+  const source = `---
+series: linux-driver
+order: 1
+draft: true
+---
+## 1. Environment
+
+### Build tree
+
+https://kernel.org/doc/html/latest/`;
+  assert.throws(() => validateDraft(source, plannedArticles[0].file, plannedArticles[0]),
+    /prose H3 headings must use hierarchical numbering/);
 });
 
 test('rejects duplicate prose H1 headings', () => {
