@@ -1,501 +1,244 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #16 · Linux PCI Endpoint Framework：EPC、EPF、BAR 与 MSI-X"
-description: "以 Linux 6.12 为基线，系统拆解 PCI Endpoint Controller、Endpoint Function、ConfigFS 绑定、BAR 空间、地址窗口、DMA、Linkup、MSI/MSI-X 和解绑清理。"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #16 · Linux PCI Endpoint Framework"
+description: "从 Linux SoC 怎样扮演 Endpoint 出发，讲清 EPC、EPF、EPF Driver、ConfigFS 与 Host Driver 的协作，并用 pci_epf_test 串起 BAR、地址转换、DMA、MSI/MSI-X、Link 与 unbind。"
 pubDate: "2026-08-29"
 series: pcie
 order: 16
-tags: ["PCIe", "Endpoint Framework", "Linux 6.12"]
+tags: ["PCIe", "Endpoint Framework", "EPC", "EPF", "Linux 6.12"]
 draft: false
 ---
 
-多数 PCIe Linux Driver 运行在 Root Complex 一侧，管理被枚举的 Endpoint。
+第 15 篇让 Linux SoC 充当 Root Complex，主动枚举外部设备。某些产品恰好相反：一个运行 Linux 的 SoC、FPGA SoC 或加速卡需要插入外部主机，向 Host 暴露 Configuration Space、BAR、IRQ 和数据通道。问题变成：Linux 怎样让自己扮演 PCIe Endpoint？
 
-但一些 SoC/FPGA 也能工作在 Endpoint 模式，让另一台 Host 把它枚举成网卡、加速器、共享内存或自定义设备。
+Endpoint 模式同时包含控制器硬件和要暴露的 Function 业务。若每个产品都在 Controller Driver 中硬编码 VID/DID、BAR 和测试协议，代码无法复用。Linux PCI Endpoint Framework 因此把硬件能力抽象为 EPC，把业务 Function 抽象为 EPF，再用 ConfigFS 在运行时组合。
 
-Endpoint 侧需要完成：
+本文以 Linux 6.12 为基线，使用主线 `pci_epf_test`/Host `pci_endpoint_test` 解释协作。仓库中的 `pci_epf_teaching.c` 是原创教学协议，只有目标 SoC Controller 真正支持 EP Mode 时才能运行。
 
-- 构造 Configuration Header 和 Capability。
-- 提供 BAR Backing Memory。
-- 配置 Inbound/Outbound Address Translation。
-- 响应 Linkup/Reset/Unbind。
-- 向 Host 触发 Legacy/MSI/MSI-X Interrupt。
-- 在 DMA 前确认 Host 提供的地址和所有权。
+## 一、先看问题：谁负责配置空间，谁负责业务
 
-Linux PCI Endpoint Framework 把 Controller IP 与 Function 功能分开。
-
-本文固定以 Linux 6.12 为基线。
-
-## 一、Endpoint Framework 的三类角色
-
-PCI Endpoint Controller（EPC）Driver 管理具体 EP Controller IP。
-
-PCI Endpoint Function（EPF）Driver 实现一个可枚举 Function 的功能语义。
-
-ConfigFS/用户配置把某个 EPF 实例绑定到某个 EPC Function Number。
+一个 Endpoint 要完成四件事：让 Host 枚举出 Function，为 BAR 提供可访问 Backing Memory，把 Host/EP 地址相互转换，并向 Host 发出 Legacy/MSI/MSI-X 通知。控制器 IP 知道怎样编程这些硬件，却不知道产品要暴露什么业务。
 
 ```mermaid
 flowchart TD
-    HW[Endpoint Controller IP] --> EPCD[EPC Driver]
-    EPCD --> EPC[struct pci_epc]
-    EPFD[EPF Driver] --> EPF[struct pci_epf]
-    CFG[ConfigFS instance/link] --> EPF
-    CFG --> BIND[bind EPF to EPC function]
-    EPC --> BIND
-    BIND --> LINK[PCIe Link to external Root Complex]
+    EPCDRV[Endpoint Controller driver] --> EPC[pci_epc]
+    EPFDRV[Endpoint Function driver] --> EPF[pci_epf]
+    CFG[ConfigFS instance] --> EPF
+    EPF --> BIND[bind EPF to EPC]
+    BIND --> HEADER[configuration header]
+    BIND --> BAR[BAR backing and mapping]
+    BIND --> IRQ[MSI / MSI-X]
+    HOST[Host PCI driver] --> BAR
+    HOST --> IRQ
 ```
 
-EPC Driver 不应内置每个产品功能协议。
+EPC Driver 负责硬件能力和操作，例如写 Configuration Header、设置/清除 BAR、配置 Address Translation、启动/停止 Link、Raise IRQ。EPF Driver 负责 Function 语义，例如 Vendor/Device/Class、BAR 中的 Register Protocol、Command 和 Data Buffer。
 
-EPF Driver 不应直接操作某个控制器私有寄存器。
+因为两者职责不同，同一个 EPC 可以绑定测试 Function、NTB Function 或自定义加速器 Function；同一个 EPF 理论上也可以运行在不同支持能力的 Controller 上，但必须查询并适配 BAR Size、Alignment、MSI-X 和 Address Window 限制。
 
-两者通过 `pci_epc_*` 公共 API 协作。
+## 二、EPC 表示 Endpoint Controller 硬件
 
-## 二、struct pci_epc 表示控制器能力与资源
+`struct pci_epc` 是 Endpoint Controller 的核心对象，Controller Driver 注册 `pci_epc_ops`，把通用 Framework Request 转换成具体 IP Register/ATU 操作。
 
-`struct pci_epc` 由 EPC Driver 创建和注册。
+常见 Operation 类别包括：
 
-它关联：
+| Operation | 解决的问题 |
+| --- | --- |
+| `write_header` | 把 VID/DID/Class 等写入 Function Configuration Header |
+| `set_bar` / `clear_bar` | 让 Host BAR Access 命中 EP Local Memory |
+| `map_addr` / `unmap_addr` | 让 EP 主动访问 Host Address |
+| `set_msi` / `get_msi` | 配置和查询 MSI 能力 |
+| `set_msix` / `get_msix` | 配置 MSI-X Table Size/能力 |
+| `raise_irq` | 产生 Legacy/MSI/MSI-X 通知 |
+| `start` / `stop` | 控制 Link/Controller 运行 |
 
-- `pci_epc_ops`：write_header、set_bar、clear_bar、map_addr、unmap_addr、raise_irq、start/stop 等。
-- 最大 Function/Virtual Function 数。
-- BAR 限制与 Features。
-- Address Space 分配器。
-- Controller Device 与 ConfigFS Group。
+通用 EPF 不应直接写 DesignWare、Rockchip 或其他 Controller Register，因为这样会绕过 Capability/Window 管理。它通过 `pci_epc_*()` API 请求硬件动作，EPC Driver 再决定是否支持与如何实现。
 
-EPC Driver 在 probe 中取得寄存器、clock、reset、PHY、IRQ、Power Domain 与 ATU Window。
+## 三、EPF 表示一个可以暴露给 Host 的 Function
 
-只有 Controller 硬件就绪后才注册 EPC。
+`struct pci_epf` 保存 Function Instance、Header、BAR、EPC Binding 和 EPF Driver Data。EPF Driver 的 `probe()` 创建 Function 私有对象，`bind()` 在绑定到 EPC 时配置硬件，`unbind()` 负责停止并解除所有关系。
 
-remove 时先停止 Link/解绑 EPF，再注销 EPC 和释放寄存器。
+```text
+EPF driver probe
+  -> allocate software instance
+  -> wait for ConfigFS binding
 
-## 三、struct pci_epf 表示一个 Function 实例
-
-`struct pci_epf` 由 EPF Core/Driver 创建。
-
-它保存：
-
-- Function Name/Driver。
-- `pci_epf_header` 配置头模板。
-- BAR Descriptor/Backing Memory。
-- 绑定的 EPC 与 Function Number。
-- Primary/Secondary Interface（某些控制器支持）。
-- Function 私有数据。
-
-同一种 EPF Driver 可以创建多个实例，分别绑定不同 EPC 或 Function Number。
-
-实例私有内存不能放在全局静态变量中，否则多个实例会互相覆盖。
-
-## 四、EPF Driver 的 probe、bind 与 unbind
-
-EPF Driver 典型 callback：
-
-- `probe()`：为 EPF 实例分配软件私有对象。
-- `bind()`：已选择 EPC/FN，配置 Header、BAR 与 Controller 资源。
-- `unbind()`：撤销 Controller 资源和数据面。
-
-```mermaid
-stateDiagram-v2
-    [*] --> Created: ConfigFS creates EPF instance
-    Created --> Probed: EPF driver probe
-    Probed --> Bound: ConfigFS link invokes bind
-    Bound --> Linkup: external RC trains/enumerates
-    Linkup --> Running: host protocol starts
-    Running --> Bound: linkdown/reset
-    Bound --> Probed: ConfigFS unlink invokes unbind
-    Probed --> Removed: instance removed
-    Removed --> [*]
+EPF bind to EPC
+  -> query EPC features
+  -> write configuration header
+  -> allocate BAR backing
+  -> pci_epc_set_bar
+  -> configure IRQ and protocol state
+  -> wait for link / host commands
 ```
 
-probe 时通常还不知道绑定哪个 EPC，因此不能调用 EPC 硬件 API。
+EPF `probe()` 与 `bind()` 不能混为一谈。Probe 只表示 EPF Driver 与一个软件 Function Instance 匹配，EPC 可能尚未选择；Bind 后才有具体 Controller、Function Number 和硬件资源，因此 BAR/IRQ 通常在 Bind 阶段建立。
 
-bind 才是 Controller Resource 的获取边界。
+## 四、ConfigFS 把“创建 Function”和“绑定控制器”分开
 
-unbind 必须能在 Host 仍有 open driver、Link 已掉或 DMA 异常的情况下安全收敛。
+Endpoint ConfigFS 通常暴露 Function Driver、Controller 和 Link：用户先创建一个 Function Instance，再把它 Link 到某个 EPC，配置允许的属性后启动 Controller。
 
-## 五、Configuration Header 由 EPF 提供语义
+代表性流程如下，路径名称以实际 Kernel Config 和 Driver 为准：
 
-EPF 使用 `struct pci_epf_header` 描述：
+```bash
+mount -t configfs none /sys/kernel/config
+cd /sys/kernel/config/pci_ep
 
-- Vendor/Device ID。
-- Revision ID。
-- Class Code/Programming Interface。
+mkdir functions/pci_epf_test/func1
+ln -s functions/pci_epf_test/func1 controllers/<epc-name>/
+echo 1 > controllers/<epc-name>/start
+```
 
-Subsystem 与 Capability 的支持方式取决于 Framework/API 和 Controller 能力。
+因为 ConfigFS Link 表示 Binding，删除 Symbolic Link 会触发 `unbind()`。用户不能在 Host 仍运行测试或 DMA 时直接解绑；EPF 必须先拒绝新命令、停止 DMA/IRQ，再 Clear BAR 和 Free Memory。
 
-bind 中通过 `pci_epc_write_header()` 把 Function Header 交给 EPC。
+ConfigFS 是组装和生命周期接口，不是数据平面。高频业务命令应通过 BAR Queue、Shared Memory 或 DMA Protocol 完成，不能把每个请求都变成 ConfigFS File Operation。
 
-Host 枚举时读取的是 Controller 暴露的配置空间结果。
+## 五、Configuration Header 让 Host 识别 Function
 
-Class Code 会影响 Host 自动加载何种 Driver，不能随意填写。
+EPF 定义 Vendor ID、Device ID、Revision、Class Code、Subsystem ID 和 Interrupt Pin 等 Header Field，Bind 时由 `pci_epc_write_header()` 写入 Controller 能响应的 Configuration Space。
 
-自定义实验 Function 应使用合法 Vendor/Device ID 策略，避免冒充真实产品。
+Host 枚举时先读取这些标准字段，再执行 BAR sizing 和 Capability 解析。因此 Header 必须在 Link/Enumeration 前准备好；若 Host 已经枚举后再修改 ID，可能需要受控 Rescan/Reset，不能期待 Driver Model 自动把已有 Function 当成新设备。
 
-## 六、BAR 有三层含义
+多 Function Endpoint 还要管理 Function Number、BAR/IRQ Resource 与 Controller Capability。不同 Function 的 Header 和 BAR 独立，但 Controller 的 Address Window、MSI-X Table 和 DMA Engine 可能共享。
 
-谈 Endpoint BAR 时必须区分：
+## 六、BAR 同时包含 Host 窗口、EP Backing 和地址转换
 
-1. Host 配置空间中的 BAR Register/Address。
-2. Endpoint Controller 的 Inbound Translation Window。
-3. Endpoint 本地 Backing Memory/Registers。
-
-Host 为 BAR 分配 PCI Address。
-
-Host 对该地址发 Memory TLP。
-
-EPC 把 TLP 地址翻译到 EP 本地 Backing Memory。
+EP 模式下，一个 BAR 至少有三层含义：Host 为 Function 分配 PCI Address；EPC 让该 BAR Match 指向某个 EP Local Address；EPF 分配/定义 Backing Memory 中的 Register/Data Protocol。
 
 ```mermaid
 flowchart LR
-    HOST[Host CPU MMIO address] --> TLP[PCIe Memory Read/Write TLP]
-    TLP --> BAR[Function BAR match]
-    BAR --> IB[Endpoint inbound translation]
-    IB --> LOCAL[EP local BAR backing memory]
-    LOCAL --> FUNC[EPF protocol/register/shared buffer]
+    HOSTVA[Host driver ioremap address] --> HOSTPA[Host PCI window]
+    HOSTPA --> TLP[PCIe Memory Request]
+    TLP --> BAR[Endpoint BAR match]
+    BAR --> IN[EP inbound translation]
+    IN --> BACK[EPF backing memory / registers]
 ```
 
-`pci_epc_set_bar()` 配置这一 Host 可见窗口。
+EPF 可以使用 `pci_epf_alloc_space()` 分配满足 EPC Alignment/Size 的 BAR Space，再填写 `struct pci_epf_bar`，调用 `pci_epc_set_bar()` 建立硬件映射。失败时必须 Free Space，不能保留一个 Host 能枚举但没有合法 Backing 的 BAR。
 
-它不会自动给 Endpoint 一个可 DMA 到 Host RAM 的地址。
+BAR Size 常要求 2 的幂和特定 Alignment，Controller 还可能限制 64-bit/Prefetchable/Fixed Size。EPF 应查询 `pci_epc_features`，而不是假设任何 BAR 都能配置任意大小。
 
-## 七、BAR Size、Alignment 与 Controller Feature
+## 七、EP 主动访问 Host 需要 Outbound Mapping
 
-EPF 不能任意请求 BAR Size。
-
-PCI BAR 一般要求 2 的幂和相应对齐，最小大小受类型/规范约束。
-
-Controller 还可能限制：
-
-- 哪些 BAR 可用。
-- Fixed Size/Reserved BAR。
-- 32-bit/64-bit。
-- Prefetchable 属性。
-- BAR Pair。
-- 最小/最大 Inbound Window。
-
-EPF 应通过 `pci_epc_get_features()` 获取 EPC Feature，并调整 BAR 设计。
-
-如果 Controller 要求 1 MiB 对齐，而 Function 只申请 4 KiB，bind 应明确失败或按 Framework 规则调整，不能静默越界映射。
-
-## 八、分配 BAR Backing Memory
-
-Endpoint Framework 提供 `pci_epf_alloc_space()`/`pci_epf_free_space()` 等帮助 Function 分配适合 BAR 的空间。
-
-返回 CPU 可访问地址和物理/Controller 所需信息由 API 管理。
-
-BAR 内容可设计为：
-
-- 版本与 Capability Register。
-- Command/Status Ring。
-- Doorbell/Interrupt Control。
-- 小块 Shared Memory。
-
-不要把无限大的数据 Buffer 都塞进 BAR。
-
-BAR MMIO 适合控制面和有限共享窗口，大数据常用 DMA 到 Host Buffer。
-
-## 九、Inbound 与 Outbound Translation 是两个方向
-
-Inbound：Host 发 TLP 访问 EP BAR，转换到 EP Local Address。
-
-Outbound：EP 发 Memory TLP 访问 Host 提供的 PCI Address。
-
-```mermaid
-flowchart TD
-    HMMIO[Host MMIO to EP BAR] --> IN[Inbound ATU]
-    IN --> ELOCAL[Endpoint local memory]
-    EDMA[Endpoint DMA/master request] --> OUT[Outbound ATU]
-    OUT --> HRAM[Host RAM DMA address]
-```
-
-`pci_epc_map_addr()`/`pci_epc_unmap_addr()` 管理 EP Local Address 到 PCI Address 的 Outbound Mapping（具体约束看 EPC）。
-
-Host RAM Address 必须由 Host Driver 通过 DMA API 获得并通过双方协议传给 EP。
-
-不能把 Host CPU Virtual Address 或任意 Physical Address写给 EP。
-
-## 十、Host DMA Address 是不可信协议输入
-
-Host Driver 可能通过 BAR Register/Command Descriptor 告诉 EP：
-
-- DMA Address。
-- Length。
-- Direction。
-- Request ID/Generation。
-
-Endpoint 必须验证：
-
-- Length 上限与对齐。
-- Address 是否满足 EPC/DMAC 位宽。
-- Range 加法不溢出。
-- Request 状态与所有权。
-- IOMMU/PASID 等高级模式是否真的协商。
-
-EP 不能知道 Host IOMMU Mapping 的真实边界，只能依赖 Host Driver 的正确 DMA API 与协议隔离。
-
-产品协议应使用 Capability、Queue Bounds 和认证/隔离降低错误/恶意 Host 风险。
-
-## 十一、Endpoint DMA 的两种实现路径
-
-有些 EPC 包含 DMA Engine。
-
-有些 SoC 使用通用 DMAengine Controller。
-
-还有些 EP 通过 CPU/PIO 访问 Window，仅适合小数据。
-
-无论实现，状态机都应包含：
+Host 访问 EP BAR 使用 Inbound Path；EP DMA Engine 主动访问 Host Memory 时，需要 Host 提供 DMA/PCI Address，并由 EPC 建立 EP Local Address 到 Host PCI Address 的 Outbound Mapping。
 
 ```text
-HOST_OWNS_BUFFER
-  -> EP maps outbound window
-  -> EP DMA in flight
-  -> EP unmaps window
-  -> EP publishes completion
-  -> HOST reclaims buffer
+EP local DMA address
+  -> EPC outbound address window
+  -> PCIe Memory Request to Host address
+  -> Host IOMMU / memory system
 ```
 
-Completion 前必须确保 DMA 写完成并具有正确内存序。
+EPF 不能把 Host Virtual Pointer 当成 PCI Address。Host Driver 必须通过自己的 DMA API 准备 Host Buffer，并按测试协议把 DMA Address 告诉 EP；平台是否经过 IOMMU、地址宽度和一致性都属于 Host DMA Contract。
 
-Host 收到 MSI-X 后也要 `dma_rmb()`/DMA API 同步再读结果。
+Mapping Window 数量有限，因此每次传输动态 Map/Unmap 可能成为瓶颈。产品协议可以固定 Shared Window、Batch Transfer 或 Controller DMA Engine，但必须在 Reset/Unbind 时先停止访问再撤销 Mapping。
 
-## 十二、MSI 与 MSI-X 的产生
+## 八、MSI/MSI-X 是 EP 向 Host 发布完成的方式
 
-Host 枚举时配置 MSI/MSI-X Capability、Message Address/Data 或 Table。
-
-Endpoint Function 通过 EPC API 请求发中断：
-
-```c
-pci_epc_raise_irq(epc, func_no, vfunc_no,
-		  PCI_IRQ_MSIX, interrupt_number);
-```
-
-Linux 6.12 的准确原型与枚举值以头文件为准。
-
-EPF 不能假设 Host 已启用某种中断。
-
-它应根据 EPC/Host 协议状态决定 Legacy、MSI 或 MSI-X。
-
-MSI-X Vector Number、Queue 与 Host Driver IRQ Mapping 必须在双方协议中一致。
-
-## 十三、中断发布前的数据可见性
-
-EP DMA 写 Host Completion Buffer 后，必须先确保数据完成/可见，再 Raise MSI-X。
-
-Host IRQ Handler 观察中断后，要按 DMA API 与共享协议读取 Completion。
+EPF 可以通过 `pci_epc_raise_irq()` 请求 EPC 产生 Legacy、MSI 或 MSI-X。Host 必须已经在 Configuration Space 中 Enable 对应 Capability，EPF 也要查询实际 Vector 数量。
 
 ```mermaid
 sequenceDiagram
-    participant EP as Endpoint Function
-    participant DMA as EP DMA Engine
-    participant MEM as Host DMA Memory
-    participant EPC as Endpoint Controller
-    participant HD as Host Driver
-    EP->>DMA: start transfer to host DMA address
-    DMA->>MEM: write payload/completion
-    DMA-->>EP: transfer complete
-    EP->>EP: publish barrier/order
-    EP->>EPC: raise MSI-X vector
-    EPC-->>HD: PCIe MSI-X message
-    HD->>HD: dma_rmb / DMA sync
-    HD->>MEM: consume completion
+    participant HOST as Host driver
+    participant BAR as EPF command/status BAR
+    participant EPF as Endpoint function
+    participant EPC as Endpoint controller
+    HOST->>BAR: write command and host DMA address
+    EPF->>EPF: execute transfer and publish status
+    EPF->>EPC: pci_epc_raise_irq MSI/MSI-X
+    EPC-->>HOST: PCIe interrupt message
+    HOST->>BAR: read completion/status
 ```
 
-如果中断先于数据可见，Host 会读到旧 completion，形成偶发错误。
+中断前必须先发布 Completion/Data，再 Raise IRQ；Host Handler 收到通知后仍要读取 Status 或 Completion Queue。因为 MSI/MSI-X 只是通知，丢失/合并/Mask 情况下协议还需要 Poll 或 Sequence Number 保证可恢复。
 
-## 十四、Linkup、Linkdown 与 Core Event
+MSI-X Table/PBA 的物理实现受 EPC 控制器能力影响。EPF 请求 `MSI-X` 不等于所有 Controller 都能支持足够 Vector；无法满足时应明确失败或降级，而不是伪造成功。
 
-EPC Driver 在 Link 训练完成后通知 Endpoint Core/EPF。
+## 九、pci_epf_test 把控制面与数据面放在 BAR 中
 
-EPF 可在 Linkup 后开放协议，但不能假设 Host 已完成枚举和 Driver Probe。
-
-Host 何时写 Command/Enable/Queue Register 才是业务就绪信号。
-
-Linkdown 时：
-
-- 阻止新 EP DMA。
-- 停止/取消在途 DMA。
-- 清理 Outbound Mapping。
-- 增加 generation。
-- 不再 Raise Interrupt。
-- 等待下一次 Host 初始化。
-
-Linkup 与业务 Running 是两层状态。
-
-## 十五、ConfigFS 绑定流程
-
-典型 ConfigFS 语义：
-
-1. 在 `pci_ep/functions/<driver>.<instance>` 创建 EPF Instance。
-2. 配置 Vendor/Device/Class/BAR 等允许属性。
-3. 在 `pci_ep/controllers/<epc>/` 下建立链接，把 EPF 绑定到 Function Number。
-4. 根据 Controller 接口执行 start/link。
-
-具体目录和属性以 Linux 6.12 Endpoint ConfigFS 文档为准。
-
-ConfigFS 操作会触发 probe/bind/unbind，属于真实硬件生命周期，不是静态配置文件编辑。
-
-删除链接前应先让 Host Driver 停止业务，避免 Surprise Removal 与 DMA。
-
-## 十六、unbind 的正确顺序
-
-EPF `unbind()`：
-
-1. 标记 Function stopping，拒绝 Host 新命令。
-2. 停止 timer/work/thread。
-3. 停止并同步 DMA。
-4. 确认不再访问 Host Memory。
-5. 停止中断产生。
-6. `pci_epc_unmap_addr()` 撤销所有 Outbound Window。
-7. `pci_epc_clear_bar()` 撤销 Inbound BAR。
-8. `pci_epf_free_space()` 释放 BAR Backing。
-9. 清除 EPC/Function 关联与私有状态。
-
-```mermaid
-flowchart TD
-    U[ConfigFS unlink/unbind] --> BLOCK[block new host commands]
-    BLOCK --> DMA[quiesce and sync DMA]
-    DMA --> IRQ[stop MSI/MSI-X]
-    IRQ --> OUT[unmap outbound windows]
-    OUT --> BAR[clear BAR mappings]
-    BAR --> FREE[free EPF space/private resources]
-```
-
-先 free BAR Backing 再 clear BAR，会让 Host TLP 访问已释放内存。
-
-先 unmap Outbound 再停 DMA，会让在途 DMA 使用失效 Window。
-
-## 十七、Reset 与 PERST#
-
-外部 Host 可通过 PERST# 执行 Fundamental Reset，或触发 Hot Reset/FLR。
-
-EPC Driver 负责检测硬件事件并通知 Framework。
-
-EPF 必须把 reset 视为业务状态丢失：
-
-- 停止 DMA。
-- 清 Queue/Request。
-- 增加 generation。
-- 恢复 Header/BAR/Capability（按 EPC 行为）。
-- 等待 Host 重新配置和启用。
-
-不能在 PERST# Assert 时继续访问 Host Memory。
-
-Host IOMMU Mapping 可能已经撤销。
-
-## 十八、一个最小共享内存 Function 的协议
-
-可定义 BAR0 Control Page：
+主线 `pci_epf_test` 定义一组测试 Register/Command，让 Host `pci_endpoint_test` Driver 可以请求 BAR Read/Write/Copy、IRQ 和其他验证。它的价值是提供一条双方都公开的测试协议，而不是用未知设备私有寄存器猜测。
 
 ```text
-0x000 VERSION
-0x004 CAPABILITY
-0x008 COMMAND
-0x00c STATUS
-0x010 HOST_DMA_ADDR_LO
-0x014 HOST_DMA_ADDR_HI
-0x018 LENGTH
-0x01c REQUEST_ID
-0x020 GENERATION
-0x024 DOORBELL
+Host pci_endpoint_test
+  -> writes test command, size, source/destination/checksum
+  -> Endpoint pci_epf_test observes command
+  -> performs memory operation / DMA when supported
+  -> writes status/checksum
+  -> raises selected IRQ type
+  -> Host validates data and status
 ```
 
-状态机：
+这是一套 Framework 验证工具，不等于产品协议。产品通常还要定义 Version、Feature Negotiation、Queue、Timeout、Reset Generation、Security 和 Backpressure；但它非常适合证明 BAR、Address Translation、DMA 和 Interrupt 的底层路径。
 
-1. Host 读取 Version/Capability。
-2. Host 用 DMA API 分配/映射 Buffer。
-3. Host 写 Address/Length/ID/Generation。
-4. Host Barrier 后写 Doorbell。
-5. EP 验证并执行 DMA。
-6. EP 写 Status/Bytes，Barrier 后 Raise MSI-X。
-7. Host 消费、unmap/free。
+## 十、Linkup、Core Init 与 Host 枚举需要时序协调
 
-寄存器只是教学协议，真实产品需定义字节序、并发、超时、安全和 reset。
+有些 EPC 能在 Link Up 后通知 EPF，有些 Function 需要在 Core Init/Bind 时先准备 Header/BAR。EPF Driver 要遵守 Controller Feature 中的 Linkup Notifier/CORE_INIT_NOTIFIER 能力，不能假设所有平台回调顺序相同。
 
-## 十九、EPC Driver 与 EPF Driver 的错误边界
+Host 可能在 Link Up 后很快发 Configuration Read，因此 Header/BAR Capability 必须在允许 LTSSM/Start 之前就绪。反方向，Host Driver 写 BAR 命令前又必须等待枚举、Resource 分配和 Driver Probe 完成。
 
-EPC Driver 错误：
+Reset/PERST# 会让 Configuration/Link State变化，EPF 要停止正在进行的事务并重建必要硬件。只在首次 Bind 初始化一次，无法应对 Host Reboot 或 Hot Reset。
 
-- ATU Window 编程不正确。
-- BAR Feature/Alignment 报告错误。
-- Link Event 丢失。
-- Raise IRQ 实现错误。
-- Controller PM/Reset 不完整。
+## 十一、Host Driver 是协议的另一半
 
-EPF Driver 错误：
+Host 端仍是普通 `pci_driver`：匹配 EPF 暴露的 VID/DID，Enable、Request/Iomap BAR，申请 IRQ，使用 DMA API准备 Host Buffer，再按 BAR Protocol 与 EP 协作。
 
-- Host 命令验证不足。
-- DMA/Request 所有权错误。
-- unbind 未同步 work/DMA。
-- 中断与 Completion 可见顺序错误。
-- generation/reset 协议不完整。
+```mermaid
+flowchart LR
+    HPROBE[Host PCI probe] --> HBAR[request and iomap BAR]
+    HBAR --> HIRQ[allocate IRQ vectors]
+    HIRQ --> HDMA[map host test buffer]
+    HDMA --> CMD[write EPF command]
+    CMD --> WAIT[wait IRQ / poll status]
+    WAIT --> CHECK[verify result and checksum]
+```
 
-先用 Framework 自带 Test Function/Host Test Driver 验证 EPC，再调产品 EPF，可以缩小边界。
+因为 EP 与 Host 是两个独立 Kernel/Address Space，日志必须统一 Request ID 和时间。只看 EP `command received`，不能证明 Host Completion Handler 正常；只看 Host IRQ 增长，也不能证明 EP DMA Data 正确。
 
-## 二十、性能设计
+## 十二、unbind 必须先停止 Host 可见行为
 
-高吞吐 EPF 应考虑：
+解绑顺序从 Host 仍可能做什么来推导：先让协议拒绝新命令，停止 EP DMA/Worker，Mask/取消 IRQ，等待在途请求结束或标记失败，再撤销 Outbound Mapping、Clear BAR、Free BAR Space 和私有对象。
 
-- Multi-queue 与多个 MSI-X。
-- Descriptor Ring 而不是单命令寄存器。
-- Outbound Window 数量/大小。
-- DMA Engine 并发 Channel。
-- Doorbell Batching。
-- Host NUMA/IOMMU。
-- BAR Control 与 DMA Data 分离。
-- Queue Reset 与 Fault Isolation。
+```text
+mark function stopping
+  -> reject new BAR commands
+  -> stop DMA and workers
+  -> synchronize completion / IRQ generation
+  -> unmap outbound host address windows
+  -> pci_epc_clear_bar
+  -> pci_epf_free_space
+  -> detach from EPC
+```
 
-先测量 Controller/IP 的真实 Window、DMA 和 Link 能力，再决定 Queue 数。
+若先 Clear BAR，Host 仍在 Poll/写命令会收到 Unsupported/Abort；若先 Free Backing，Inbound Window 可能继续指向已复用内存。因此 `unbind()` 必须覆盖 Host 可见性和 EP 本地异步上下文。
 
-## 二十一、验证矩阵
+## 十三、调试要同时看 Host、Link 与 EP
 
-- Cold Boot、Host Reboot、EP Reboot。
-- PERST# Assert/Deassert。
-- ConfigFS bind/unbind 重复。
-- Host Driver load/unload。
-- Linkdown during DMA。
-- Host timeout/reset during EP DMA。
-- MSI/MSI-X Vector 数变化。
-- IOMMU On/Off。
-- Length/Address overflow 输入。
-- Queue Full 与 generation wrap。
-- Runtime/System PM（若 EPC 支持）。
+Endpoint Framework 故障可以分成：Host 看不到 Function、能枚举但 BAR 失败、BAR 命令可写但 EP 不处理、DMA Fault/数据错误、IRQ 不到、Reset/Unbind Hang。每层需要不同证据。
 
-每次都确认不再存在旧 DMA、旧 Mapping、旧 MSI 和已释放 BAR 访问。
+| 现象 | 先检查 |
+| --- | --- |
+| Host 无 BDF | EP Power/Clock/PERST#/LTSSM/Header |
+| BAR unassigned | EPF BAR Size/Feature、Host Window |
+| BAR 读写异常 | EPC Inbound Translation、Backing/Cache Attribute |
+| EP DMA Fault | Outbound Mapping、Host DMA Address/IOMMU |
+| IRQ 不到 | Host Enable、EPC Raise、Vector/Mask、Status 发布 |
+| unbind Hang | 在途 DMA、Worker、Host 仍提交、Mapping 引用 |
 
-## 二十二、Linux 6.12 源码入口
+因此日志至少包含 EPC、EPF Instance、Function、BAR、Request ID、Host DMA Address、IRQ Type/Vector、Generation 和时间戳。单边日志无法证明跨机器协议完成。
 
-- `include/linux/pci-epc.h`
-- `include/linux/pci-epf.h`
-- `drivers/pci/endpoint/pci-epc-core.c`
-- `drivers/pci/endpoint/pci-epf-core.c`
-- `drivers/pci/endpoint/pci-ep-cfs.c`
-- `drivers/pci/endpoint/functions/pci-epf-test.c`
-- 具体 Controller 的 EPC Driver
+## 十四、本篇检查点
 
-以 Core API 调用边界追踪，不要从某个 Controller 寄存器文件反推所有 EPF 语义。
+现在应当能够区分 EPC、EPF、EPF Driver、ConfigFS 和 Host Driver，并按 Bind 顺序讲出 Header、BAR Backing、`pci_epc_set_bar()`、Address Translation 和 IRQ 如何建立。
 
-## 二十三、一手资料
+还应能解释 Host BAR Access 与 EP Outbound DMA 是两个方向，MSI/MSI-X 只通知完成，`pci_epf_test` 是公开测试协议而非产品模板，以及为什么 `unbind` 必须先停止 Host 可见行为。
+
+## 十五、小结：下一篇把单队列扩展成高吞吐产品路径
+
+Linux Endpoint Framework 用 EPC 隔离控制器硬件，用 EPF 表达 Function 业务，用 ConfigFS 组装实例，再由 Host Driver 完成协议另一半。BAR、Address Translation、DMA 和 IRQ 都在双方明确 ownership 后才能安全工作。
+
+下一篇回到 Host 数据路径，比较网卡和 NVMe 如何把单 Ring 扩展成 Multi-Queue：Queue、MSI-X Vector、CPU Affinity、Doorbell Batch、Backpressure、NUMA 和 Reset Scope 怎样共同决定吞吐与 P99。
+
+**一手资料**
 
 - [Linux 6.12 PCI Endpoint Framework](https://www.kernel.org/doc/html/v6.12/PCI/endpoint/pci-endpoint.html)
-- [Linux PCI Endpoint ConfigFS](https://docs.kernel.org/PCI/endpoint/pci-endpoint-cfs.html)
-- [Linux stable Endpoint source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci/endpoint?h=linux-6.12.y)
-- [PCI-SIG specifications](https://pcisig.com/specifications)
-
-## 二十四、小结
-
-Linux PCI Endpoint Framework 用 EPC 隔离 Controller IP，用 EPF 表达 Function 协议，用 ConfigFS 组合实例。
-
-EPF probe 管理实例软件对象，bind 取得 EPC/FN 后配置 Header、BAR 与数据面，unbind 逆序停止 DMA、IRQ、Window 和 Backing Memory。
-
-BAR Address、Inbound Translation 与 EP Local Backing 是三层不同概念。
-
-EP 访问 Host RAM 需要 Host Driver 通过 DMA API 提供 DMA Address，并由 Outbound Window/DMA Engine 使用。
-
-`pci_epc_set_bar()` 不会生成 Host DMA Address。
-
-MSI/MSI-X 只能在 Completion 数据可见后 Raise。
-
-Linkup 不等于 Host Driver 已就绪，业务状态要由双方协议确认。
-
-PERST#/Hot Reset/Linkdown 后所有旧 Host Mapping 与 Request 都应视为失效并增加 generation。
-
-掌握这些所有权和地址域边界，才能从简单 Test Function 走向可靠的共享内存、加速器或高速采集 Endpoint。
+- [Linux 6.12 PCI Endpoint Test](https://www.kernel.org/doc/html/v6.12/PCI/endpoint/pci-test-howto.html)
+- [Linux 6.12 Endpoint Function source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci/endpoint/functions?h=linux-6.12.y)

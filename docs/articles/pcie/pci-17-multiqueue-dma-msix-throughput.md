@@ -1,484 +1,236 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #17 · Multi-queue DMA、MSI-X 与高吞吐设计"
-description: "PCIe 设备驱动的难点通常不在“能不能读一个 BAR 寄存器”，而在于如何让设备持续、高效、可恢复地搬运数据。网卡、采集卡、FPGA 和 AI 加速器普遍采用 **描述符环形队列 + DMA + MSI/MSI-X** 的组合。"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #17 · Multi-Queue、DMA、MSI-X 与高吞吐设计"
+description: "从单队列瓶颈出发，用网卡与 NVMe 对照 Queue、MSI-X Vector、CPU Affinity、Doorbell Batch、DMA Mapping、NUMA、Backpressure、Interrupt Moderation、Generation 与 Reset Scope。"
 pubDate: "2026-08-29"
 series: pcie
 order: 17
-tags: ["PCIe", "Multi-queue", "MSI-X", "Linux 6.12"]
+tags: ["PCIe", "Multi-Queue", "MSI-X", "Performance", "Linux 6.12"]
 draft: false
 ---
-PCIe 设备驱动的难点通常不在“能不能读一个 BAR 寄存器”，而在于如何让设备持续、高效、可恢复地搬运数据。网卡、采集卡、FPGA 和 AI 加速器普遍采用 **描述符环形队列 + DMA + MSI/MSI-X** 的组合。
 
-本文的数据结构、DMA API 和 IRQ 接口固定以 Linux 6.12 为基线，设备寄存器协议明确视为教学模型。
+第 09 篇已经解释 Descriptor Ring 的正确性，第 13 篇也给出了 MPS、Tag、Credit 和 Queue Depth 的性能模型。但在多核系统上，即使单 Ring 已经跑满一个 CPU，增加 Link Speed 仍可能没有收益。问题变成：怎样把请求、Completion 和中断分散到多个 CPU，同时保持每条 Queue 的所有权和 Reset 边界？
 
-这里的 multi-queue 指多组相互隔离的 SQ/CQ、MSI-X Vector 和 CPU 处理上下文，而不是给单 Ring 多加几把锁。
+Multi-Queue 不是简单复制数组。每个 Queue 需要 Descriptor、Producer/Consumer、Request Table、Doorbell、Vector、CPU Affinity、Memory Placement 和 Backpressure；Queue 之间还要共享 Device Reset、Admin Command 与全局 Resource。
 
-这一篇从一个抽象的 PCIe Endpoint 数据通路出发，讲清楚缓冲区所有权、描述符、doorbell、completion、中断和内存屏障之间的关系，并给出 Linux 驱动中的关键代码骨架。代码用于说明结构，具体寄存器布局必须以设备硬件 spec 为准。
+本文以 Linux 6.12 为基线，用多队列网卡与 NVMe 作对照。设备只是说明同一架构模式的不同实现，私有寄存器和 Queue 数量不构成 PCIe 通用要求。
 
-## 一、先看完整数据通路
+## 一、先看问题：为什么单队列先卡在 CPU 而不是 Link
 
-以设备向主机发送数据为例：
-
-```mermaid
-flowchart LR
-    A[设备产生数据] --> B[Endpoint DMA 写入主机缓冲区]
-    B --> C[写入 completion 描述符]
-    C --> D[MSI-X 通知 CPU]
-    D --> E[中断处理或 NAPI poll]
-    E --> F[回收描述符并交给上层]
-    F --> G[补充空闲缓冲区]
-```
-
-主机向设备发送数据时方向相反：
+单队列通常只有一个 Producer Lock、一个 Completion Consumer 和一个 IRQ/Poll Context。多个 CPU 提交时争用同一 Cache Line，Completion 又集中到一个 CPU，最终某个 Core 满载而 PCIe Link 仍有空闲。
 
 ```mermaid
 flowchart LR
-    A[上层提交请求] --> B[填充 TX 描述符]
-    B --> C[dma_wmb 保证描述符可见]
-    C --> D[写 doorbell MMIO]
-    D --> E[设备读取描述符并 DMA]
-    E --> F[设备写 completion]
-    F --> G[MSI-X 或轮询回收]
+    C0[CPU 0] --> LOCK[single queue lock]
+    C1[CPU 1] --> LOCK
+    C2[CPU 2] --> LOCK
+    LOCK --> SQ[single submission ring]
+    SQ --> DEV[PCIe device]
+    DEV --> CQ[single completion ring]
+    CQ --> IRQ[single IRQ CPU]
 ```
 
-这里最关键的不是某个 API，而是 **谁拥有缓冲区、什么时候转移所有权、什么时候可以回收**。
+因此，增加 Queue 后，每个 CPU/Flow 可以使用独立 Ring 和 Vector，减少 Lock 与 Cache Line 迁移。但 Queue 数超过 Device Execution Slot、MSI-X Vector、CPU 或 Memory Bandwidth 后，继续增加只会扩大管理开销。
 
-## 二、为什么需要环形队列
+因此目标不是“Queue 越多越好”，而是让 Queue 数匹配并行工作单元，并使每条 Queue 的 Producer、Consumer 和 IRQ 尽量落在同一 CPU/NUMA Locality。
 
-如果每次传输都分配一个缓冲区、写一次寄存器、等一次中断，CPU 会花大量时间处理固定开销。环形队列把多个请求预先组织起来：
+## 二、Queue、Vector、CPU 与 Memory 构成一个映射单元
 
-- 生产者持续填写空闲描述符；
-- 设备消费者持续读取可用描述符；
-- 设备完成后更新完成状态；
-- 驱动批量回收并补充队列。
-
-典型队列包含：
-
-| 区域 | 作用 | 写入者 |
-|---|---|---|
-| TX descriptor ring | 描述待发送数据 | 主机驱动 |
-| RX descriptor ring | 描述可接收缓冲区 | 主机驱动 |
-| Completion ring | 描述已完成请求 | 设备或硬件 |
-| Doorbell | 通知设备新的 producer index | 主机 MMIO |
-| Head/Tail | 表示双方处理进度 | 主机和设备 |
-
-环形队列中的索引不能只用“数组下标相等”判断空满，否则会产生歧义。常见方案是维护 producer/consumer index，并额外保存 phase bit，或者让队列大小取 2 的幂并保留一个空槽。
-
-### 缓冲区所有权协议
-
-以 RX 队列为例，缓冲区生命周期可以这样描述：
+一种常见设计把 Queue Pair、MSI-X Vector、Poll Context 和 CPU 一一对应：
 
 ```text
-驱动填充空闲 buffer
-        |
-        v
-驱动把 buffer 交给设备
-        |
-        v
-设备 DMA 写入 buffer
-        |
-        v
-设备写 completion 并交还驱动
-        |
-        v
-驱动同步、解析、交给上层
-        |
-        v
-驱动重新填充并再次交给设备
+Queue 0 -> MSI-X 0 -> IRQ 120 -> CPU 2 -> NUMA node 0 memory
+Queue 1 -> MSI-X 1 -> IRQ 121 -> CPU 3 -> NUMA node 0 memory
+Queue 2 -> MSI-X 2 -> IRQ 122 -> CPU 8 -> NUMA node 1 memory
+Admin   -> MSI-X 3 -> housekeeping CPU
 ```
-
-在设备拥有期间，CPU 不能修改描述符指向的内存，也不能提前把 buffer 交给上层复用。否则会出现：
-
-- 设备写入已被上层覆盖的内存；
-- 同一个 DMA 地址同时出现在多个描述符；
-- completion 到达后找不到对应软件对象；
-- 偶发图像撕裂或数据包损坏。
-
-实际项目中建议给每个描述符建立软件上下文：
-
-```c
-struct my_dma_buf {
-    void *cpu_addr;
-    dma_addr_t dma_addr;
-    size_t len;
-    u16 index;
-    bool device_owned;
-};
-
-struct my_desc {
-    __le64 addr;
-    __le32 len;
-    __le16 flags;
-    __le16 id;
-};
-```
-
-描述符里的多字节字段通常使用 `__le16`、`__le32` 或 `__le64`，通过 `cpu_to_le32()` 和 `le32_to_cpu()` 显式处理字节序，不要假设设备和 CPU 永远都是同一种 endian。
-
-## 三、Linux DMA API、描述符发布与内存顺序
-
-### 1. 一致性 DMA 内存
-
-适合描述符环、控制结构和需要 CPU/设备频繁共同访问的区域：
-
-```c
-ring->cpu = dma_alloc_coherent(dev,
-                               ring_bytes,
-                               &ring->dma,
-                               GFP_KERNEL);
-if (!ring->cpu)
-    return -ENOMEM;
-```
-
-释放时必须使用对应的：
-
-```c
-dma_free_coherent(dev, ring_bytes,
-                  ring->cpu, ring->dma);
-```
-
-一致性内存简化了 CPU 与设备的可见性问题，但不意味着零成本，也不一定适合大量大块数据。
-
-### 2. Streaming DMA
-
-数据 buffer 更常使用 streaming mapping：
-
-```c
-dma_addr_t dma;
-
-dma = dma_map_single(dev, buf, len, DMA_FROM_DEVICE);
-if (dma_mapping_error(dev, dma))
-    return -EIO;
-
-/* 把 dma 地址写入设备描述符 */
-
-/* 设备完成后 */
-dma_sync_single_for_cpu(dev, dma, len, DMA_FROM_DEVICE);
-/* CPU 读取 buf */
-dma_sync_single_for_device(dev, dma, len, DMA_FROM_DEVICE);
-```
-
-使用 `DMA_FROM_DEVICE` 表示数据从设备流向内存，`DMA_TO_DEVICE` 表示从内存流向设备。方向填错在非一致性架构上可能表现为旧数据、随机数据或只在高负载下失败。
-
-长期映射的 buffer 要在设备使用期间保持映射，不能每次中断都无条件 map/unmap。短期映射则必须严格配对。
-
-### 描述符发布前的内存顺序
-
-驱动通常先写描述符，再写 doorbell。CPU 和 PCIe 设备之间必须保证这个顺序：
-
-```c
-WRITE_ONCE(desc->addr, cpu_to_le64(dma_addr));
-WRITE_ONCE(desc->len, cpu_to_le32(len));
-WRITE_ONCE(desc->flags, cpu_to_le16(DESC_VALID));
-
-/* 确保描述符内容先于 doorbell 对设备可见 */
-dma_wmb();
-
-writel(new_tail, regs + TX_DOORBELL);
-```
-
-如果 doorbell 先到达设备，而描述符内容仍停留在 CPU cache 或写缓冲中，设备可能读取到旧地址、旧长度或无效标志。
-
-完成路径也有相反的顺序要求：设备先写 completion，再更新状态或触发中断。CPU 在读取 completion 前，需要遵循设备 spec 要求的读取顺序，并在驱动中使用合适的 `dma_rmb()` 或 DMA sync。具体屏障不能机械套用，必须结合设备对 completion 的写入协议。
-
-## 四、MSI-X、中断处理与 RX 回收
-
-### MSI
-
-MSI 通常提供数量较少、结构较简单的消息中断。对于单队列或少量队列设备，MSI 已经足够。
-
-### MSI-X
-
-MSI-X 支持更多中断向量，适合把不同队列、错误事件和管理事件分开：
-
-```text
-vector 0 -> RX queue 0
-vector 1 -> RX queue 1
-vector 2 -> TX queue 0
-vector 3 -> device error
-```
-
-这样可以把队列中断分配到不同 CPU，减少锁竞争并提高并行度。驱动中通常先启用 MSI-X，再申请各向量的 IRQ：
-
-```c
-ret = pci_alloc_irq_vectors(pdev, 1, max_vecs,
-                            PCI_IRQ_MSIX | PCI_IRQ_MSI);
-if (ret < 0)
-    return ret;
-
-nvec = ret;
-for (i = 0; i < nvec; i++) {
-    int irq = pci_irq_vector(pdev, i);
-    ret = request_irq(irq, my_irq, 0,
-                      "my_pcie", &q[i]);
-    if (ret)
-        goto err_irq;
-}
-```
-
-错误路径必须只释放已经成功申请的向量：
-
-```c
-while (--i >= 0)
-    free_irq(pci_irq_vector(pdev, i), &q[i]);
-pci_free_irq_vectors(pdev);
-```
-
-### 中断处理不要做重活
-
-硬中断处理函数应尽快完成：
-
-1. 读取并确认中断状态；
-2. 屏蔽或清除当前中断源；
-3. 记录必要的队列状态；
-4. 调度下半部、tasklet、workqueue 或 NAPI；
-5. 返回 `IRQ_HANDLED`。
-
-示例：
-
-```c
-static irqreturn_t my_irq(int irq, void *data)
-{
-    struct my_queue *q = data;
-    u32 status = readl(q->regs + IRQ_STATUS);
-
-    if (!(status & q->irq_mask))
-        return IRQ_NONE;
-
-    writel(status, q->regs + IRQ_ACK);
-    napi_schedule(&q->napi);
-    return IRQ_HANDLED;
-}
-```
-
-数据包或 completion 的批量回收放到 NAPI poll 等下半部中。中断风暴、锁竞争和 cache 抖动通常都需要通过批处理缓解。
-
-### RX 队列的伪代码
-
-```c
-static int my_rx_poll(struct napi_struct *napi, int budget)
-{
-    struct my_queue *q = container_of(napi, struct my_queue, napi);
-    int work = 0;
-
-    while (work < budget) {
-        struct my_cqe *cqe = my_peek_cqe(q);
-        struct my_dma_buf *buf;
-        u32 len;
-
-        if (!cqe)
-            break;
-
-        dma_rmb();
-        buf = &q->bufs[cqe->id];
-        len = le32_to_cpu(cqe->len);
-
-        dma_sync_single_for_cpu(q->dev, buf->dma_addr,
-                                buf->len, DMA_FROM_DEVICE);
-        my_deliver_to_upper_layer(buf->cpu_addr, len);
-        dma_sync_single_for_device(q->dev, buf->dma_addr,
-                                   buf->len, DMA_FROM_DEVICE);
-
-        my_repost_rx_desc(q, buf);
-        my_advance_cq(q);
-        work++;
-    }
-
-    if (work < budget) {
-        napi_complete_done(napi, work);
-        my_unmask_rx_irq(q);
-    }
-
-    return work;
-}
-```
-
-这段代码省略了锁、错误状态、分配失败和上层回收机制，但完整体现了：读取 completion、同步 DMA、处理 buffer、重新投递描述符和恢复中断。
-
-## 五、吞吐量为什么达不到链路理论值
-
-PCIe 链路带宽只是上限，实际吞吐还受到：
-
-- TLP header 和 DLLP 开销；
-- Max Payload Size；
-- Max Read Request Size；
-- DMA 读写方向；
-- 主机内存带宽；
-- IOMMU 映射和页表开销；
-- 描述符数量与队列深度；
-- 中断频率；
-- CPU 回收速度；
-- 设备内部 FIFO；
-- NUMA 或 cache locality。
-
-调优时不要只看 `Gen3 x4` 的理论数字。至少分别统计：
-
-```text
-设备产生数据量
-DMA 提交速率
-DMA 完成速率
-中断次数
-每次中断回收描述符数
-队列最大深度
-DMA error 次数
-CPU 使用率
-```
-
-如果队列经常满，可能是设备发送太快或上层处理太慢；如果队列长期空，可能是提交线程、内存分配或设备生产端不足。
-
-### Backpressure 必须从 CQ 一直传回提交入口
-
-当 SQ free低于阈值，submit阻塞或返回 `-EAGAIN`；当 payload pool耗尽，不能继续只填 descriptor；当 CQ接近满，Device必须停止取新SQE或触发 overflow/error。任何一层继续生产都会覆盖仍有所有权的数据。
-
-驱动暴露 queue depth、SQ/CQ high watermark、ring full、dropped和wait time，用户态据此限流。加深 ring只能吸收短突发，长期生产速率大于消费速率时只会增加延迟。
-
-多队列共享全局内存/带宽时还要公平调度，避免一个 queue耗尽 descriptor或MSI-X预算。Reset/错误向所有阻塞提交者广播并让状态收敛。
-
-## 六、背压、generation、reset 与稳定性
-
-SQ 满时 software producer 不能覆盖 device consumer 尚未释放的槽位；可以阻塞提交者、返回 `-EAGAIN` 或让上层 queue 限流。CQ 接近满时 Device 也必须停止产生新 completion 或报告 overflow，否则软件会永久丢失 buffer ownership。
-
-多队列减少数据路径锁，但 reset 属于全局控制面。Reset 前进入 QUIESCING，阻止新 doorbell，mask vector，停止 Device DMA并等待 quiescent；随后把所有 in-flight 请求完成为错误，清 producer/consumer/phase，增加 queue generation，再重新写 base/size并启动。
-
-迟到 completion 必须带 request id 或 generation 校验。旧 generation 的 CQE 只能丢弃，不能映射到已经复用的 descriptor。压力测试应覆盖 producer/consumer 多次回绕、ring full、CQ overflow、乱序完成、timeout、FLR 和用户进程退出，而不只是顺序提交。
-
-长期一致性可以用守恒关系检查：`submitted = completed + failed + in_flight`，DMA mapping 数和 buffer pool 数在停止后归零，所有 queue producer/consumer 回到同一 generation。吞吐仍在增长并不能证明资源没有缓慢泄漏。
-
-### 稳定性设计
-
-### 1. DMA 超时
-
-超时处理要区分：
-
-- 设备真的没有完成；
-- completion 已写入但中断丢失；
-- IOMMU fault；
-- DMA 地址错误；
-- 设备已经进入 fatal error。
-
-恢复流程通常包括：停止新提交、屏蔽中断、读取错误寄存器、停止 DMA、回收软件对象、执行设备复位、重新初始化队列。不能直接释放仍被设备使用的 buffer。
-
-### 2. 设备拔出或复位
-
-PCIe 热复位、链路掉线和系统关机都可能触发资源销毁。驱动需要有统一的状态机，例如：
-
-```text
-RUNNING -> QUIESCING -> RESETTING -> REINIT -> RUNNING
-                    \-> DEAD
-```
-
-所有提交入口都应检查状态，避免在 `QUIESCING` 或 `DEAD` 状态继续写 doorbell。
-
-### 3. DMA mask
-
-设备支持的 DMA 地址宽度必须和平台一致：
-
-```c
-if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64))) {
-    if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32)))
-        return -ENODEV;
-}
-```
-
-这并不代表硬件真的支持 64 位地址。最终应以设备 spec、IOMMU 配置和平台 DMA 能力为准。
-
-## 七、硬件验证与验收
-
-至少准备：
-
-- 一块可枚举的 PCIe Endpoint，如 FPGA、网卡或 NVMe；
-- 主机或 SoC 的 PCIe 插槽；
-- 串口日志；
-- 万用表和示波器；
-- 可选的 PCIe 协议分析仪。
-
-建议按顺序验证：
-
-1. `lspci` 能枚举；
-2. `LnkSta` 速率和宽度符合预期；
-3. BAR 读写测试通过；
-4. MSI/MSI-X 中断计数增长；
-5. 单 buffer DMA 读写通过；
-6. 环形队列连续传输通过；
-7. 高负载、长时间和复位恢复通过。
-
-### 验收清单
-
-- [ ] 描述符和 completion 的字节序已明确；
-- [ ] TX/RX buffer 的所有权转移有清晰协议；
-- [ ] DMA mask、map/unmap、sync API 使用正确；
-- [ ] 描述符发布前有适当的内存顺序保证；
-- [ ] MSI-X 向量与队列映射关系明确；
-- [ ] 硬中断只做确认和调度；
-- [ ] 队列满、空、超时和错误状态均有处理；
-- [ ] 设备 reset 或链路掉线时不会继续提交 DMA；
-- [ ] 已完成单 buffer、环形队列、高负载和恢复测试。
-
-**参考资料**
-
-- [Dynamic DMA Mapping Guide](https://docs.kernel.org/core-api/dma-api-howto.html)
-- [The MSI Driver Guide HOWTO](https://docs.kernel.org/PCI/msi-howto.html)
-- [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
-
-## 八、Queue、Vector 与 CPU 的映射
-
-每个 Queue Pair 最好有独立 SQ/CQ、锁、MSI-X Vector 与统计。
-
-```mermaid
-flowchart LR
-    Q0[SQ/CQ 0] --> V0[MSI-X 0]
-    Q1[SQ/CQ 1] --> V1[MSI-X 1]
-    QN[SQ/CQ n] --> VN[MSI-X n]
-    V0 --> C0[CPU/NAPI 0]
-    V1 --> C1[CPU/NAPI 1]
-    VN --> CN[CPU/NAPI n]
-    C0 --> M0[NUMA-local memory]
-    C1 --> M1[NUMA-local memory]
-```
-
-实际 Vector 少于 Queue 数时，可让多个 Queue 共享 Vector/Poll，但要避免一个繁忙 Queue 饿死其他 Queue。
-
-## 九、背压必须按 Queue 局部传播
-
-```mermaid
-stateDiagram-v2
-    [*] --> Running
-    Running --> Stopped: SQ space below threshold
-    Stopped --> Running: CQ clean frees enough descriptors
-    Running --> Throttled: latency/temperature/error policy
-    Throttled --> Running: policy clears
-    Running --> Resetting: timeout/AER
-    Resetting --> Running: generation rebuilt
-```
-
-一个 Queue Full 不应无条件停止全设备，除非硬件共享资源确实全局耗尽。
-
-上层 Flow/CPU 选择也要避免持续把负载送到已停止 Queue。
-
-## 十、Queue Reset 与 Device Reset 分层
 
 ```mermaid
 flowchart TD
-    T[queue timeout] --> STOP[stop only affected upper queue]
-    STOP --> QRESET{hardware queue reset works?}
-    QRESET -- yes --> GEN[generation++ and rebuild queue]
-    QRESET -- no --> FRESET{Function Level Reset works?}
-    FRESET -- yes --> ALL[rebuild all queues/function state]
-    FRESET -- no --> BUS[request broader bus/slot recovery]
-    GEN --> RUN[resume affected queue]
-    ALL --> RUNALL[resume all queues]
+    FLOW[flow / software context] --> Q[queue pair]
+    Q --> V[MSI-X vector]
+    V --> CPU[target CPU]
+    CPU --> MEM[local ring and payload memory]
+    Q --> DEV[device execution context]
 ```
 
-优先使用最小恢复范围可减少其他 Queue 的业务中断。
+这不是固定规范。Vector 不足时多个 Queue 可以共享一个 IRQ；CPU 少于 Queue 时可以轮转或合并；Admin Queue 常单独保留，因为它控制 Reset、Feature 和 Queue Creation，不能被繁忙数据 Queue 饿死。
 
-但硬件若共享 DMA Engine/Firmware Context，单 Queue Reset 不能假装隔离存在。
+映射变化要处理 CPU Hotplug 与 IRQ Affinity。若 CPU Offline 但 Queue 仍把 Completion 发向该 CPU，Linux IRQ Core可以迁移 IRQ，Driver/Poll/Upper-Layer Queue Mapping 也要同步更新。
 
-## 十一、小结
+## 三、网卡用 RSS、TX Queue 与 NAPI 分散流量
 
-PCIe 高吞吐驱动的主线是：
+多队列 NIC 常用 RSS Hash 把 RX Flow 分配到不同 Hardware RX Queue，每个 Queue 由对应 NAPI Poll消费；TX 则根据 Socket/Flow/CPU 选择 Software/Hardware Queue。MSI-X Vector可以按 RX/TX Queue Pair分配。
 
-**分配 DMA 内存 → 构造描述符 → 屏障后敲 doorbell → 设备 DMA → completion → MSI-X/NAPI 回收 → 重新投递。**
+```mermaid
+flowchart LR
+    PKT[received packet] --> RSS[RSS hash]
+    RSS --> RX0[RX queue 0]
+    RSS --> RX1[RX queue 1]
+    RX0 --> N0[NAPI CPU 2]
+    RX1 --> N1[NAPI CPU 3]
+    N0 --> STACK0[network stack]
+    N1 --> STACK1[network stack]
+```
 
-真正决定稳定性的，是缓冲区所有权、DMA 映射、内存顺序、中断批处理和错误恢复，而不是单独某一个寄存器或 API。
+NAPI 在高负载时关闭/抑制 IRQ 并按 Budget 批量消费，Ring Empty 后 Complete、Unmask 并 Recheck。因为 Flow Affinity 影响 Cache Locality，所以 RSS Indirection、IRQ Affinity、RPS/XPS 和应用 CPU 应一起设计。
 
----
+并非所有网卡都提供一 Queue 一 Vector。上一章的 rtw88 只有一个 MSI/INTx Vector，依然用多个设备 TX Queue 与一个 NAPI RX Path；它说明 Device Protocol 能力决定实际映射，不能从“网卡”类别推断 MSI-X 架构。
+
+## 四、NVMe 用 Submission/Completion Queue Pair 分散 I/O
+
+NVMe Controller 通常提供 Admin Queue 和多个 I/O Submission/Completion Queue。Host 把 Command 写入 SQ，Doorbell 通知 Tail；Controller 执行后写 CQE并产生 MSI-X，Host 按 Phase Tag消费并更新 CQ Head Doorbell。
+
+```mermaid
+sequenceDiagram
+    participant CPU as CPU / blk-mq context
+    participant SQ as NVMe SQ
+    participant DEV as NVMe controller
+    participant CQ as NVMe CQ
+    CPU->>SQ: write command
+    CPU->>DEV: ring SQ tail doorbell
+    DEV->>DEV: execute I/O
+    DEV->>CQ: write CQE with phase
+    DEV-->>CPU: MSI-X vector
+    CPU->>CQ: consume completions
+    CPU->>DEV: update CQ head doorbell
+```
+
+Linux Block Multi-Queue 把 Software Context/Hardware Queue 与 CPU 拓扑对应。与网卡相比，NVMe Completion 不走 NAPI 网络栈，但同样需要 Queue、Vector、CPU Affinity、Doorbell Batch 和 Backpressure。
+
+这说明 Multi-Queue 是系统架构模式，不是某个子系统 API。网卡使用 `skb`/NAPI，NVMe 使用 Request/blk-mq；底层仍是 Descriptor/Command Ownership、Completion 和通知。
+
+## 五、Queue 数量受多个上限共同约束
+
+可用 Queue 数至少受 Device Max Queue、MSI-X Table Size、Driver Data Structure、CPU Online 数、IOMMU/Memory Resource 和 Upper-Layer Queue 能力限制。
+
+```text
+effective queues = min(
+    device queue capacity,
+    available interrupt vectors,
+    driver supported queues,
+    useful CPU parallelism,
+    upper-layer queue mapping,
+    memory / DMA resource budget)
+```
+
+Vector 不足时 Driver 可以共享或减少 Queue，而不是 Probe 失败；但若最少需要 Admin + Data 两类独立通知，则应把 `min_vecs` 设置为真正功能下限。
+
+Queue Creation 还消耗 Coherent Ring、Request Table 和 Payload Pool。大规模 Queue 在空闲时也占用内存，因此产品要按工作负载动态选择或在 Probe 时使用合理上限。
+
+## 六、Doorbell Batch 要尊重每 Queue 的可见性
+
+Multi-Queue 通常为每条 Queue提供 Doorbell Offset。Producer 可以批量填多个 Descriptor，再用一次 `writel()` 发布新 Tail；不同 Queue 的 Doorbell 可以由不同 CPU 并发写，但必须避免落在同一 Cache/PCIe Write Combine 语义中产生错误合并。
+
+```text
+per queue submit
+  -> reserve slots
+  -> map payloads
+  -> fill descriptors
+  -> dma_wmb
+  -> publish producer
+  -> ring queue-specific doorbell
+```
+
+Batch 增大减少 MMIO/TLP，但增加低负载等待。可采用“Queue 从空变非空立即 Doorbell，持续 Burst 达阈值再 Batch”的策略；最终参数由吞吐与 P99 测量决定。
+
+Doorbell 不携带 Descriptor 内容，所以锁只保护本 Queue Producer 并不自动保证 DMA 可见性。每条 Queue 仍需要正确 Barrier 和 Ownership Protocol。
+
+## 七、DMA Mapping 和 NUMA 决定 Queue 是否真正本地化
+
+若 Queue 0 的 IRQ 在 CPU 2，但 Ring/Payload 来自远端 NUMA Node，Completion 处理会跨 Socket 访问内存。高吞吐下，远程 Memory 和 Cache Line Transfer 可能比 PCIe TLP Header更昂贵。
+
+Driver/Subsystem 可以根据 `dev_to_node()`、CPU Affinity 和 Memory Policy 分配 Ring/Pool，并让应用线程与 Queue 尽量同 Node。不能硬编码 CPU Number，因为 CPU Hotplug、Virtualization 和 BIOS 拓扑会变化。
+
+IOMMU Mapping 也可能共享 IOVA Allocator/Lock。Per-Queue Page Pool、Long-Lived Mapping 和 Batch Unmap 能降低开销，但必须在 Queue Reset/Remove 时收回全部 ownership。
+
+## 八、Interrupt Moderation 与 Poll Budget 按 Queue 调节
+
+不同 Queue 流量不同，一个全局 Moderation 参数可能让低流量 Queue 延迟过高、繁忙 Queue IRQ 过多。硬件若支持 Per-Queue Moderation，Driver 可以根据 Packet/Completion Rate 动态调整。
+
+```mermaid
+flowchart TD
+    RATE[queue completion rate] --> HIGH{high rate?}
+    HIGH -- yes --> MORE[increase moderation and poll batch]
+    HIGH -- no --> LAT{latency sensitive?}
+    LAT -- yes --> LESS[reduce moderation]
+    LAT -- no --> MID[keep balanced settings]
+```
+
+动态调节必须有滞回，避免每个采样周期来回振荡。还要保存 P99 与 CPU，而不是只追求最少 IRQ；过度 Moderation 会把 Queueing Delay 推高。
+
+Poll Budget 也应防止单 Queue 垄断 CPU。繁忙 Queue 用完 Budget 后继续调度，其他 Queue/Softirq 仍有运行机会，这属于系统公平性而不仅是设备吞吐。
+
+## 九、backpressure 应局部化到拥塞 Queue
+
+Queue Full、Request ID不足、DMA Mapping失败或 Device Credit不足时，应停止对应 Queue，而不是全设备停机。局部 `backpressure` 让其他 Queue 继续工作，减少 Head-of-Line Blocking。
+
+```mermaid
+flowchart TD
+    REQ[new request for queue i] --> SPACE{local ring and request resource?}
+    SPACE -- yes --> SUB[submit on queue i]
+    SPACE -- no --> STOP[stop queue i]
+    STOP --> CPL[local completion releases resource]
+    CPL --> TH{wake threshold reached?}
+    TH -- yes --> WAKE[wake queue i]
+    TH -- no --> STOP
+```
+
+Wake Threshold 不应等于一个 Free Slot，否则高并发下频繁 Stop/Wake。阈值还要考虑一次 Upper-Layer Batch 可能需要多个 Descriptor/SG Entry。
+
+全局错误、Admin Queue失效或 Link Down 才需要 Device-Wide Quiesce。区分 Queue Local 与 Device Global Scope 是高可用设计的基础。
+
+## 十、锁、Cache Line 与所有权应按 Queue 分片
+
+理想情况下，每条 Queue 有独立 Producer Lock/Consumer Context和 Statistics。读多写少的全局配置可以共享，但高频 Producer、Consumer、Doorbell Record 不应放在同一 Cache Line。
+
+False Sharing 常发生在相邻 Queue Structure 中：CPU 2 更新 Queue0 Producer，CPU 3 更新 Queue1 Producer，但两个字段位于同一 Cache Line，导致持续 Cache Ping-Pong。Alignment/Padding 要以实际 Cache Line 和数据布局验证。
+
+Lockless Ring 只有在明确 Single Producer/Single Consumer、Memory Ordering 和 Wrap Contract 时才成立。为了“无锁”省掉必要 Ownership，同样会导致覆盖或丢 Completion。
+
+## 十一、Queue Reset 与 Device Reset 使用不同 generation
+
+支持 Queue Reset 的设备可以只停止一条 Queue、增加 Queue Generation、取消该 Queue Request 并重建 Ring，其他 Queue继续运行。Device Reset 则影响所有 Queue、IRQ、BAR Private State 和全局 Generation。
+
+```text
+queue-local fault
+  -> block queue i
+  -> stop/flush queue i
+  -> generation[i]++
+  -> rebuild queue i
+  -> reject old generation completions
+  -> wake queue i
+
+device-global fault
+  -> block all queues
+  -> reset function/link as required
+  -> device_generation++
+  -> rebuild admin/data queues and vectors
+```
+
+Generation 仍不能替代硬件停止；它只防止旧 Completion被新 Request误收。Queue Reset API 和 Scope 必须由设备公开协议支持，Driver 不能假设写零某个 Index 就完成隔离。
+
+## 十二、性能验证要按 Queue 收集而不是只看总吞吐
+
+总吞吐正常可能掩盖某条 Queue 饥饿。至少记录每 Queue Submit/Complete、Occupancy、Stop/Wake、IRQ/Poll、Batch、Timeout、CPU、NUMA 和 Generation，再汇总到设备级 Link/AER/IOMMU。
+
+如果 Queue0 满载而 Queue1空闲，应检查 Flow/CPU Mapping；所有 Queue均低 Occupancy但 Link 满，瓶颈在 PCIe/TLP；Queue均高 Occupancy但 Link低，可能是 Device Engine或 Completion Path。
+
+压力场景包括均匀流、单热点 Queue、CPU Hotplug、NUMA Cross-Node、Vector不足降级、Queue Reset和 Device Reset。只测“所有 Queue 同时顺序读写”不足以验证产品路径。
+
+## 十三、本篇检查点
+
+现在应当能够把一条高吞吐路径表示为 Queue Pair、MSI-X Vector、CPU、NUMA Memory和 Device Execution Context，并解释网卡 RSS/NAPI 与 NVMe blk-mq/CQ虽 API不同，却共享同一个 multi-queue 架构模式。
+
+还应能说明 Doorbell Batch、Interrupt Moderation和 Queue Depth如何影响吞吐与P99，为什么 `backpressure` 应优先局部化，Queue Generation与 Device Generation怎样隔离不同Reset Scope。
+
+## 十四、小结：下一篇用分层证据完成系列收尾
+
+Multi-Queue 通过分片 Ring、Vector、CPU、Memory和Lock提高并行度，但有效Queue数受设备、Vector、CPU、Upper Layer和Memory共同限制。正确设计同时处理Affinity、NUMA、Batch、Moderation、Backpressure、False Sharing和Reset Generation。
+
+下一篇不再增加新机制，而是把全系列内容组织成故障决策树：设备完全看不到、BAR失败、Driver不绑定、IRQ不增长、DMA超时、IOMMU Fault和AER恢复失败时，分别从哪一层开始收集什么证据。
+
+**一手资料**
+
+- [Linux 6.12 MSI Driver Guide](https://www.kernel.org/doc/html/v6.12/PCI/msi-howto.html)
+- [Linux Networking Scaling](https://docs.kernel.org/networking/scaling.html)
+- [Linux NVMe host source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/nvme/host?h=linux-6.12.y)

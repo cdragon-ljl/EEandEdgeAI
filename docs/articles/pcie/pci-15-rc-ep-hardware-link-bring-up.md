@@ -1,362 +1,217 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #15 · Root Complex、Endpoint 与链路 Bring-up"
-description: "PCIe 驱动开发经常被误解成“写一个 `pci_driver`，然后访问 BAR”。实际项目中，驱动能否进入 `probe()`，取决于更底层的一整条链路：参考时钟、复位、PERST#、供电、参考地、lane 配置、LTSSM、配置空间和资源分配。"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #15 · RC/EP 硬件、LTSSM 与链路 Bring-up"
+description: "以 RK356x Root Complex 连接通用 Endpoint 为局部平台案例，从 lspci 看不到设备的问题出发，按供电、REFCLK、PERST#、PHY、LTSSM、Config ATU、地址转换和 Linux 枚举逐层 Bring-up。"
 pubDate: "2026-08-29"
 series: pcie
 order: 15
-tags: ["PCIe", "Bring-up", "Linux 6.12"]
+tags: ["PCIe", "Root Complex", "Endpoint", "Linux 6.12"]
 draft: false
 ---
-PCIe Endpoint Bring-up 同时涉及链路两端。Root Complex 必须提供电源/时钟/复位、训练、配置访问和地址窗口；Endpoint 必须实现 LTSSM、Configuration Space、BAR、ATU、中断和 DMA。任一端未就绪，Host 侧 `pci_driver` 都没有执行机会。
 
-本文的软件、设备树和 Controller Driver 语义固定以 Linux 6.12 为基线。
+前十四篇都从 Linux 已经创建 `pci_dev` 的前提出发。但板级 Bring-up 最常见的现象是 `lspci` 完全没有目标设备，此时功能驱动连 `probe()` 都不会调用。问题必须向下移动：电源和时钟是否存在，PERST# 是否释放，PHY 与 LTSSM 是否进入 L0，配置请求是否通过 RC Window 到达 Endpoint？
 
-本篇以嵌入式 SoC 连接 FPGA、网卡或自研加速器为场景，从原理图走到 Linux；同时说明 SoC 自己运行 Linux 并充当 Endpoint 时，PCI Endpoint Framework 位于哪里。具体寄存器和设备树 binding 仍以目标 SoC/IP 手册为准。
+本文以 RK356x 一类 Rockchip DesignWare PCIe Root Complex 连接网卡、FPGA 或其他 Endpoint 为局部平台案例，讲解通用排查顺序。具体 Clock 名称、Reset ID、PHY Lane 和 Register Offset 随 SoC/板卡变化，必须以目标 Device Tree Binding、TRM 和原理图为准。
 
-## 一、Root Complex、Endpoint 角色与硬件信号
+Linux 6.12 是本文的软件基线。文章不会用一份固定 DTS 冒充所有 RK356x 板卡，而是说明每一层需要什么输入、产生什么可观察结果，以及没有结果时为什么不能继续调上层 Driver。
 
-PCIe 链路至少包含两个角色：
+## 一、先看问题：lspci 为空意味着流程停在哪里
 
-- **Root Complex，RC**：通常位于 SoC 内，负责发起配置访问、分配总线号和 BAR 地址；
-- **Endpoint，EP**：网卡、NVMe、FPGA 或加速器等设备，响应配置访问并提供功能；
-- **Switch**：在一个 RC 下扩展多个下游端口。
+`lspci` 依赖 PCI Core 已经完成配置扫描。目标 Endpoint 完全不出现，说明失败发生在 `pci_dev` 创建之前，范围包括板级供电、Reference Clock、Reset、PHY、Link Training、RC 配置访问和 BDF 路由。
 
-嵌入式板卡中最常见的两种结构是：
+```mermaid
+flowchart TD
+    POWER[Endpoint rails stable] --> REF[REFCLK valid]
+    REF --> RESET[PERST# released with correct timing]
+    RESET --> PHY[RC/EP PHY configured]
+    PHY --> LTSSM[LTSSM reaches L0]
+    LTSSM --> CFG[RC configuration transaction works]
+    CFG --> ENUM[PCI Core reads VID/DID]
+    ENUM --> PDEV[pci_dev appears]
+    PDEV --> DRIVER[pci_driver match and probe]
+```
+
+这条链只能从下向上验证。因为 `pci_device_id` 只参与最后的 Driver Match，所以设备尚未出现在 `lspci` 时，修改 ID Table、DMA Ring 或 IRQ Handler没有作用。
+
+因此，Bring-up 的目标不是一次“碰巧能枚举”。应在冷启动、热重启、压力、ASPM 和温度变化下保持目标 Speed/Width，并且 AER/Receiver Error 不持续增长。
+
+## 二、先确认 RC 与 EP 角色没有配置反
+
+Root Complex（RC）发起配置扫描、分配 Bus Number 和 BAR；Endpoint（EP）响应配置请求并暴露 Function。一个支持 Dual-Mode 的控制器必须在硬件 Strap、Firmware、Clock/Reset 和 Linux Driver 中选择一致角色。
 
 ```mermaid
 flowchart LR
-    A[SoC PCIe RC] --> B[PCIe 连接器]
-    B --> C[FPGA/网卡/加速器 EP]
+    CPU[RK356x CPU and memory] --> RC[DesignWare PCIe RC]
+    RC --> LINK[PCIe Link]
+    LINK --> EP[network card / FPGA Endpoint]
 ```
 
-```mermaid
-flowchart LR
-    A[SoC PCIe RC] --> B[PCIe Switch]
-    B --> C[Endpoint 1]
-    B --> D[Endpoint 2]
-    B --> E[Endpoint 3]
-```
+若 SoC 配置成 EP，它会等待外部 RC 枚举，不会主动发现插槽设备；若两端都配置成 RC 或都配置成 EP，LTSSM 也无法建立期望链路。因此角色检查必须早于 Device Tree 属性微调。
 
-如果 SoC 被配置成 Endpoint，它不会主动枚举其他设备，而是等待外部 RC 对它进行配置。RC/EP 角色必须先从硬件设计和控制器模式上确认，不能仅根据设备树节点名字猜测。
+Switch 场景仍只有一个 Root Complex，但每段 Port/Link 单独训练。Root Port 到 Switch Upstream 能进入 L0，不代表 Switch Downstream 到 Endpoint 也正常，调试要逐段读取 Port Link Status。
 
-### 硬件设计中必须核对的信号
+## 三、供电稳定是所有数字信号的前提
 
-### 1. REFCLK
+Endpoint 可能需要主电源、辅助电源、IO 电源和板上 Regulator Enable。电压数值正确但上电时序不满足，也可能让内部 PLL、Strap 或 Configuration Space 初始化失败。
 
-PCIe 设备通常需要 100 MHz 参考时钟。需要核对：
+检查供电时记录稳态电压、上升时间、纹波、Enable/PWRGD、插卡瞬态和 Reset 关系。只在无负载时用万用表看到额定电压，不足以证明链路训练期间电源稳定。
 
-- 时钟由 RC、EP 还是独立时钟芯片提供；
-- Common Clock 或 SRIS/SRNS 架构；
-- 时钟是否在 PERST# 释放前稳定；
-- 差分时钟走线、端接和 AC 耦合方案；
-- Endpoint 是否有独立参考时钟输入。
+RC Controller/PHY 自身也依赖 SoC Power Domain。Runtime PM 或 Firmware 若在 Probe 前关闭 Domain，Register Read 可能全零/Abort；因此需要结合 Clock/Reset/Power Domain 状态和 Controller Driver 日志，而不是只测 Endpoint 插槽。
 
-参考时钟异常时，最常见表现是 LTSSM 长时间停在 Detect 或 Polling，系统看不到设备。
+## 四、REFCLK 决定两端能否开始训练
 
-### 2. PERST#
+PCIe 常见 Reference Clock 为 100 MHz 差分时钟，但系统可以使用 Common Clock、SRNS 或 SRIS 等架构。板级设计必须确认 Clock Source、方向、抖动、幅度、终端、AC Coupling 和两端模式一致。
 
-`PERST#` 是低有效复位信号。RC 通常负责在参考时钟稳定、电源就绪后释放 Endpoint 复位。必须检查：
+REFCLK 应在协议要求的时序内稳定，并与 PERST# 释放协调。若 Clock 未到或质量不足，LTSSM 常停在 Detect/Polling，Receiver Error 和 Recovery 也可能增加。
 
-- 上电默认电平是否为低；
-- 释放时序是否满足 Endpoint 数据手册；
-- GPIO 复用是否正确；
-- 是否被其他设备共享；
-- 设备树中的 reset-gpios 极性是否与原理图一致。
+示波器观察要使用合适差分探头和测量带宽，避免探头负载本身破坏链路。软件只能看到 Clock/PHY 结果，不能从一行日志证明抖动符合规范。
 
-PERST# 提前释放会导致 Endpoint 没有完成内部电源和 PLL 初始化；一直拉低则设备永远不会进入配置阶段。
+## 五、PERST# 必须按板级时序释放
 
-### 3. CLKREQ# 与 WAKE#
-
-低功耗系统可能使用 `CLKREQ#` 请求参考时钟，也可能使用 `WAKE#` 唤醒主机。初次 bring-up 建议先确认链路是否能在非低功耗路径下稳定建立，再逐步启用 ASPM 和 runtime PM。
-
-### 4. TX/RX lane 方向
-
-PCIe TX 必须连接对端 RX，RX 必须连接对端 TX。差分对的极性翻转在部分控制器中可配置，但不能假设所有芯片都能自动修正。x1、x2、x4 的 lane 数量和 lane 映射也必须与控制器支持范围一致。
-
-## 二、链路训练与 LTSSM
-
-PCIe 链路启动会经历 LTSSM，即 Link Training and Status State Machine。初学阶段重点关注这些状态：
-
-- `Detect`：检测对端接收器；
-- `Polling`：交换训练序列并建立同步；
-- `Configuration`：交换链路宽度和编号等配置；
-- `L0`：正常工作状态；
-- `Recovery`：重新训练或降速降宽；
-- `Disabled` / `Hot Reset`：链路被禁用或复位。
-
-链路最终必须进入 `L0`，但“进入 L0”还不代表设备功能一定可用，因为后面仍有枚举、BAR 和中断配置。
-
-## 三、Configuration Space、BAR、ATU 与 RC 设备树
-
-Endpoint Controller 至少包含配置空间响应、BAR decode、inbound/outbound address translation、MSI/MSI-X 和可选 DMA engine。Host 能读 VID/DID 只证明 Configuration TLP 可达；BAR Memory TLP 还要经过 Endpoint inbound translation 才能落到内部 AXI/AHB/BRAM。
-
-建议第一个 BAR 只实现最小寄存器：VERSION、SCRATCH、LTSSM_STATUS 和 IRQ_TRIGGER。Host 为 BAR 分配地址后，Linux 驱动 `pci_request_region()` + `pci_iomap()`，先读版本，再写读 scratch。若配置空间正常但 MMIO 全 1/abort，检查 bridge window、RC outbound ATU、Endpoint BAR decode 和 inbound address translation，不要直接进入 DMA。
-
-```mermaid
-flowchart LR
-    CPU[Host readl writel] --> RC[RC outbound window]
-    RC --> TLP[Memory TLP to BAR]
-    TLP --> EP[Endpoint BAR decode]
-    EP --> ATU[inbound address translation]
-    ATU --> REG[Registers or BRAM]
-```
-
-Host BAR address、TLP offset 和 Endpoint 内部 target 是三个地址域。日志和文档必须分别命名，避免把 Host resource start 直接写进 Endpoint 内部总线。
-
-最小 MMIO 通过后再触发 MSI：Host 启用 vector，写 IRQ_TRIGGER，确认 `/proc/interrupts` 与 handler。最后才由 Host DMA API 提供地址，Endpoint outbound engine 发 Memory Read/Write。这个顺序把配置、BAR、中断和 DMA 四类错误逐一隔离。
-
-### Endpoint Configuration Space 的最小实现与 Capability 递增
-
-先实现合法 Type 0 Configuration Space：VID/DID、Class Code、Header Type、Command/Status和一个 BAR。Host能稳定读写 Command、完成 BAR sizing并保持配置后，再加入 MSI/MSI-X、PCIe Capability、AER等；不要一次声明未完成的 Capability链。
-
-BAR mask、64位和 prefetchable属性必须与实际 aperture一致。Function Level Reset支持、Device Serial Number和Resizable BAR等能力只有硬件/firmware真正实现状态恢复时才公开。
-
-Host `lspci -vvxxxx` 的每个字段都应能对应 Endpoint IP配置或用户逻辑寄存器。
-
-### 设备树中的 RC 节点
-
-一个抽象的 RC 节点可能包含以下资源：
-
-```dts
-pcie0: pcie@40000000 {
-    compatible = "vendor,soc-pcie";
-    reg = <0x0 0x40000000 0x0 0x100000>;
-    reg-names = "dbi";
-
-    interrupts = <GIC_SPI 100 IRQ_TYPE_LEVEL_HIGH>;
-    clocks = <&cru PCLK_PCIE>, <&cru ACLK_PCIE>, <&cru CLK_PCIE_REF>;
-    clock-names = "pclk", "aclk", "ref";
-    resets = <&cru SRST_PCIE>;
-    reset-names = "phy";
-
-    phys = <&pcie_phy0>;
-    phy-names = "pcie-phy";
-    num-lanes = <1>;
-    reset-gpios = <&gpio2 4 GPIO_ACTIVE_LOW>;
-    status = "okay";
-};
-```
-
-不同平台的字段差异很大，有的把 PERST# 放在 endpoint 节点，有的使用 `reset-gpios`，还有的平台使用专门的 PHY、pipe、rockchip、cadence 或 dwc glue 属性。修改前要对照：
-
-- SoC 官方设备树；
-- 当前内核对应的 binding 文档；
-- 板卡原理图；
-- bootloader 实际加载的 DTB。
-
-### 运行时确认 DTB
-
-```bash
-find /proc/device-tree -iname '*pcie*' -o -iname '*pci*'
-cat /proc/device-tree/soc/pcie@40000000/status
-tr '\0' '\n' < /proc/device-tree/soc/pcie@40000000/compatible
-```
-
-节点路径只是示意，实际路径需要根据 `/proc/device-tree` 查找结果调整。
-
-## 四、Linux 枚举和 lspci 证据
-
-启动后先执行：
-
-```bash
-dmesg | grep -Ei 'pcie|pci|link|ltssm|phy|aer|reset'
-lspci -nn
-lspci -vv
-```
-
-可以按下面的结果分类：
-
-### 情况 1：`lspci` 没有任何设备
-
-优先查 RC 控制器是否 probe、链路是否进入 L0、Endpoint 是否释放 PERST#、参考时钟是否正常。此时还没有必要分析 BAR 或驱动匹配。
-
-### 情况 2：能看到设备，但没有绑定驱动
-
-这说明链路、配置访问和枚举基本成功。接下来检查：
-
-```bash
-lspci -k
-modinfo your_driver
-```
-
-确认 `vendor:device` ID 是否在驱动的 `pci_device_id` 表中，以及模块是否已经加载。
-
-### 情况 3：驱动进入 `probe()`，但资源初始化失败
-
-查看 `lspci -vv` 中的 BAR、BusMaster、MSI/MSI-X 和链路状态，再检查驱动的错误回滚路径。
-
-### 用 lspci 读懂一块真实设备
-
-```bash
-lspci -s 01:00.0 -nn
-lspci -s 01:00.0 -vv
-lspci -s 01:00.0 -xxxx
-```
-
-重点观察：
-
-- `LnkCap`：设备支持的最大速率和宽度；
-- `LnkSta`：当前协商出的速率和宽度；
-- `Region 0` 等 BAR：基地址和大小；
-- `BusMaster+`：是否允许设备发起 DMA；
-- `MSI` / `MSI-X`：中断能力；
-- `AER`：高级错误报告能力；
-- `Kernel driver in use`：当前绑定驱动。
-
-例如设备支持 Gen3 x4，但 `LnkSta` 只有 Gen1 x1，说明链路虽然工作，却存在速度或宽度降级，需要回到信号、lane、参考时钟和训练日志排查。
-
-## 五、链路速度、宽度与稳定性
-
-可以使用：
-
-```bash
-lspci -s 01:00.0 -vv | grep -E 'LnkCap|LnkSta'
-```
-
-还可以查看内核 sysfs：
-
-```bash
-cat /sys/bus/pci/devices/0000:01:00.0/current_link_speed
-cat /sys/bus/pci/devices/0000:01:00.0/current_link_width
-cat /sys/bus/pci/devices/0000:01:00.0/max_link_speed
-cat /sys/bus/pci/devices/0000:01:00.0/max_link_width
-```
-
-如果这些文件不存在，可能是内核版本、设备类型或 sysfs 支持不同，应以 `lspci -vv` 为准。
-
-### 链路稳定性测试
-
-初次 bring-up 不能只执行一次 `lspci`。建议组合测试：
-
-```bash
-for i in $(seq 1 20); do
-    date
-    lspci -s 01:00.0 -vv | grep -E 'LnkSta|DevSta|AER'
-    sleep 1
-done
-```
-
-有条件时再进行：
-
-- 设备复位后重新枚举；
-- 冷启动和热启动对比；
-- 不同 PCIe 代际和宽度测试；
-- 高负载 DMA 测试；
-- runtime suspend/resume；
-- 多次插拔或 hot reset。
-
-稳定性测试的价值在于区分“一次能起来”和“产品可以长期工作”。
-
-### Outbound DMA 从 Host 提供的 dma_addr_t 开始
-
-Host驱动通过 DMA API分配/映射 buffer，把 `dma_addr_t`、length和request id写入 BAR/descriptor。Endpoint outbound DMA将该地址作为 PCIe Memory Request目标；它可能是 IOVA，绝不能按 Host物理地址猜测。
-
-先做 one-shot：Host给 4 KiB，Endpoint写固定 pattern，MSI后Host校验；再做 Endpoint读 Host、scatter-gather和 ring。检查 address高低位、MPS/MRRS、Completion status、IOMMU fault和 Device内部 AXI错误。
-
-Device写 payload/CQE必须先于 MSI可见；reset/PERST#/FLR后停止旧 outbound DMA。若 Host unmap后 Device迟到访问，IOMMU应直接暴露 fault。
-
-## 六、故障定位、Endpoint Framework 与验收
-
-### 故障 1：链路停在 Detect
-
-检查 Endpoint 供电、参考时钟、TX/RX 连接、PERST# 和接收器终端。示波器或高速协议分析仪比反复改软件更有效。
-
-### 故障 2：链路停在 Polling 或 Recovery
-
-重点查信号完整性、lane 极性、参考时钟架构、速率降级配置和 PHY 参数。可以先强制 Gen1/x1 验证基础链路，再逐步提升。
-
-### 故障 3：设备偶尔枚举，冷启动失败
-
-重点看电源时序、PERST# 释放时机、参考时钟稳定时间以及 Endpoint 内部固件启动时间。
-
-### 故障 4：设备能枚举但 DMA 一启动就崩
-
-这已经不是单纯的链路问题，应转向 BusMaster、DMA 地址宽度、IOMMU 映射、缓存一致性和设备侧 DMA 描述符检查。
-
-### 故障 5：开启 ASPM 后链路异常
-
-先关闭省电特性建立稳定基线，再逐项启用 L0s/L1、L1 Substates 和 runtime PM。不要把低功耗问题与初始链路问题混在一起。
-
-### Linux PCI Endpoint Framework 的另一侧视角
-
-当 SoC运行 Linux并充当 Endpoint，PCI Endpoint Framework用 `pci_epc` 表示 Endpoint Controller，EPC driver适配硬件，`pci_epf` Function driver配置 Configuration Space、BAR、MSI和数据协议。`pci_epf_test`/对应 Host test driver可用于最小验证。
-
-Framework API负责 function bind/unbind和资源配置，但 PHY、LTSSM、ATU、DMA/cache仍由 EPC/平台实现。Host侧普通 `pci_driver` 与 Endpoint侧 EPF不是同一角色，调试日志要注明所在端。
-
-这套框架适合验证 BAR read/write/copy/MSI，再扩展自定义 Function，顺序与 FPGA Endpoint最小闭环一致。
-
-EPC driver 负责 controller capability、BAR/ATU window、raise IRQ、start/stop link；EPF driver 负责一个 Function 的 Vendor/Device/Class、BAR 内容和业务协议。configfs 可把 EPF 绑定到某个 EPC/Function，再启动 link。Function bind 成功不等于 Host 已枚举，仍要从 RC 侧读取 Configuration Space 验证。
-
-Inbound window 把 Host 对 BAR 的 Memory TLP 映射到 EP 本地内存/寄存器；Outbound window 让 EP DMA/CPU 发起到 Host address 的事务。两者方向必须明确。EPF test 的 read/write/copy 命令适合验证窗口和 MSI，但高吞吐 DMA 还需要独立 descriptor/ownership 协议。
-
-### 验收清单
-
-- [ ] 已确认 RC/EP 角色和 lane 配置；
-- [ ] REFCLK、PERST#、电源和连接器信号经过原理图核对；
-- [ ] 设备树运行时节点与预期一致；
-- [ ] 链路进入 L0，且速度与宽度符合设计目标；
-- [ ] `lspci -nn` 能看到正确 Vendor ID、Device ID 和 class；
-- [ ] BAR 资源已分配，BusMaster 和 MSI/MSI-X 状态符合设计；
-- [ ] 冷启动、热启动、复位和连续枚举测试通过；
-- [ ] Gen1/x1 基线通过后，再验证目标速率和宽度；
-- [ ] 高负载下没有 AER、Completion Timeout 或链路反复 Recovery。
-
-**参考资料**
-
-- [Linux PCI Endpoint Framework](https://docs.kernel.org/PCI/endpoint/index.html)
-- [PCI Endpoint Function ConfigFS](https://docs.kernel.org/PCI/endpoint/pci-endpoint-cfs.html)
-- [Linux PCI Express Port Bus Driver Guide](https://docs.kernel.org/PCI/pciebus-howto.html)
-
-## 七、PERST#、REFCLK 与电源的时序证据
-
-冷启动稳定性必须同时观察电源轨、Reference Clock 与 PERST#。
-
-Endpoint 应在电源和 REFCLK 满足规范/芯片手册条件后退出 Fundamental Reset。
+`PERST#` 是低有效 Fundamental Reset。上电期间通常保持 Assert，待电源与 REFCLK 稳定、Endpoint 内部准备完成后再 Deassert。GPIO Polarity、Pinmux、Pull 和共享关系任何一个错误都会让设备永久保持 Reset 或提前启动。
 
 ```mermaid
 sequenceDiagram
-    participant P as Power rails
-    participant C as REFCLK
-    participant R as PERST#
-    participant L as Endpoint LTSSM
-    P->>P: rails ramp and become stable
-    C->>C: reference clock stable
-    R->>R: remain asserted for required interval
-    R-->>L: deassert PERST#
-    L->>L: Detect -> Polling -> Configuration -> L0
+    participant PWR as Endpoint power
+    participant CLK as REFCLK
+    participant RST as PERST#
+    participant EP as Endpoint
+    PWR->>PWR: rails become stable
+    CLK->>CLK: reference clock stable
+    RST->>EP: remain asserted during stabilization
+    RST->>EP: deassert after required delay
+    EP->>EP: initialize PHY and configuration space
+    EP-->>EP: begin receiver detect / training
 ```
 
-仅看软件延时值不能证明硬件信号满足时序。
+初次 Bring-up 可以适当延长 Reset Delay用于验证时序假设，但最终值应回到规范和设备手册。无限增加 Delay 只能掩盖其他问题，不能修复错误 Pinmux 或不稳定 Clock。
 
-若热重启稳定、冷启动失败，应重点比较 Power/Clock/Reset 相对关系与 Endpoint 固件启动时间。
+热重启还要确认 Bootloader 与 Kernel 对 PERST# 的交接。如果 Bootloader 已释放并枚举，Kernel 又以错误极性抖动 Reset，冷启动和热启动可能表现不同。
 
-## 八、RC 与 EP 的地址窗口必须成对验证
+## 六、Lane 连接和 PHY 配置必须与硬件一致
 
-Host CPU 访问 EP BAR 依赖 RC Outbound 与 EP Inbound Window。
+RC TX 连接 EP RX，RC RX 连接 EP TX。差分对极性翻转、Lane Reversal 和 Lane Bifurcation 是否支持由控制器/PHY 决定，不能假设所有错误都能自动纠正。
 
-EP DMA 访问 Host RAM 依赖 Host DMA Mapping 与 EP Outbound Window。
+RK356x 平台还要确认 Controller Instance、PHY Instance、Lane 数量、模式和共享资源。SerDes 可能在 PCIe、SATA、USB3 等协议间复用，Firmware/Device Tree 选择错误会让 Controller Register 正常却没有真实 PCIe PHY。
+
+PHY 初始化通常包括 Power On、Reset、Mode、Reference Clock 和校准。Driver 日志若显示 PHY Timeout，应先回到这些输入，不要继续调 ATU；因为 LTSSM 尚未产生可用 Link，配置 TLP 无处发送。
+
+## 七、Clock、Reset 与 Controller 初始化有依赖顺序
+
+SoC PCIe Host Driver 需要打开 APB/AXI/Core/PHY 等 Clock，解除 Controller/PHY Reset，配置 Mode 与 DesignWare Core，再 Enable LTSSM。具体名称依赖 Binding，但依赖关系相同。
+
+```text
+power domain on
+  -> clocks enabled
+  -> controller and PHY reset sequencing
+  -> PHY mode/init/power_on
+  -> DesignWare core/DBI configuration
+  -> outbound/inbound windows
+  -> enable LTSSM
+```
+
+Register Dump 只有在相应 Clock/Power Domain 已打开时才可信。对一个被 Reset 或断电的 Block 读取全零，不能说明配置字段本来就是零。
+
+错误路径也要逆序关闭。若 Probe 失败却留下 Clock/PHY 半开，下一次 Rebind 可能得到与冷启动不同的状态，导致“第二次反而成功”的假象。
+
+## 八、LTSSM State 把电气问题缩小到阶段
+
+LTSSM 从 Detect、Polling、Configuration 进入 L0，必要时进入 Recovery。不同 State 指向不同前提：Detect 关注 Receiver/电源/连接，Polling 关注 Training Sequence/Clock/Signal，Configuration 关注 Lane/Width，Recovery 关注重训练、均衡和速率变化。
+
+```mermaid
+stateDiagram-v2
+    [*] --> Detect
+    Detect --> Polling: receiver present
+    Polling --> Configuration: training sequences valid
+    Configuration --> L0: lane and width agreed
+    L0 --> Recovery: retrain / error / speed change
+    Recovery --> L0: successful recovery
+    Recovery --> Detect: link lost
+```
+
+反复 Detect 通常不应先怀疑 Linux BAR；反复 Polling/Recovery 更接近 REFCLK、Signal Integrity、Equalization 或两端 Capability；进入 L0 后才能继续验证配置访问。
+
+有些 Controller 只提供 Link Up Bit而不公开完整 LTSSM，仍可结合 PHY Status、Debug Register、Endpoint Side Status 和 Analyzer 缩小范围。记录每次启动 State 和耗时比只打印最终“link fail”更有价值。
+
+## 九、Config ATU 让 Host 按 BDF 访问配置空间
+
+Link 进入 L0 后，RC 还要把 CPU Configuration Window 转换成 PCIe Type 0/Type 1 Configuration Request。DesignWare Controller 常使用 Outbound iATU Region，Root Bus/Direct Child 与 Bridge 后设备使用的 Configuration Type 可能不同。
 
 ```mermaid
 flowchart LR
-    CPU[Host CPU address] --> RCO[RC outbound ATU]
-    RCO --> BAR[EP BAR bus address]
-    BAR --> EPI[EP inbound ATU]
-    EPI --> LOCAL[EP local register/SRAM]
-    EPDMA[EP DMA local address] --> EPO[EP outbound ATU]
-    EPO --> HDMA[Host DMA address]
-    HDMA --> RAM[Host RAM]
+    CPU[CPU config window access] --> ATU[RC outbound config ATU]
+    ATU --> TLP[Type 0 or Type 1 config TLP]
+    TLP --> EP[Endpoint BDF]
+    EP --> CPL[Completion with VID/DID]
+    CPL --> CORE[Linux PCI Core]
 ```
 
-先用 side-effect-free BAR ID Register 验证 Host->EP，再用受控 DMA Buffer 验证 EP->Host。
+因为 Configuration Path 与 Memory BAR Path 可以使用不同 ATU Region，所以 Link Up 仍可能 `lspci` 为空；反过来配置空间可读也不证明 Memory Address Translation 已正确。
 
-配置空间可读只证明 Config Transaction 路径，不证明这两个 Memory 路径。
+检查 Config ATU 时核对 CPU Base/Limit、PCI Target、Transaction Type、Bus Number 和 Region Enable。不要把针对某个 Kernel/SoC 的 Register Offset 复制到另一 Controller Revision。
 
-## 九、小结
+## 十、Memory address translation 决定 BAR 访问路径
 
-PCIe Endpoint bring-up 的主线是：
+枚举发现设备后，Host Bridge `ranges` 提供 CPU Address 与 PCI Bus Address Window，PCI Core 在 Window 中分配 BAR，RC Outbound ATU 把 CPU MMIO 转换成 PCIe Memory Request。
 
-**确认角色 → 核对时钟与复位 → 检查 PHY 和 lane → 让 LTSSM 进入 L0 → 完成枚举 → 验证 BAR/中断 → 进入 DMA。**
+```text
+driver virtual address
+  -> CPU physical PCI window
+  -> RC outbound address translation
+  -> PCI bus address
+  -> Endpoint BAR match
+  -> optional EP inbound translation
+  -> device local register or memory
+```
 
-驱动只是在这条链路稳定后接管设备。遇到 `probe()` 不进，应先问设备是否已经出现在 `lspci`；遇到 DMA 数据错误，应先确认链路、BAR、BusMaster 和地址映射，再分析软件队列。
+如果 `lspci` 能看到设备、BAR 有地址，但 `readl()` 全 1，应把调查移到 Command Memory Enable、Bridge Window、Host `ranges`、Memory ATU 和 EP BAR/Internal Decode。继续修改 Config ATU 不会解决 Memory Path。
 
----
+DMA Direction 还会使用 Host `dma-ranges` 与 IOMMU，不能把 BAR MMIO Window 当成设备 DMA Address。第 03 和第 10 篇的地址模型在 Bring-up 中分别对应 Memory Outbound 与 DMA Translation。
+
+## 十一、Linux Host Bridge 创建后才轮到 PCI Core
+
+RK356x Host Driver完成硬件与 Window 后，向 PCI Core 注册 Host Bridge。PCI Core 创建 Root Bus、调用配置访问、递归扫描并建立 `pci_bus/pci_dev`。此时 `lspci` 才有数据，功能 Driver 才可能 Match。
+
+```text
+platform driver probe
+  -> resources / clocks / resets / PHY
+  -> link bring-up
+  -> host bridge windows and pci_ops
+  -> common PCI host probe
+  -> pci_scan_child_bus
+  -> pci_dev creation
+  -> function driver probe
+```
+
+这条边界非常重要：Host Driver Log 表示控制器阶段，`lspci` 表示 PCI Core 阶段，Function Driver Log 表示设备业务阶段。按阶段保存日志，才能知道问题第一次出现在哪里。
+
+## 十二、Bring-up 证据按层收集
+
+| 层 | 要证明的事实 | 代表性证据 |
+| --- | --- | --- |
+| 供电 | RC/EP Rail 稳定 | 电压、纹波、PWRGD、时序 |
+| Clock/Reset | REFCLK 与 PERST# 正确 | 示波器、GPIO/Pin State、时序 |
+| PHY | Lane/Mode/校准完成 | PHY Status、Driver Log |
+| Link | LTSSM 到 L0、Speed/Width 正确 | Controller/Port Link Status |
+| Config | VID/DID Completion 返回 | Config ATU、`lspci` |
+| Resource | BAR/Bridge Window 可分配 | `lspci -vv`、sysfs resource |
+| Function | Driver Match/Probe 成功 | modalias、Driver Link、dmesg |
+
+不要只收集成功证据。若 Config Request 没有 Completion，需要记录 Request 是否发出、Endpoint 是否收到、返回是否被 RC/桥丢弃；负面证据必须说明工具能观察到哪一段。
+
+## 十三、本篇检查点
+
+现在应当能够解释“`lspci` 看不到设备”为什么要从供电、REFCLK、PERST#、PHY、LTSSM 和 Config ATU 排查，而不是修改功能驱动。还应能区分 Configuration Path、Memory address translation 和 DMA Translation。
+
+面对 Link Up 但无 BDF，应检查 Config Window/ATU/Bus Routing；面对 BDF 可见但 BAR 访问失败，应进入 Memory Window/ATU；面对 Driver 不绑定，再检查 modalias、ID Table 与 Probe。这就是分层 Bring-up 的核心。
+
+## 十四、小结：下一篇让 Linux 设备扮演 Endpoint
+
+Root Complex Bring-up 是一条严格依赖链：供电、REFCLK 和 PERST# 建立硬件前提，PHY 与 LTSSM 建立 Link，Config ATU 建立 BDF 访问，Host Window 与 Memory ATU 建立 BAR 路径，PCI Core 最后创建软件对象。
+
+下一篇转换角色：让运行 Linux 的 SoC 自己成为 Endpoint。我们会解释 Endpoint Controller、Endpoint Function、ConfigFS 和 Host Test Driver 如何协作，并使用主线 `pci_epf_test` 展示 BAR、IRQ 和数据传输，而不是把 RK356x RC 配置硬套到 EP 模式。
+
+**一手资料**
+
+- [Linux PCI host bridge API](https://docs.kernel.org/driver-api/pci/index.html)
+- [Linux DesignWare PCIe controller source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci/controller/dwc?h=linux-6.12.y)
+- [Linux Rockchip PCIe PHY bindings](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/Documentation/devicetree/bindings/phy/rockchip?h=linux-6.12.y)
