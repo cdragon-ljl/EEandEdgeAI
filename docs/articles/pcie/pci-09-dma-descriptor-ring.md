@@ -1,528 +1,262 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #09 · DMA Descriptor Ring、所有权与复位协议"
-description: "以 Linux 6.12 为基线，从 SQ/CQ、producer/consumer 和 phase bit 出发，解释 Descriptor 发布、DMA 内存序、Doorbell、背压、超时与 generation reset。"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #09 · DMA Descriptor Ring、所有权、Doorbell 与 Completion"
+description: "从一个 Descriptor 的所有权循环出发，讲清 Submission/Completion Ring、Producer/Consumer、Phase Bit、Doorbell、Backpressure、Request Table、Reset Generation 与释放顺序。"
 pubDate: "2026-08-29"
 series: pcie
 order: 9
-tags: ["PCIe", "DMA Ring", "Memory Ordering", "Linux 6.12"]
+tags: ["PCIe", "DMA", "Descriptor Ring", "Linux 6.12"]
 draft: false
 ---
 
-高吞吐 PCIe 设备很少为每个请求只提供一组“地址、长度、启动”寄存器。
+第 08 篇只提交了一个 Buffer，但真实网卡、NVMe、采集卡和加速器需要持续并发处理大量请求。若每次请求都重新分配控制结构、写寄存器并等待完成，PCIe 往返延迟和 CPU 开销会把吞吐限制在很低水平。
 
-更常见的设计是 Descriptor Ring：Host 在内存中发布一批描述符，Device DMA 读取并执行，再把完成状态写回 Completion Ring 或原描述符。
+Descriptor Ring 用一段共享内存批量描述请求，Doorbell 只通知“Producer 前进到哪里”，Completion Ring 再让设备批量交还所有权。难点不是 Ring 是圆形，而是 CPU 与 Device 如何在 Wrap、并发、超时和 Reset 中对每个槽位保持唯一 Owner。
 
-Ring 的难点不在环形下标，而在并发协议：
+本文使用原创教学协议解释通用机制。寄存器、Descriptor Layout 和 VID/DID 都不能直接套到真实设备；`rtw88`、NVMe 或其他主线驱动只在后续作为这些模式的具体实现案例。
 
-- 谁拥有某个槽位。
-- Descriptor 字段何时对设备可见。
-- Doorbell 与内存写入的先后如何保证。
-- Completion 数据何时对 CPU 可见。
-- Ring 满时如何把背压传到上层。
-- timeout/reset 后旧完成为何不能污染新请求。
+## 一、先看问题：一个 Descriptor 怎样完成所有权循环
 
-本文以 Linux 6.12 DMA API 为基线，使用一个明确标注为虚构的教学设备协议说明这些机制。
-
-## 一、先定义教学设备的寄存器与描述符合同
-
-本文假设设备有：
-
-- Submission Queue（SQ）：Host 生产，Device 消费。
-- Completion Queue（CQ）：Device 生产，Host 消费。
-- 每队列 Doorbell 寄存器。
-- MSI-X Completion Interrupt。
-- Queue Enable/Reset/Status 寄存器。
-
-这不是任何真实芯片的寄存器定义。
-
-实际驱动必须以公开 Hardware Programming Manual 为准。
-
-```mermaid
-flowchart LR
-    APP[upper-layer request] --> DRV[driver request object]
-    DRV --> SQ[Submission Descriptor Ring]
-    SQ --> DB[MMIO Doorbell]
-    DB --> DEV[PCIe Device Engine]
-    DEV --> DMA[DMA payload]
-    DEV --> CQ[Completion Ring]
-    CQ --> MSI[MSI-X]
-    MSI --> POLL[IRQ/NAPI/poll completion]
-    POLL --> APP
-```
-
-一个 SQ Descriptor 可包含：
-
-```c
-struct teach_sq_desc {
-	__le64 dma_addr;
-	__le32 length;
-	__le16 command;
-	__le16 request_id;
-	__le32 flags;
-	__le32 generation;
-};
-```
-
-CQ Entry 可包含：
-
-```c
-struct teach_cq_desc {
-	__le16 request_id;
-	__le16 status;
-	__le32 bytes_done;
-	__le32 generation;
-	u8 phase;
-	u8 reserved[3];
-};
-```
-
-字段大小、字节序和对齐都属于硬件 ABI。
-
-## 二、Ring Capacity 与下标表示法
-
-设 Ring 深度为 `N`，且 `N` 是 2 的幂。
-
-数组槽位可用：
-
-```c
-slot = counter & (N - 1);
-```
-
-常见两种计数模型：
-
-1. producer/consumer 只保存 0..N-1 下标，留一个空槽区分满与空。
-2. 使用单调递增的扩展 counter，`producer - consumer` 表示占用数，可用全部 N 个槽。
-
-第二种更适合软件，前提是整数回绕比较经过设计。
-
-```mermaid
-stateDiagram-v2
-    [*] --> Empty: producer == consumer
-    Empty --> Partial: submit one or more
-    Partial --> Full: producer - consumer == N
-    Full --> Partial: consume completion/free slot
-    Partial --> Empty: all requests complete
-    Full --> Full: reject or wait new submit
-```
-
-Ring Size 不应由设备未验证值直接决定分配。
-
-驱动要限制最小/最大深度、对齐、每队列内存上限和设备 capability。
-
-## 三、SQ 的槽位所有权状态机
-
-一个 SQ 槽位可经历：
-
-```text
-FREE -> CPU_FILLING -> DEVICE_OWNED -> COMPLETED -> FREE
-```
-
-CPU_FILLING 时只有 Driver 可以写 Descriptor。
-
-发布后 Device 取得所有权，CPU 不得修改 DMA Address、Length 或 Flags。
-
-Completion 到达且设备不再读取 Descriptor 后，Driver 才能回收。
+先忽略 Ring，只看一个 Submission Descriptor。CPU 填写 DMA Address、Length 和 Request ID，Barrier 后把 Descriptor 交给 Device；Device 读取并执行 DMA，在 Completion 中写回相同 Request ID；CPU 消费 Completion 后才能复用槽位和 Payload。
 
 ```mermaid
 stateDiagram-v2
     [*] --> Free
-    Free --> CpuFilling: reserve slot
-    CpuFilling --> DeviceOwned: descriptor publish + doorbell
-    DeviceOwned --> Completed: CQ reports request
-    Completed --> Free: unmap payload and release request
-    DeviceOwned --> ResetPending: timeout/error reset
-    ResetPending --> Free: device quiesced and generation advanced
+    Free --> CPUPrepared: fill descriptor fields
+    CPUPrepared --> DeviceOwned: dma_wmb + publish tail
+    DeviceOwned --> Completed: device DMA + completion write
+    Completed --> CPUOwned: observe owner/phase + dma_rmb
+    CPUOwned --> Free: unmap payload and release request
 ```
 
-“写完 Descriptor”不是所有权自动转移。
+每个状态都对应允许的访问者。FREE 时 CPU 可以重写；DEVICE_OWNED 时 CPU 不能修改 Descriptor 或 Payload Mapping；COMPLETED 只表示设备已经发布完成，CPU 还要用 Barrier 和 Request Table 恢复软件上下文。
 
-真正发布点是完成所有字段、执行 DMA write barrier、更新可见 producer，并写 Doorbell。
+因为 Slot Index 会循环复用，所以仅靠“第 7 号槽位完成”不足以判断它属于哪一代请求。Request ID、Phase Bit 和 Generation 分别解决请求关联、Ring Wrap 和 Reset 后旧完成隔离，三者不应混成一个字段。
 
-## 四、为什么 coherent ring 仍然需要内存屏障
+## 二、教学协议只定义理解 Ring 所需的最小字段
 
-`dma_alloc_coherent()` 保证 CPU 与设备对这块内存具有一致性 DMA 语义。
-
-它不保证编译器/CPU 会按源代码顺序把 Descriptor 字段写入和 MMIO Doorbell 发出。
-
-提交路径通常：
+Submission Queue（SQ）由 CPU 生产、Device 消费；Completion Queue（CQ）由 Device 生产、CPU 消费。代表性 Descriptor 如下：
 
 ```c
-desc->dma_addr = cpu_to_le64(payload_dma);
-desc->length = cpu_to_le32(length);
-desc->request_id = cpu_to_le16(id);
-desc->generation = cpu_to_le32(queue->generation);
+struct demo_sqe {
+    __le64 payload_dma;
+    __le32 payload_len;
+    __le16 request_id;
+    __le16 flags;
+};
 
-dma_wmb();
-writel(queue->producer, queue->doorbell);
-```
-
-`dma_wmb()` 保证此前对 DMA coherent memory 的写，在设备观察到后续发布动作前可见。
-
-具体硬件还可能要求读取某寄存器 flush posted MMIO write。
-
-不要用 `barrier()` 替代 DMA Memory Barrier。
-
-编译器屏障不解决 CPU/Interconnect/Device 可见顺序。
-
-## 五、Doorbell 是通知，不是 Descriptor 数据本身
-
-Doorbell 通常携带新 producer index 或新增数量。
-
-Device 收到 Doorbell 后从 SQ DMA 读取 Descriptor。
-
-如果 Doorbell 先于 Descriptor 字段可见，设备可能读到上一轮数据或半写状态。
-
-```mermaid
-sequenceDiagram
-    participant CPU as Driver CPU
-    participant MEM as Coherent SQ Memory
-    participant BAR as MMIO Doorbell
-    participant DEV as Device DMA Engine
-    CPU->>MEM: write all descriptor fields
-    CPU->>CPU: dma_wmb
-    CPU->>BAR: writel new producer
-    BAR-->>DEV: notify work available
-    DEV->>MEM: DMA read descriptor
-    MEM-->>DEV: complete published descriptor
-```
-
-Doorbell batching 可以减少 MMIO 写。
-
-Driver 可连续填充多个 Descriptor，只执行一次 barrier 和 Doorbell。
-
-批量过大则增加首个请求等待时间。
-
-吞吐与尾延迟需要测量，不应固定一个“万能 batch size”。
-
-## 六、Payload 使用 Streaming DMA Mapping
-
-Ring Descriptor 常驻且频繁复用，适合 coherent allocation。
-
-业务 Payload 体积大、方向明确，常使用 streaming mapping：
-
-```c
-dma_addr_t dma = dma_map_single(&pdev->dev, buffer, length,
-				DMA_TO_DEVICE);
-if (dma_mapping_error(&pdev->dev, dma))
-	return -EIO;
-```
-
-Mapping 成功后直到 unmap，CPU 不应访问由设备拥有的缓冲。
-
-Completion 后：
-
-```c
-dma_unmap_single(&pdev->dev, dma, length, DMA_TO_DEVICE);
-```
-
-DMA_FROM_DEVICE 数据要在 Device 完成并经过正确可见性顺序后才交给 CPU/上层。
-
-Scatter-Gather Payload 使用 `dma_map_sg()`，Descriptor 可能指向 SG List 或拆成多个硬件条目。
-
-不要假设返回 segment 数等于输入 `nents`。
-
-## 七、CQ 的 phase bit 解决环回歧义
-
-CQ 由 Device 写，CPU 读。
-
-若 producer index 不通过 MMIO 暴露，可在每个 CQ Entry 使用 phase bit。
-
-Host 维护 expected phase。
-
-当 Entry 的 phase 等于 expected，说明它属于当前环次。
-
-consumer 从最后一个槽回到 0 时翻转 expected phase。
-
-```mermaid
-flowchart TD
-    C[read CQ at consumer] --> P{entry.phase == expected?}
-    P -- no --> STOP[no new completion]
-    P -- yes --> R[dma_rmb before reading payload fields]
-    R --> V[validate id/status/generation]
-    V --> ADV[consumer++]
-    ADV --> W{wrapped to slot 0?}
-    W -- yes --> FLIP[expected phase ^= 1]
-    W -- no --> C
-    FLIP --> C
-```
-
-phase bit 必须由 Device 最后写入，或硬件协议保证它是 Entry 发布标志。
-
-如果硬件先写 phase 再写其他字段，Host 仍可能读到半完成 Entry。
-
-协议文档必须定义 Entry 原子发布顺序。
-
-## 八、读取 CQ 需要 dma_rmb
-
-CPU 观察到有效 phase/owner 后，应执行 `dma_rmb()`，再读取 status、bytes 与 request_id。
-
-这保证设备在发布 owner/phase 前的 DMA 写，对 CPU 后续读取可见。
-
-典型：
-
-```c
-if (READ_ONCE(cqe->phase) != queue->phase)
-	break;
-
-dma_rmb();
-id = le16_to_cpu(cqe->request_id);
-status = le16_to_cpu(cqe->status);
-bytes = le32_to_cpu(cqe->bytes_done);
-```
-
-`READ_ONCE()` 防止编译器合并/重排该标志读取，但不能替代 `dma_rmb()`。
-
-若 CQ 位于 non-coherent streaming buffer，还需要 DMA sync API；硬件协议通常让 Ring 使用 coherent memory以简化。
-
-## 九、Request Table 把 request_id 映射回软件对象
-
-Descriptor 只保存有限位宽的 request_id。
-
-Driver 需要 Request Table：
-
-```c
-struct teach_request {
-	void *buffer;
-	dma_addr_t dma;
-	size_t length;
-	u32 generation;
-	unsigned long deadline;
-	/* upper-layer completion context */
+struct demo_cqe {
+    __le16 request_id;
+    __le16 status;
+    __le32 result_len;
+    u8 phase;
+    u8 reserved[7];
 };
 ```
 
-提交前保留 ID 并把 Request Object 发布到 Table。
+SQE/CQE 通常放在 `dma_alloc_coherent()` 得到的内存中，因为双方长期共享控制字段；Payload 使用 Streaming Mapping，因为数据更大、生命周期随请求变化。Coherent 只省去显式 Cache Sync，不省略 `dma_wmb()`/`dma_rmb()`。
 
-CQ 消费时先验证 ID 范围、Table Entry 存在、generation 相符，再释放。
+设备寄存器只需要表达 Queue Base、Depth、Head/Tail 或 Doorbell。真实设备可能使用不同布局、Shadow Doorbell 或 Event Index，但它们都在解决“共享内存已经更新，另一方何时开始处理”的通知问题。
 
-设备返回重复、越界或已释放 ID 属于协议/硬件错误，不能直接数组越界访问。
+## 三、Producer 和 Consumer 定义容量而不是数组长度
 
-ID 复用过快会让延迟完成错误命中新 Request。
+长度为 `N` 的 Ring 常用单调递增 Producer/Consumer 计数，实际数组索引为 `counter & (N - 1)`，要求 `N` 是 2 的幂。可用条目数由两者差值决定：
 
-generation 或更宽 tag 用于隔离。
+```text
+used = producer - consumer
+free = depth - used
+slot = producer & (depth - 1)
+```
 
-## 十、Ring Full 时背压必须传播
-
-SQ 满时不能覆盖 DeviceOwned Descriptor。
-
-不同上层可选择：
-
-- 网络驱动停止 TX Queue，Completion 后 wake。
-- Block Driver 返回 resource/重排队。
-- 字符驱动阻塞 write 或 `O_NONBLOCK` 返回 `-EAGAIN`。
-- 内核 API 返回 `-EBUSY`。
+如果只保存取模后的 Head/Tail，`head == tail` 同时可能表示 Empty 和 Full，因此还需要保留一个空槽、Phase/Wrap Bit 或单调计数。选择哪种方案必须在软件和硬件协议中一致。
 
 ```mermaid
 flowchart LR
-    SUB[submit request] --> F{SQ has free slot and ID?}
-    F -- yes --> MAP[map payload + fill descriptor]
-    MAP --> PUB[publish and ring doorbell]
-    F -- no --> BP[apply upper-layer backpressure]
-    CQ[consume completion] --> FREE[free slot/ID]
-    FREE --> WAKE[wake stopped queue/waiter]
-    WAKE --> SUB
+    P[producer monotonic counter] --> SLOT[slot = producer & mask]
+    C[consumer monotonic counter] --> USED[used = producer - consumer]
+    P --> USED
+    USED --> FULL{used == depth?}
+    FULL -- yes --> BP[backpressure]
+    FULL -- no --> WRITE[prepare next descriptor]
 ```
 
-背压阈值不一定等到完全满。
+Ring Full 不是异常，而是正常流控状态。因为覆盖一个仍由 Device 拥有的 Descriptor 会同时破坏 DMA Address、Request ID 和 Completion 关联，所以提交路径必须在获得槽位前实施 Backpressure。
 
-保留少量 Descriptor 可用于管理命令、flush 或 reset，取决于硬件协议。
+## 四、SQ 发布顺序把 CPU 数据交给设备
 
-## 十一、中断处理与 Completion Poll 分工
+提交路径先在 Request Table 预留 Software Context 和唯一 Request ID，再 Map Payload，最后填写 SQE。只有全部字段写完，才能增加 Producer 并写 Doorbell：
 
-MSI-X Handler 应快速确认向量来源、屏蔽/确认必要状态，并安排 Poll。
+```c
+sqe = &sq[prod & ring_mask];
+sqe->payload_dma = cpu_to_le64(dma);
+sqe->payload_len = cpu_to_le32(len);
+sqe->request_id = cpu_to_le16(req_id);
+sqe->flags = cpu_to_le16(DEMO_SQE_VALID);
 
-大量 CQ Entry 可在 NAPI、tasklet/threaded IRQ 或 workqueue 中批量处理。
+dma_wmb();
+WRITE_ONCE(ring->sq_prod, prod + 1);
+writel(prod + 1, bar0 + DEMO_SQ_DOORBELL);
+```
 
-选择取决于子系统与延迟要求。
+`dma_wmb()` 的位置表示：Device 一旦观察到新 Tail，就必须同时看到完整 SQE 和 Payload Mapping。若先更新 Producer 再填 Address，设备可能把半初始化字段当成真实 DMA Address。
 
-处理顺序：
+Request Table 必须在 Doorbell 前可查询，因为快速设备可能在 `writel()` 返回前就完成请求并触发 IRQ。把 Software Context 放到 Doorbell 后才登记，会造成 Completion 找不到 Request 的竞态。
 
-1. 确认 CQ 有有效 Entry。
-2. `dma_rmb()` 后读取字段。
-3. 验证 request_id/generation。
-4. 解除 Payload DMA Mapping。
-5. 把结果完成给上层。
-6. 更新 consumer。
-7. 写 CQ Doorbell/Head 告知设备已回收。
-8. 按预算决定继续或重新开中断。
+## 五、Doorbell 是通知，不是数据与完成
 
-不要在持有 Ring spinlock 时调用可能重新进入 submit 的上层 completion。
+Doorbell 通常只携带新 Tail、Queue ID 或新增数量。Descriptor 内容已经在 Host Memory 中，设备收到 Doorbell 后通过 DMA Read 获取；因此频繁敲 Doorbell 会增加 MMIO Posted Write，而批量更新可以分摊成本。
 
-可以先把已完成 Request 移到本地列表，释放锁后再回调。
+```mermaid
+sequenceDiagram
+    participant CPU as Driver producer
+    participant MEM as SQ memory
+    participant RC as Root Complex
+    participant DEV as Device
+    CPU->>MEM: write N descriptors
+    CPU->>CPU: dma_wmb
+    CPU->>RC: writel new tail doorbell
+    RC->>DEV: posted Memory Write
+    DEV->>MEM: DMA read descriptors
+    DEV->>DEV: execute requests
+```
 
-## 十二、多个队列减少锁竞争
+因为 Doorbell Write 是 Posted，CPU 不应把 `writel()` 返回当成 Device 已经取走 Descriptor。若停止或 Reset 需要确认此前 Doorbell 到达，应使用设备协议定义的 Safe Readback 或 Queue Idle，而不是随意读取可能有副作用的寄存器。
 
-单个 SQ/CQ 会让所有 CPU 竞争 producer/consumer 锁。
+Doorbell Batch 需要在吞吐和延迟之间权衡。Batch 太小增加 MMIO 开销，Batch 太大让第一个 Request 等待更久；第 13 和第 17 篇会把它放进完整性能模型。
 
-Multi-queue 设计常让一个 Queue Pair 对应一个 MSI-X Vector 和 CPU affinity。
+## 六、CQ Phase Bit 解决 Wrap 后的新旧条目判定
 
-请求按 CPU、Flow、Hardware Context 或 NUMA Node 分流。
+Completion Queue 常由 Device 顺序写入，CPU 保存 `cq_cons` 和 `expected_phase`。CQ Slot 初始 Phase 与 Expected 不同；Device 写完 Completion 其他字段后，最后写 Phase，CPU 看到匹配 Phase 才认为条目有效。
 
-每队列拥有独立：
+```c
+cqe = &cq[cq_cons & ring_mask];
+phase = READ_ONCE(cqe->phase);
+if (phase != expected_phase)
+    return 0;
 
-- coherent Ring。
-- producer/consumer/phase。
-- request_id space。
-- spinlock。
-- Doorbell。
-- interrupt/poll state。
+dma_rmb();
+req_id = le16_to_cpu(READ_ONCE(cqe->request_id));
+status = le16_to_cpu(READ_ONCE(cqe->status));
+```
 
-Queue 数不是越多越好。
+`dma_rmb()` 放在确认 Phase 之后，因为 Phase 是 Device 发布 Completion 的 Owner Field。它保证 CPU 之后读取的 Request ID、Status 和 Result Length 不会越过 Owner 检查。
 
-每队列占用内存、MSI-X Vector、Device Context 和 cache footprint。
+Consumer 绕过 Ring 末尾时翻转 `expected_phase`。这样同一个 Slot 上一圈遗留的 Completion 仍带旧 Phase，不会被误认为新完成。Phase Bit 解决 Wrap，不解决 Reset：Reset 后旧 DMA 可能晚到，因此还需要 Generation。
 
-## 十三、timeout 只说明 Request 未按期完成
+## 七、Request Table 把硬件完成恢复成软件请求
 
-timeout 到期时可能是：
+Descriptor 为了紧凑通常只保存 `request_id`，真正的 Buffer Pointer、DMA Mapping、Callback、Timeout 和 Upper-Layer Context 保存在 Driver Request Table。提交时分配 ID，完成时按 ID 查找并验证状态。
 
-- Device 尚未取 Descriptor。
-- DMA 正在进行。
-- Completion 已写但中断丢失。
-- CQ 消费线程卡住。
-- Device/Firmware Hang。
-- Link/AER/IOMMU Fault。
+```text
+request_id -> {
+    generation,
+    payload pointer,
+    dma address and length,
+    direction,
+    completion callback,
+    submit timestamp,
+    state
+}
+```
 
-不能直接 unmap/free Payload，让仍在 DMA 的设备继续访问。
+完成路径必须防止重复 Completion、越界 ID 和状态不匹配。若 `request_id` 不存在或已完成，不应继续 Unmap 任意地址；应记录硬件错误并进入受控恢复。
 
-先收集：
+因为 Request ID 会循环复用，所以 Table Entry 还要有 State/Generation，或者保证 ID 在旧请求彻底结束前不复用。只使用 16-bit ID 的设备可以有很高吞吐，但软件必须处理 Wrap 和在途深度。
 
-- SQ producer/Device consumer。
-- CQ producer/phase/Host consumer。
-- Doorbell 与 Queue Status。
-- MSI-X count。
-- AER 与 IOMMU fault。
-- Request deadline/generation。
+## 八、Backpressure 要在覆盖前发生
 
-只有设备被 quiesce 或 reset 并确认 DMA 停止后，才能强制回收。
+当 SQ Free Slot、Request ID、DMA Mapping、Credit 或 Upper-Layer Budget 不足时，提交路径必须拒绝或排队，而不是覆盖旧槽位。网络驱动可以 Stop TX Queue，Block Driver 可以返回 Resource，异步设备可以让用户等待 Poll/Completion。
 
-## 十四、Reset 的第一步是停止新提交
+```mermaid
+flowchart TD
+    SUBMIT[new request] --> CHECK{SQ slot + req ID + DMA resources?}
+    CHECK -- no --> STOP[apply backpressure]
+    STOP --> WAKE{completion releases enough resources?}
+    WAKE -- no --> STOP
+    WAKE -- yes --> RETRY[retry submission]
+    CHECK -- yes --> MAP[map payload and fill SQE]
+    MAP --> DB[ring doorbell]
+```
 
-Queue Reset 协议：
+Wake 条件应使用阈值和内存顺序，避免每完成一个请求就反复 Stop/Wake。因为 Producer 与 Consumer 可能由不同 CPU 更新，所以共享 Counter 还要选择锁、Atomic 或 Per-Queue Single Producer/Consumer Contract。
 
-1. 原子设置 queue stopping。
-2. 上层停止新 Request。
-3. 屏蔽/同步 IRQ 与 Poll。
-4. 请求设备停止 Queue/DMA。
-5. 等待有界 quiesce；失败升级 FLR/Bus Reset。
-6. 处理所有未完成 Request 为错误。
-7. unmap Payload。
-8. 清空 SQ/CQ 与 Request Table。
-9. 增加 generation，重置 phase/index。
-10. 重新编程 Ring DMA Address/Size。
-11. 启用 Queue、IRQ 和上层提交。
+Backpressure 是端到端的：硬件 Ring 有空间，但 Request Table、DMA Map 或 Upper Layer Budget 耗尽时仍不能提交。只检查 `sq_prod - sq_cons` 会把其他资源耗尽误判成可用。
+
+## 九、中断与 Poll 只负责推动 Consumer
+
+设备写 CQ 后通过 MSI/MSI-X 通知 CPU。Handler 可以直接消费少量 Completion，也可以 Mask Vector 并调度 Poll/NAPI，由 Poll 按 Budget 批量处理，最后在 Ring Empty 时 Unmask 并 Recheck。
+
+```text
+IRQ
+  -> mask queue vector
+  -> poll CQ up to budget
+  -> for each CQE: dma_rmb, lookup request, unmap, callback
+  -> advance cq_cons and notify device if required
+  -> if more work: continue poll
+  -> if empty: unmask, then recheck pending/CQ
+```
+
+Consumer Index 何时写回设备由协议定义。过于频繁写 Head Doorbell 增加 MMIO，过于延迟又可能让设备认为 CQ Full。因此 Completion Batch 与 Interrupt Moderation 应一起调节。
+
+丢中断时，Poll/Watchdog 可能发现 CQ 已前进但 `/proc/interrupts` 不增；IRQ 正常但 Request 不完成，则更像 CQ Owner/Phase、DMA Visibility 或 Request Table 问题。通知证据和数据证据必须分开。
+
+## 十、多队列减少共享状态但增加映射关系
+
+多队列把 Producer/Consumer、Lock、Request Table 分片到多个 Queue，减少不同 CPU 对同一 Cache Line 的竞争。常见映射为 Queue Pair 对应一个 MSI-X Vector，再绑定到处理该流量的 CPU。
+
+每个 Queue 应尽量保持 Single Producer/Single Consumer，或明确 Multi-Producer Lock。把所有 Queue 的 Statistics、Doorbell Record 和 Consumer 放在同一 Cache Line，会产生 False Sharing，抵消分片收益。
+
+多队列也引入 Queue ID、Vector ID、CPU、NUMA Node 和 Reset Scope 的映射。调试日志若只打印 Request ID 而没有 Queue ID，同一个 ID 在不同 Queue 中可能重复，无法还原现场。
+
+## 十一、Timeout、Reset 与 generation 隔离旧完成
+
+Request Timeout 只说明软件没有按期看到 Completion，不证明 Device 已停止访问 Payload。恢复路径先停止新提交、Mask IRQ、停止 Queue，并通过 Device Reset Contract 让旧 DMA 失效，然后才能回收 Mapping。
+
+每次 Queue/Device Reset 增加 `generation`。提交的 Request 记录当前 Generation，Completion 回来时必须与当前 Queue Generation 匹配；不匹配的旧完成只记录并丢弃，不能对已经复用的 Request Entry 再次 Unmap/Callback。
 
 ```mermaid
 stateDiagram-v2
-    Running --> Stopping: timeout/AER/admin reset
-    Stopping --> Quiescing: block submit and sync IRQ
-    Quiescing --> Resetting: device DMA stopped
-    Resetting --> Rebuilding: fail old requests, clear rings, generation++
-    Rebuilding --> Running: reprogram queues and enable
-    Quiescing --> Failed: device cannot stop
-    Failed --> Resetting: FLR/hot reset succeeds
+    [*] --> Gen7Running
+    Gen7Running --> Quiescing: timeout or error
+    Quiescing --> Resetting: stop submissions and DMA
+    Resetting --> Gen8Rebuild: increment generation
+    Gen8Rebuild --> Gen8Running: rebuild rings and IRQ
+    Gen7Running --> OldCompletion: delayed CQE
+    OldCompletion --> Dropped: generation mismatch
 ```
 
-## 十五、generation 隔离旧完成
+Generation 不能替代真正停止 DMA；它只防止软件误接收旧 Completion。如果设备仍用旧 DMA Address 写 Host Memory，IOMMU Fault 或内存破坏仍会发生，因此 Reset 的硬件停止证据是前提。
 
-每次 Queue 重新初始化增加 generation。
+## 十二、释放顺序从 ownership 反推
 
-SQ Descriptor 与 Request Object 记录当前值。
+正常 remove 先撤销用户/上层提交，停止所有 Queue，Mask/同步 IRQ，确认 Device 不再访问 Ring 与 Payload，然后逐请求 Unmap，释放 Coherent SQ/CQ，最后解除 BAR 和 Device Enable。
 
-CQ Entry 返回 generation 或使用包含 generation 的 tag。
+```text
+stop new submissions
+  -> quiesce queues and device DMA
+  -> synchronize IRQ / poll / workers
+  -> complete or cancel request table entries
+  -> unmap streaming payloads
+  -> free coherent SQ/CQ
+  -> free IRQ vectors
+  -> unmap BAR and disable device
+```
 
-Completion 不匹配时不能完成当前 Request。
+若先 Free Ring，设备可能继续写 CQ；若先 Unmap Payload，旧 Descriptor 仍可能引用该地址；若先 Free IRQ，Completion 无人消费且停止握手可能永远等不到。因此每一步都由当前 Owner 推导，而不是按 API 名称倒序机械排列。
 
-如果硬件 ABI 没有 generation 字段，可通过更宽 request_id、延迟 ID 复用、reset 后清空 CQ/等待硬件保证等方法降低风险。
+## 十三、本篇检查点
 
-仅在软件变量里增加 generation，而 CQ 没有任何可关联信息，无法识别一个看似合法的延迟旧 ID。
+现在应当能够追踪一个 SQE：CPU 获得 Free Slot，预留 Request ID，Map Payload，填字段，`dma_wmb()` 后更新 Producer 和 Doorbell；Device 完成后先写 CQE 内容、最后写 Phase，CPU 匹配 Phase、`dma_rmb()`、查 Request Table 并回收 Mapping。
 
-协议设计阶段应预留这一能力。
+还应能区分 Producer/Consumer 与数组索引，Phase Bit 与 Generation，Doorbell 与 Descriptor 内容，Ring Full 与错误，以及为什么 Timeout 不能自动交还 ownership。
 
-## 十六、内存释放顺序
+## 十四、小结：下一篇解释 DMA Address 背后的 IOMMU
 
-正常 remove：
+Descriptor Ring 把单次 DMA 扩展成持续并发协议。Producer/Consumer 管理容量，Doorbell 通知进度，Phase Bit识别 Wrap，Request Table 恢复软件上下文，Backpressure 防止覆盖，Generation 隔离 Reset 前后的请求。
 
-1. 停止上层 Queue。
-2. 禁止 Device 产生新 DMA。
-3. 同步 IRQ/Poll/Work。
-4. 完成或失败所有 Request。
-5. unmap 所有 streaming Payload。
-6. `dma_free_coherent()` 释放 SQ/CQ。
-7. 释放 MSI-X、BAR 和设备资源。
+下一篇将继续追踪 Descriptor 中的 DMA Address：它怎样成为 IOMMU IOVA，Domain 与 Group 怎样限制设备，IOTLB 为什么影响性能，以及 ATS、PRI、PASID 和 SVA 为什么必须按依赖顺序启用。
 
-如果先 free coherent Ring，Device 仍可能 DMA 写入已被内核重新分配的页面。
-
-这是数据破坏和安全问题，不只是 Driver Crash。
-
-## 十七、常见错误设计
-
-### Doorbell 前没有 dma_wmb
-
-在强顺序测试平台上可能长期正常，在弱顺序 ARM/ARM64 上偶发设备读到旧 Descriptor。
-
-### 只使用 volatile
-
-`volatile` 不建立 CPU-Device happens-before，也不提供 DMA Barrier。
-
-### Ring Full 覆盖未完成槽位
-
-会把 DMA 地址和 request_id 改成新请求，导致任意内存访问或错误完成。
-
-### timeout 直接 unmap
-
-设备可能仍在 DMA，产生 IOMMU fault 或写入已复用内存。
-
-### reset 后立即复用 request_id
-
-延迟旧 CQ Entry 可能完成新请求。
-
-### CQ 只看 status 不看 phase
-
-环回后旧 Entry 被重复消费。
-
-## 十八、验证与故障注入
-
-至少验证：
-
-- N=2、N=4 的极小 Ring 边界。
-- producer/consumer 回绕数百万次。
-- Queue Full 的阻塞/非阻塞背压。
-- Completion 批处理预算。
-- 中断丢失后 Poll 是否能发现 CQ。
-- Payload Mapping 失败。
-- Descriptor 填到一半触发 reset。
-- timeout 与正常 completion 同时发生。
-- reset 后注入旧 generation CQ。
-- remove 时仍有 Request 在途。
-
-使用 IOMMU、KASAN、KCSAN、lockdep 与 DMA API debug。
-
-吞吐测试之外记录 P50/P99 延迟、Queue Occupancy、Doorbell Batch、Interrupt Rate 和 timeout count。
-
-## 十九、Linux 6.12 一手资料
+**一手资料**
 
 - [Linux 6.12 DMA API HOWTO](https://www.kernel.org/doc/html/v6.12/core-api/dma-api-howto.html)
-- [Linux DMA API](https://docs.kernel.org/core-api/dma-api.html)
-- [Linux memory barriers](https://docs.kernel.org/core-api/wrappers/memory-barriers.html)
-- [Linux stable DMA mapping header](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/linux/dma-mapping.h?h=linux-6.12.y)
-- [PCI-SIG specifications](https://pcisig.com/specifications)
-
-## 二十、小结
-
-Descriptor Ring 是 CPU 与 Device 共享的并发协议，不是普通循环数组。
-
-SQ 的 producer/consumer 表示容量，槽位在 FREE、CPU_FILLING、DEVICE_OWNED、COMPLETED 间转移。
-
-coherent Ring 仍需 `dma_wmb()` 保证 Descriptor 先于 Doorbell 发布。
-
-CQ 通过 phase bit 区分环次，CPU 观察有效标志后用 `dma_rmb()` 读取完成字段。
-
-Payload 常使用 streaming DMA Mapping，所有权在 submit 到 completion/unmap 之间属于设备。
-
-Ring Full 必须把背压传给网络、块、字符或内部调用者。
-
-timeout 不能直接释放可能仍被 DMA 的内存。
-
-reset 必须先 quiesce，再失败旧请求、清 Ring、增加 generation、重新编程并恢复。
-
-只有把这些发布与回收顺序写成明确协议，Ring 才能在弱内存序、IOMMU、热复位和高并发下可靠运行。
+- [Linux Memory Barriers](https://docs.kernel.org/core-api/wrappers/memory-barriers.html)
+- [Linux 6.12 PCI driver API](https://www.kernel.org/doc/html/v6.12/driver-api/pci/pci.html)

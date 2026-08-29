@@ -1,36 +1,85 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #08 · DMA API、地址域、所有权与内存序"
-description: "从 CPU VA、PA、DMA address 到 coherent/streaming/SG API，再以 descriptor ring 推导所有权、barrier、doorbell、completion、reset 和用户内存。"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #08 · DMA API、地址域、缓存一致性与内存顺序"
+description: "用一个 TX Buffer 的 CPU/Device ownership 交接讲清 DMA Address、Mask、coherent/streaming mapping、SG、Cache Sync、Barrier 与释放顺序。"
 pubDate: "2026-08-29"
 series: pcie
 order: 8
 tags: ["PCIe", "DMA", "Memory Ordering", "Linux 6.12"]
 draft: false
 ---
-PCIe 设备的价值之一，是不让 CPU 用 MMIO 一字一字搬运大数据。设备内部 DMA Engine 读取 descriptor，直接访问 Host memory，再通过 completion 和中断通知驱动。性能来自异步并行，风险也来自异步：地址、cache、映射和 buffer ownership 任何一项错误都可能破坏内存。
 
-本文所有 DMA API 和内存屏障语义固定以 Linux 6.12 为基线。
+第 07 篇解释了设备怎样通知 CPU，但通知通常只表示“某个 DMA 请求完成”。真正的数据位于 Host Memory，设备却不能直接使用驱动手里的普通 C 指针。那么驱动把一块 Buffer 交给设备时，地址怎样转换，Cache 由谁同步，完成前后谁可以访问？
 
-本篇先区分地址，再解释 Linux DMA API，最后以 descriptor ring 建立完整发布/完成/取消协议。
+DMA 最难的地方不是函数多，而是三个问题经常混在一起：地址是否可达、缓存是否可见、访问顺序是否正确。Linux DMA API 分别提供 Mask/Mapping、Sync 和 Barrier 来处理它们；少调用一个接口，系统可能只在 IOMMU、非一致性 ARM 或高并发下暴露故障。
 
-## 一、CPU 虚拟地址、物理地址与 DMA 地址
+本文以 Linux 6.12 为基线，先追踪一个 TX Buffer 的完整 ownership，再进入 Coherent Ring、Scatter-Gather、SWIOTLB 和故障证据。示例中的设备协议为教学模型。
 
-`kmalloc()` 返回 CPU virtual address，CPU MMU 将它映射到 physical page；设备 descriptor 中要写 DMA address。DMA address 可能等于 bus-visible physical address，也可能是 IOMMU 分配的 IOVA，驱动不能自行转换。
+## 一、先看问题：设备为什么不能使用 CPU 指针
+
+驱动通过 `kmalloc()` 得到的地址是 CPU Virtual Address，只在当前内核页表和 CPU Address Space 中有意义。PCIe Device 发出的 Memory Request 使用 DMA Address；它可能等于 CPU Physical Address，也可能是 IOMMU 分配的 IOVA，或指向 SWIOTLB Bounce Buffer。
 
 ```mermaid
 flowchart LR
-    CPUVA[CPU virtual address] --> MMU[CPU page tables]
-    MMU --> PA[Physical memory]
-    DRIVER[Linux DMA API] --> DMAADDR[DMA address returned to driver]
-    DMAADDR --> IOMMU[IOMMU translation optional]
-    IOMMU --> PA
-    DEV[PCIe Device requester] --> DMAADDR
+    CPUVA[CPU virtual pointer] --> PAGE[CPU physical pages]
+    PAGE --> DMAAPI[Linux DMA mapping]
+    DMAAPI --> DIRECT[direct DMA address]
+    DMAAPI --> IOMMU[IOMMU IOVA]
+    DMAAPI --> BOUNCE[SWIOTLB bounce address]
+    DIRECT --> DEV[PCIe device]
+    IOMMU --> DEV
+    BOUNCE --> DEV
 ```
 
-驱动在 probe 早期设置 DMA 能力：
+因此 Driver 不能用 `virt_to_phys()` 或强制类型转换把指针交给硬件。这样做跳过了 IOMMU、地址位宽、Bounce 和 Cache Maintenance，代码也许在一台 x86 无 IOMMU 主机上“能跑”，却不具备可移植 DMA 语义。
+
+DMA API 的返回值只在指定 Device、Direction、Length 和 Mapping Lifetime 内有效。把另一个 `pci_dev` 的 DMA Address 复用过来，或者在 `dma_unmap_single()` 后继续让设备访问，都是所有权错误。
+
+## 二、一个 TX Buffer 的最小 ownership 生命周期
+
+假设 CPU 准备一帧数据，设备通过 DMA Read 取走。完整路径是：CPU 分配并填写 Buffer，Driver 建立 Streaming Mapping，Descriptor 记录 DMA Address，Barrier 发布 Descriptor，Doorbell 把 ownership 交给设备；Completion 到达后，Driver 回收 Mapping 和 Buffer。
+
+```mermaid
+stateDiagram-v2
+    [*] --> CPUOwned: allocate buffer
+    CPUOwned --> Mapped: dma_map_single DMA_TO_DEVICE
+    Mapped --> DeviceOwned: publish descriptor + doorbell
+    DeviceOwned --> Completed: device reports completion
+    Completed --> CPUOwned: dma_unmap_single
+    CPUOwned --> [*]: free or reuse
+```
 
 ```c
-int ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+buf = kmalloc(len, GFP_KERNEL);
+if (!buf)
+    return -ENOMEM;
+
+fill_packet(buf, len);
+
+dma = dma_map_single(&pdev->dev, buf, len, DMA_TO_DEVICE);
+if (dma_mapping_error(&pdev->dev, dma)) {
+    kfree(buf);
+    return -EIO;
+}
+
+desc->addr = cpu_to_le64(dma);
+desc->len = cpu_to_le32(len);
+desc->flags = cpu_to_le32(DEMO_DESC_READY);
+dma_wmb();
+writel(new_tail, bar0 + DEMO_TX_DOORBELL);
+```
+
+从 `dma_map_single()` 成功到 Completion 回收之前，Buffer 的业务 ownership 属于 Device。CPU 不应修改内容或提前 `kfree()`，因为设备可能仍在读取；这意味着“Doorbell 已写”不是本地函数结束，而是所有权转移点。
+
+Completion 后调用 `dma_unmap_single()` 结束 Mapping，CPU 才能安全释放或重新写入。若硬件支持取消/Reset，Driver 仍要先证明 DMA 已停止，再 Unmap；Reset 命令已经发出不等于旧 Request 已经从 PCIe Fabric 和 Device Engine 中消失。
+
+## 三、先设置 DMA Mask，再分配任何 DMA 资源
+
+设备能够产生多少位 DMA Address 由硬件决定。Driver 在 Probe 中使用 `dma_set_mask_and_coherent()` 告诉 DMA Layer Streaming 与 Coherent 的地址位宽：
+
+```c
+int ret;
+
+ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 if (ret) {
     ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
     if (ret)
@@ -38,262 +87,164 @@ if (ret) {
 }
 ```
 
-mask 表示设备能在 descriptor/TLP 中生成多少位地址。Streaming 与 coherent mask 都要满足硬件。设备只实现 32-bit address 时，IOMMU 可能把高物理内存映射到低 IOVA；没有 IOMMU 时 DMA API 可能使用 SWIOTLB bounce，或分配失败。
+Mask 必须早于 `dma_alloc_coherent()`、`dma_map_single()` 和 `dma_map_sg()`。因为 Mapping Backend 会据此选择可达地址、IOMMU IOVA 或 Bounce Buffer，所以先分配后改 Mask 会让已有资源不符合最终约束。
 
-`pci_set_master()` 设置配置空间 Bus Master Enable，允许 Function 发起 Memory Request。它不是 DMA mapping 的替代；必须在设备真正启动 DMA 前完成。
+64-bit Capability 不意味着任何平台都能直接返回 64-bit Physical Address。IOMMU 可以把高物理页映射到低 IOVA，SWIOTLB 可以 Bounce，Host Bridge 也可能有 `dma-ranges`；Driver 应相信 DMA API 的结果，而不是根据 CPU 地址猜测硬件是否可达。
 
-## 二、Coherent allocation 适合长期共享控制结构
+## 四、Coherent Allocation 适合长期共享控制结构
 
-`dma_alloc_coherent()` 同时返回 CPU address 和 DMA address，适合 descriptor ring、completion queue、doorbell record 等长期由 CPU/设备共享的结构：
+Descriptor Ring、Completion Ring 和 Doorbell Record 常由 CPU 与 Device 长期共享，适合 `dma_alloc_coherent()`：
 
 ```c
-dev->sq = dma_alloc_coherent(&pdev->dev, sq_bytes,
-                             &dev->sq_dma, GFP_KERNEL);
-if (!dev->sq)
+ring = dma_alloc_coherent(&pdev->dev, ring_bytes,
+                          &ring_dma, GFP_KERNEL);
+if (!ring)
     return -ENOMEM;
 ```
 
-Coherent 表示 CPU 与设备对该区域的 cache 可见性由平台保证，不表示访问自动有序。CPU 填 descriptor 后仍需 barrier；设备写 completion 后 CPU 读取字段也要 barrier。
+Coherent 表示 CPU 与 Device 对该区域的缓存可见性由平台保证，不需要每次调用 `dma_sync_*()`。它不表示访问具有自动顺序，也不表示 Descriptor 字段可以任意重排；发布 Descriptor 前仍可能需要 `dma_wmb()`，消费 Completion 后仍可能需要 `dma_rmb()`。
 
-分配大小、对齐和 DMA mask 共同影响成功。大量连续 coherent memory 可能因 CMA/IOMMU/内存碎片受限，不能用系统 free memory 总量判断。队列应在 probe/reset 中复用，而不是每个请求动态分配。
-
-释放必须配对且设备已停止：
+返回的 CPU Pointer 用于软件访问，`ring_dma` 用于写入设备寄存器或 Descriptor。两者不能交换。释放时必须使用完全相同的 Device、Size、CPU Pointer 和 DMA Handle：
 
 ```c
-dma_free_coherent(&pdev->dev, sq_bytes, dev->sq, dev->sq_dma);
+dma_free_coherent(&pdev->dev, ring_bytes, ring, ring_dma);
 ```
 
-若 reset 后设备仍保存旧 `sq_dma`，提前 free 会让迟到 DMA 写入已重用页面。先让 DMA Engine quiescent，再释放或更换 generation。
+Coherent Memory 可能昂贵、受限或使用特殊映射，因此不应把所有 Payload 都改成 Coherent 来回避 ownership。大块、短期数据通常更适合 Streaming Mapping。
 
-## 三、Streaming mapping 表达阶段性所有权
+## 五、Streaming Mapping 强调方向和使用阶段
 
-普通数据 buffer 常使用 streaming mapping。`dma_map_single()` 返回 DMA address，并按 direction 执行平台 cache/IOMMU 操作：
+Streaming API 通过 `dma_map_single()`、`dma_map_page()` 和 `dma_map_sg()` 建立有限生命周期 Mapping。Direction 从设备视角命名：
+
+| Direction | 数据主要方向 | CPU 在 Device Ownership 期间 |
+| --- | --- | --- |
+| `DMA_TO_DEVICE` | Host -> Device | 不应修改发送内容 |
+| `DMA_FROM_DEVICE` | Device -> Host | 不应读取未完成内容 |
+| `DMA_BIDIRECTIONAL` | 双向 | 规则最保守，不能为省事默认使用 |
+
+Direction 会影响 Cache Clean/Invalidate 和平台优化。错误地把 RX Buffer 映射为 `DMA_TO_DEVICE`，可能让 CPU 在设备写回后继续看到旧 Cache；全部使用 `DMA_BIDIRECTIONAL` 虽有时能工作，却隐藏协议方向并增加同步成本。
+
+每次 Map 后必须调用 `dma_mapping_error()`。返回的 `dma_addr_t` 为 0 也可能是合法地址，因此不能用 `if (!dma)` 判断失败。
+
+## 六、长寿命 Streaming Mapping 需要显式 Sync
+
+有些驱动预先 Map 一批 RX Page，并在 CPU 与 Device 之间多次循环使用，而不是每次完成都 Unmap。此时 ownership 转换使用 `dma_sync_single_for_cpu()` 与 `dma_sync_single_for_device()`。
+
+```text
+mapped for DMA_FROM_DEVICE
+  -> device owns and fills buffer
+  -> completion arrives
+  -> dma_sync_single_for_cpu
+  -> CPU parses data
+  -> CPU prepares buffer for reuse
+  -> dma_sync_single_for_device
+  -> publish descriptor back to device
+```
+
+Sync 不是锁，也不等待设备完成。Driver 必须先通过 Completion/Status 证明 Device 已经交还 ownership，再 Sync 给 CPU；反方向也要在 CPU 完成修改后 Sync 给 Device。因此同步接口依赖协议状态机，而不是替代状态机。
+
+在 Fully Coherent 平台上 Sync 可能实现为空，但仍应保留，因为它表达生命周期并让同一 Driver 能运行在 Non-Coherent ARM/RISC-V 上。
+
+## 七、Scatter-Gather 把离散内存转换成设备可用 Segment
+
+网络包、Block I/O 或用户页通常物理不连续。Driver 先构造 `struct scatterlist`，再调用 `dma_map_sg()`：
 
 ```c
-dma_addr_t dma = dma_map_single(&pdev->dev, buf, len, DMA_TO_DEVICE);
-if (dma_mapping_error(&pdev->dev, dma))
+int mapped_nents;
+
+mapped_nents = dma_map_sg(&pdev->dev, sgl, orig_nents,
+                          DMA_TO_DEVICE);
+if (!mapped_nents)
     return -EIO;
 
-desc->addr = cpu_to_le64(dma);
-desc->len = cpu_to_le32(len);
-```
-
-Direction 是设备视角：`DMA_TO_DEVICE` 表示设备读 Host memory，`DMA_FROM_DEVICE` 表示设备写 Host memory，`DMA_BIDIRECTIONAL` 只在确实双向时使用。方向错误可能导致 cache 不同步或 IOMMU permission 不符。
-
-Map 后到 unmap 前，buffer ownership 通常属于 Device。CPU 不能随意访问；若需要在映射保持期间切换所有权，使用 `dma_sync_single_for_cpu()` 和 `dma_sync_single_for_device()`：
-
-```c
-dma_sync_single_for_cpu(dev, dma, len, DMA_FROM_DEVICE);
-consume(buf);
-dma_sync_single_for_device(dev, dma, len, DMA_FROM_DEVICE);
-```
-
-Scatter-gather buffer 用 `dma_map_sg()`。输入 nents 是 CPU scatterlist 数，返回值是合并后的 DMA segment 数，设备 descriptor 必须按返回 segment 遍历，而不是原始 nents：
-
-```c
-int mapped = dma_map_sg(&pdev->dev, sgl, nents, DMA_TO_DEVICE);
-if (!mapped)
-    return -EIO;
-
-for_each_sg(sgl, sg, mapped, i) {
-    desc[i].addr = cpu_to_le64(sg_dma_address(sg));
-    desc[i].len = cpu_to_le32(sg_dma_len(sg));
+for_each_sg(sgl, sg, mapped_nents, i) {
+    dma_addr_t addr = sg_dma_address(sg);
+    unsigned int len = sg_dma_len(sg);
+    demo_emit_desc(addr, len);
 }
 ```
 
-完成后用原始 nents 调 `dma_unmap_sg()`，这是容易写错的 API 契约。
+`mapped_nents` 可能小于 `orig_nents`，因为 DMA Layer 可以合并相邻 Segment，或按 IOMMU/Device 限制重新组织。因此硬件 Descriptor 必须遍历 Mapping 后的 DMA Entry，不能继续使用原始 Page 数量。
 
-## 四、Descriptor Ring 是一份共享所有权状态机
-
-Submission Queue（SQ）由 CPU producer 填入 request descriptor，设备 consumer 读取；Completion Queue（CQ）由设备 producer 写 completion，CPU consumer 回收。索引和 entry 内容跨越两个执行体，必须定义谁在什么阶段能写。
-
-```mermaid
-stateDiagram-v2
-    [*] --> CPU_OWNED
-    CPU_OWNED --> MAPPED: map payload and fill descriptor
-    MAPPED --> DEVICE_OWNED: dma_wmb then update producer and doorbell
-    DEVICE_OWNED --> COMPLETED: device DMA and completion write
-    COMPLETED --> CPU_OWNED: dma_rmb, validate, unmap or recycle
-    DEVICE_OWNED --> ABORTING: timeout or reset
-    ABORTING --> CPU_OWNED: prove DMA stopped before unmap
-```
-
-一个 request 需要保存 CPU buffer、DMA address、length、direction、request ID 和 generation，不能只保存 descriptor index。Ring wrap 后 index 会复用，迟到 completion 需要 generation/phase 区分。
-
-队列 full 条件必须留一个 slot 或使用 phase bit，避免 producer == consumer 同时表示 empty/full。索引类型、wrap 和硬件可见 endian 要在协议中固定。
-
-## 五、Barrier、Doorbell 与 Completion 的发布顺序
-
-CPU 发布 SQ entry：
+Unmap 时 API 要求传入原始 `orig_nents`，不是 `mapped_nents`：
 
 ```c
-desc->addr = cpu_to_le64(req->dma);
-desc->len = cpu_to_le32(req->len);
-desc->id = cpu_to_le16(req->id);
-desc->flags = cpu_to_le16(DEMO_DESC_VALID);
+dma_unmap_sg(&pdev->dev, sgl, orig_nents, DMA_TO_DEVICE);
+```
 
+因为 Map 后的 DMA Length 可能受 Segment Boundary、Max Segment Size 和 Alignment 限制，所以高性能 Driver 还要设置或读取 Device DMA Parameters，并在 Descriptor 数量不足时实施 Backpressure。
+
+## 八、dma_wmb() 与 dma_rmb() 保护 Descriptor 发布
+
+考虑 CPU 依次写 Descriptor Address、Length、Flags，然后敲 Doorbell。编译器、CPU 和互连可能重排普通内存写；设备若先看到 Ready Flag 或 Doorbell，就会读取半初始化 Descriptor。
+
+```c
+WRITE_ONCE(desc->addr, cpu_to_le64(payload_dma));
+WRITE_ONCE(desc->len, cpu_to_le32(len));
+WRITE_ONCE(desc->flags, cpu_to_le32(DEMO_DESC_READY));
 dma_wmb();
-WRITE_ONCE(sq->producer, next);
-writel(next, dev->bar0 + REG_SQ_DOORBELL);
+writel(tail, bar0 + DEMO_DOORBELL);
 ```
 
-`dma_wmb()` 保证设备在观察到 producer/doorbell 后，能看到完整 descriptor。普通 `wmb()` 与 DMA barrier 的适用范围不同，使用 DMA API 文档规定的 primitive。
+`dma_wmb()` 保证此前对 DMA Coherent/Shared Memory 的写，在后续设备可见操作之前发布。`writel()` 表达 MMIO Doorbell，但两者约束对象不同，因此不应假设一个普通 `wmb()`、CPU Mutex 或 `volatile` 可以替代 DMA Barrier。
 
-设备完成时应先写 payload/CQ fields，再写 phase/producer，最后发 MSI-X。Host handler/poll：
+设备写 Completion 时也要先写 Payload/Length，最后发布 Owner/Phase。CPU 看到完成标志后使用 `dma_rmb()`，再读取其他字段：
 
 ```c
-if (READ_ONCE(cqe->phase) != expected_phase)
-    return false;
-
-dma_rmb();
-status = le16_to_cpu(cqe->status);
-bytes = le32_to_cpu(cqe->bytes);
+if (READ_ONCE(cqe->phase) == expected_phase) {
+    dma_rmb();
+    len = le32_to_cpu(READ_ONCE(cqe->len));
+}
 ```
 
-随后按 direction unmap：
+Barrier 只建立顺序，不执行 Cache Sync、不分配 IOVA、也不证明设备已经完成。地址、缓存、顺序三类问题必须分别由 Mapping、Sync 和 Barrier 处理。
 
-```c
-dma_unmap_single(&pdev->dev, req->dma, req->len, req->dir);
-```
+## 九、SWIOTLB 和 IOMMU 是 DMA API 的后端选择
 
-MSI-X 到达只证明通知 Memory Write 到达，不自动证明设备内部所有 DMA 顺序正确；硬件协议必须保证 completion data 在中断前可见。
+当 Device 只能访问低地址，而系统物理内存位于高地址，SWIOTLB 可以分配可达 Bounce Buffer。`DMA_TO_DEVICE` Map 时先把数据复制到 Bounce，`DMA_FROM_DEVICE` Unmap/Sync 时再复制回原 Buffer，因此吞吐和 CPU 占用会受到影响。
+
+IOMMU 则为 Device 建立 IOVA 到 Physical Page 的页表。Driver 仍只看到 `dma_addr_t`，并不直接操作 IOMMU Page Table。因为同一个 API 可以选择 Direct、IOMMU 或 SWIOTLB，所以正确 Driver 不需要为这些后端写三套数据路径。
+
+若性能突然下降，应检查是否启用 SWIOTLB、IOMMU Page Size、Map/Unmap Frequency 和 IOTLB Miss，而不是先把 DMA API 替换成 Physical Address。第 10 篇会进一步解释 IOMMU Domain、Group、ATS、PRI、PASID 与 SVA。
+
+## 十、停止、Reset 与错误路径必须先收回 ownership
+
+Probe 回滚或 remove 不能看到 `dma_map_*()` 成功就立即 Unmap 所有 Buffer。Driver 必须先停止新提交，Mask IRQ，命令设备停止 Queue，Flush Posted Write，并通过 Idle/Reset/Controller Contract 证明 Device 不再发起访问。
 
 ```mermaid
-sequenceDiagram
-    participant CPU as Driver
-    participant SQ as Submission Queue
-    participant DEV as DMA Engine
-    participant CQ as Completion Queue
-    CPU->>SQ: map payload and fill descriptor
-    CPU->>CPU: dma_wmb
-    CPU->>DEV: update producer and ring doorbell
-    DEV->>SQ: read descriptor
-    DEV->>DEV: DMA payload
-    DEV->>CQ: write completion fields then phase
-    DEV-->>CPU: MSI-X
-    CPU->>CPU: dma_rmb
-    CPU->>CQ: consume completion and unmap
+flowchart TD
+    STOP[stop new submissions] --> MASK[mask interrupts]
+    MASK --> HALT[stop DMA engine / queues]
+    HALT --> WAIT[wait idle or complete reset contract]
+    WAIT --> SYNC[synchronize IRQ and workers]
+    SYNC --> UNMAP[unmap streaming buffers]
+    UNMAP --> FREE[free coherent rings and host memory]
 ```
 
-## 六、用户内存、mmap 和 IOMMU 增加约束
+Timeout 只说明软件没有按时看到完成，不自动把 ownership 交还 CPU。若硬件仍可能访问，提前 Free 会造成 Use-After-Free、IOMMU Fault 或内存破坏。因此错误恢复需要明确的“设备已停止”证据，而不是用更长延时掩盖竞态。
 
-用户 buffer 不能直接用普通 virtual address。驱动若支持异步 DMA 到用户页，需要 pin pages、构造 SG、map DMA，并处理进程退出、unmap、长期 pin 对内存回收的影响。新内核 API 与长期 pin 规则应按目标版本选择。
+## 十一、怎样从证据区分地址、缓存和顺序问题
 
-把 coherent ring `mmap()` 给用户可以减少 ioctl/copy，但会暴露 descriptor、doorbell 和设备安全边界。至少需要验证 VMA 长度/offset、禁止映射控制寄存器、使用 generation 和 memory barrier，并在 Device remove 时阻止新访问。
+IOMMU Fault 通常包含 Device、IOVA、Read/Write 和权限，说明设备访问了未映射或不允许的地址。若 Fault IOVA 与 Descriptor 中地址不一致，应检查字节序、Descriptor 越界、Use-After-Unmap 和设备寄存器编程。
 
-IOMMU 为每个 mapping 分配 IOVA 并限制访问范围。越界或 unmap 后 DMA 会产生 fault，而不是静默写任意物理内存；关闭 IOMMU 可能把可见 fault 变成内存破坏。下一篇专门展开。
+没有 Fault 但 CPU 读到旧数据，更像 Direction/Sync/Ownership 问题；Descriptor 偶发半写、Doorbell 压力下才失败，则更像 Barrier 或 MMIO Ordering。数据总在 4 GiB 以上失败，可能是 DMA Mask、地址高位或硬件 Descriptor 宽度。
 
-## 七、DMA 故障的证据闭环
+有效故障记录至少包括 BDF、Queue、Request ID、DMA Address、Length、Direction、Map/Unmap 时间、Producer/Consumer 和 IOMMU/AER 日志。只记录“DMA Timeout”无法判断请求在哪个 ownership 状态停住。
 
-常见故障与证据：
+## 十二、本篇检查点
 
-- `dma_mapping_error()`：mask、IOMMU/IOVA 或资源不足。
-- IOMMU fault：记录 requester、IOVA、读写方向，回查 request descriptor/mapping 生命周期。
-- 数据旧/部分更新：检查 direction、sync、barrier 和硬件 completion 顺序。
-- 仅高地址失败：设备地址宽度、descriptor 高位、DMA mask。
-- reset 后随机破坏：旧 generation DMA 未停止，过早 unmap/reuse。
-- 高吞吐受限：map/unmap、IOTLB、SWIOTLB bounce、NUMA/memory bandwidth、ring 空闲。
+现在应当能够完整描述一个 TX Buffer：CPU 分配并填写，`dma_map_single()` 得到 Device 可用的 DMA Address，Descriptor 和 `dma_wmb()` 发布 ownership，Device 读取并产生 Completion，CPU 再 Unmap 和释放。
 
-```bash
-dmesg | grep -Ei 'iommu|dma|swiotlb|fault'
-cat /sys/bus/pci/devices/BDF/dma_mask_bits 2>/dev/null
-perf stat -e cycles,cache-misses ./workload
-```
+还应能严格区分 CPU Virtual、Physical、DMA Address 与 IOVA，解释 Coherent 不等于有顺序，Sync 不等于等待完成，Barrier 不等于 Cache Maintenance，以及 `dma_map_sg()` 为什么返回的 Entry 数可以少于原始 SG 数。
 
-驱动维护 submitted/completed/inflight/map_fail/timeout/reset/fault 计数。停止后 `submitted = completed + failed` 且 inflight/mapping/pool 回到基线，才证明资源守恒。
+## 十三、小结：下一篇把单个 Buffer 扩展成 Ring
 
-**参考资料**
+Linux DMA API 把 Direct、IOMMU 和 SWIOTLB 后端隐藏在统一 Mapping 语义后面。Mask 解决可达地址范围，Map/Unmap 定义 Mapping 生命周期，Sync 处理 Streaming Cache Ownership，Barrier 保证 Descriptor 与 Doorbell 的可见顺序。
 
-- [Dynamic DMA Mapping Guide](https://docs.kernel.org/core-api/dma-api-howto.html)
-- [DMA API](https://docs.kernel.org/core-api/dma-api.html)
-- [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
+下一篇将把一个 Buffer 扩展为持续运行的 Submission/Completion Ring，解释 Producer、Consumer、Wrap、Phase Bit、Backpressure 和 Generation 怎样共同防止覆盖未完成请求与误收旧 Completion。
 
-## 八、Scatter-Gather Mapping 会合并物理段
-
-上层提供 `struct scatterlist` 后，驱动调用 `dma_map_sg()`。
-
-返回值是 DMA Segment 数，不一定等于输入 `nents`。
-
-IOMMU/DMA Layer 可以把相邻段合并成更少的 DMA Segment。
-
-硬件 Descriptor 必须遍历 `for_each_sg(..., mapped_nents)` 对应的 DMA Address/Length 视图，而不是继续使用原始 CPU Page 数。
-
-```mermaid
-flowchart LR
-    P0[CPU page segment 0] --> MAP[dma_map_sg]
-    P1[CPU page segment 1] --> MAP
-    P2[CPU page segment 2] --> MAP
-    MAP --> D0[DMA segment 0 merged]
-    MAP --> D1[DMA segment 1]
-    D0 --> DESC[hardware descriptors]
-    D1 --> DESC
-```
-
-unmap 时传原始 `nents` 和相同 Direction，具体按 DMA API 合同。
-
-Mapping Error/Segment 数超过硬件限制时，应拆分、bounce 或返回上层资源不足，不能截断。
-
-## 九、Bidirectional 不是偷懒选项
-
-`DMA_TO_DEVICE`、`DMA_FROM_DEVICE`、`DMA_BIDIRECTIONAL` 表达数据方向和 cache/权限语义。
-
-方向写错会让 non-coherent 平台看到 stale data。
-
-如果 Buffer 生命周期有清晰阶段，应选择精确方向。
-
-只有设备在同一映射期确实双向读写时才用 BIDIRECTIONAL。
-
-Direction 必须在 map、sync、unmap 中一致。
-
-## 十、长寿命 Streaming Mapping 的 sync
-
-若 Streaming Mapping 保持跨多个 CPU/Device Ownership 阶段，使用：
-
-- `dma_sync_single_for_cpu()`：设备交还后，CPU 访问前。
-- `dma_sync_single_for_device()`：CPU 修改完，再交给设备前。
-
-```mermaid
-stateDiagram-v2
-    [*] --> CpuOwned
-    CpuOwned --> DeviceOwned: dma_sync_for_device + descriptor publish
-    DeviceOwned --> CpuOwned: completion + dma_sync_for_cpu
-    DeviceOwned --> Unmapped: completion + dma_unmap
-    CpuOwned --> Unmapped: final unmap when device no longer owns
-```
-
-sync 只处理 DMA/Cache 可见性，不解决多 CPU 线程互斥。
-
-Queue Lock/Atomic State 与 DMA sync 分别处理软件并发和 Device Ownership。
-
-## 十一、DMA Address 位宽和 Segment Boundary
-
-`dma_set_mask_and_coherent()` 协商设备可发出的 DMA Address 位宽。
-
-64-bit 失败时可按设备能力尝试 32-bit，但这可能触发 IOMMU/SWIOTLB 或分配限制。
-
-硬件还可能限制单 Descriptor Length、Address Alignment、Boundary Crossing 与 SG Entry 数。
-
-DMA API 返回可达地址，不会自动把任意上层 Buffer 切成符合私有 Descriptor 的形状。
-
-Driver 要在 Queue Mapping 层满足硬件限制。
-
-## 十二、remove/reset 前必须证明 DMA 已停止
-
-清理顺序：停止新提交、命令设备停止、等待 idle、同步 IRQ/Poll、处理未完成 Request、unmap Payload、free coherent Ring。
-
-如果设备无法 quiesce，升级 FLR/Bus Reset，并在 reset 保证旧 DMA 不再发生后回收。
-
-IOMMU Fault 能暴露误 DMA，但 No-IOMMU 平台可能静默写坏内存。
-
-## 十三、一手资料
+**一手资料**
 
 - [Linux 6.12 DMA API HOWTO](https://www.kernel.org/doc/html/v6.12/core-api/dma-api-howto.html)
-- [Linux DMA API](https://docs.kernel.org/core-api/dma-api.html)
-- [Linux memory barriers](https://docs.kernel.org/core-api/wrappers/memory-barriers.html)
-- [Linux stable DMA mapping header](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/linux/dma-mapping.h?h=linux-6.12.y)
-
-## 十四、小结
-
-Linux DMA API 返回设备可用地址并管理 cache/IOMMU 生命周期。Coherent memory 适合长期共享控制结构，streaming mapping 表达阶段性所有权，scatter-gather 允许非连续页面被设备访问。
-
-高可靠 DMA 驱动的核心是 ring ownership：map、填 descriptor、`dma_wmb()`、doorbell、设备完成、`dma_rmb()`、unmap/recycle；reset 必须先证明 DMA 停止。下一篇将解释 IOMMU 如何在这条路径中翻译和隔离 IOVA。
+- [Linux 6.12 DMA API](https://www.kernel.org/doc/html/v6.12/core-api/dma-api.html)
+- [Linux Memory Barriers](https://docs.kernel.org/core-api/wrappers/memory-barriers.html)

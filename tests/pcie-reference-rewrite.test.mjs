@@ -112,7 +112,7 @@ test('PCIe reference rewrite publishes the approved 18-article sequence', () => 
 });
 
 test('PCIe teaching structure explains mechanisms before constraints', () => {
-  pcieFiles.slice(0, 6).forEach(assertTeachingStructure);
+  pcieFiles.slice(0, 10).forEach(assertTeachingStructure);
 });
 
 test('PCIe legacy slugs redirect to one canonical rewritten article', () => {
