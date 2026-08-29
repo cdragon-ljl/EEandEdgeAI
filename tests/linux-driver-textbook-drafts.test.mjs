@@ -155,13 +155,22 @@ const validateDraft = (source, file, article) => {
   const body = withoutFencedCode(source.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, ''));
   assert.ok((body.match(/^#\s+/gm) ?? []).length <= 1, `${file} must have at most one H1`);
   assert.doesNotMatch(body, /TBD|TODO|初学者扩展讲解|本章验收|验收问题|建议保留/);
-  for (const heading of body.match(/^##\s+.*$/gm) ?? []) {
-    assert.match(heading, /^## \d+\. /,
-      `${file} prose H2 headings must use hierarchical numbering`);
-  }
-  for (const heading of body.match(/^###\s+.*$/gm) ?? []) {
+  let currentH2Major;
+  for (const heading of body.match(/^#{2,3}\s+.*$/gm) ?? []) {
+    if (heading.startsWith('## ')) {
+      assert.match(heading, /^## \d+\. /,
+        `${file} prose H2 headings must use hierarchical numbering`);
+      currentH2Major = heading.match(/^## (\d+)\. /)[1];
+      continue;
+    }
+
     assert.match(heading, /^### \d+\.\d+ /,
       `${file} prose H3 headings must use hierarchical numbering`);
+    assert.ok(currentH2Major,
+      `${file} prose H3 headings must follow a numbered H2 parent`);
+    const h3Major = heading.match(/^### (\d+)\.\d+ /)[1];
+    assert.equal(h3Major, currentH2Major,
+      `${file} prose H3 major number must match its current H2 parent`);
   }
   assert.match(source, /https?:\/\/(?:www\.)?(?:kernel\.org|docs\.kernel\.org|devicetree\.org|docs\.kernel\.org\/doc\/html\/latest\/)/,
     `${file} must cite an official Linux, kernel source, Devicetree, or subsystem document`);
@@ -245,6 +254,52 @@ draft: true
 https://kernel.org/doc/html/latest/`;
   assert.throws(() => validateDraft(source, plannedArticles[0].file, plannedArticles[0]),
     /prose H3 headings must use hierarchical numbering/);
+});
+
+test('accepts H3 headings aligned with their most recent H2 parent', () => {
+  const source = `---
+series: linux-driver
+order: 1
+draft: true
+---
+## 1. Environment
+
+### 1.1 Build tree
+
+## 2. Target
+
+### 2.1 Running kernel
+
+https://kernel.org/doc/html/latest/`;
+  assert.doesNotThrow(() => validateDraft(source, plannedArticles[0].file, plannedArticles[0]));
+});
+
+test('rejects an H3 whose major number differs from its current H2 parent', () => {
+  const source = `---
+series: linux-driver
+order: 1
+draft: true
+---
+## 1. Environment
+
+### 2.1 Build tree
+
+https://kernel.org/doc/html/latest/`;
+  assert.throws(() => validateDraft(source, plannedArticles[0].file, plannedArticles[0]),
+    /prose H3 major number must match its current H2 parent/);
+});
+
+test('rejects an H3 before any H2 parent', () => {
+  const source = `---
+series: linux-driver
+order: 1
+draft: true
+---
+### 1.1 Build tree
+
+https://kernel.org/doc/html/latest/`;
+  assert.throws(() => validateDraft(source, plannedArticles[0].file, plannedArticles[0]),
+    /prose H3 headings must follow a numbered H2 parent/);
 });
 
 test('rejects duplicate prose H1 headings', () => {
