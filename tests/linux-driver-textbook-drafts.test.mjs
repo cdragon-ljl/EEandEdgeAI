@@ -15,7 +15,7 @@ const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const draftDirectory = join(projectRoot, 'docs', 'drafts', 'linux-driver-textbook');
 
 const expectedArticles = [
-  ['linux-driver-01-driver-environment-source-tree.md', 1, '实验环境'],
+  ['linux-driver-01-driver-environment-source-tree.md', 1, '开发环境'],
   ['linux-driver-02-kernel-module-first-experiment.md', 2, '内核模块'],
   ['linux-driver-03-vfs-character-device-cdev.md', 3, '字符设备'],
   ['linux-driver-04-character-led-driver-experiment.md', 4, 'LED'],

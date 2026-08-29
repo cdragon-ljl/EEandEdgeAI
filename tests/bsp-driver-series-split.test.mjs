@@ -2,6 +2,10 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
+import {
+  legacyRedirects,
+  plannedArticles,
+} from './fixtures/linux-driver-textbook-manifest.mjs';
 
 const bspFiles = [
   'bsp-01-linux-bsp-what-is-it-detailed.md',
@@ -24,22 +28,6 @@ const bspFiles = [
   'bsp-18-kernel-maintenance-patch-management.md',
   'bsp-19-partition-ota-version-manufacturing.md',
   'bsp-20-end-to-end-product-demo.md',
-];
-
-const driverSlugs = [
-  'platform-device-model-and-probe', 'first-kernel-module-and-char-device',
-  'misc-sysfs-procfs-debugfs', 'gpio-led-subsystem',
-  'keys-interrupt-input-subsystem', 'timers-workqueues-delayed-work',
-  'kernel-synchronization-primitives', 'i2c-regmap-sensor-driver',
-  'spi-driver-transfers', 'uart-tty-console-driver', 'pwm-adc-watchdog',
-  'dma-cache-coherency', 'driver-debugging-methodology',
-  'linux-device-model-lifecycle', 'driver-memory-io-mapping',
-  'pinctrl-gpio-irq-subsystem', 'clock-reset-regulator-power-sequence',
-  'iommu-dma-address-translation', 'firmware-remoteproc-rpmsg',
-  'rtc-nvmem-eeprom-efuse', 'block-storage-emmc-sd', 'mtd-ubi-nor-nand',
-  'ethernet-mac-phy-netdev', 'usb-host-device-otg',
-  'v4l2-imx415-mipi-csi', 'alsa-asoc-i2s-audio',
-  'thermal-cpufreq-devfreq-pm', 'reliability-performance-debug',
 ];
 
 function assertSeriesFiles(dir, files, series, title) {
@@ -68,16 +56,15 @@ test('BSP retains a contiguous 20-article board-integration sequence', () => {
   assertSeriesFiles('docs/articles/bsp', bspFiles, 'bsp', 'Linux BSP 开发实战');
 });
 
-test('Linux driver publishes a contiguous 28-article driver sequence', () => {
-  const files = driverSlugs.map((slug, index) => `linux-driver-${String(index + 1).padStart(2, '0')}-${slug}.md`);
-  for (const file of files) {
-    const markdown = readFileSync(join('docs/articles/linux-driver', file), 'utf8');
+test('Linux driver publishes a contiguous 30-article textbook sequence', () => {
+  for (const article of plannedArticles) {
+    const markdown = readFileSync(join('docs/articles/linux-driver', article.file), 'utf8');
     assert.match(markdown, /^series: linux-driver$/m);
+    assert.match(markdown, new RegExp(`^order: ${article.order}$`, 'm'));
     assert.match(markdown, /^draft: false$/m);
   }
   const framework = readFileSync('docs/articles/linux-driver/linux-driver-framework.md', 'utf8');
-  assert.match(framework, /^series: linux-driver$/m);
-  assert.match(framework, /^draft: true$/m);
+  plannedArticles.forEach(({ file }) => assert.match(framework, new RegExp(file)));
 });
 
 test('Linux driver initially reuses the BSP cover bytes', () => {
@@ -93,11 +80,11 @@ test('legacy BSP article routes redirect to their new series and numbers', () =>
   assert.match(source, /http-equiv="refresh"/);
   assert.match(source, /location\.replace/);
   assert.match(source, /rel="canonical"/);
-  driverSlugs.forEach((slug, index) => {
+  Object.entries(legacyRedirects).forEach(([legacy, target], index) => {
+    const slug = legacy.replace(/^linux-driver-\d{2}-/, '');
     const oldOrder = String(index + 15).padStart(2, '0');
-    const newOrder = String(index + 1).padStart(2, '0');
     assert.match(source, new RegExp(`bsp-${oldOrder}-${slug}`));
-    assert.match(source, new RegExp(`linux-driver-${newOrder}-${slug}`));
+    assert.ok(source.includes(target), `missing direct target ${target}`);
   });
   ['buildroot-rootfs-integration','startup-services-logs','power-management-watchdog-hardening','kernel-maintenance-patch-management','partition-ota-version-manufacturing','end-to-end-product-demo'].forEach((slug, index) => {
     assert.match(source, new RegExp(`bsp-${index + 43}-${slug}`));

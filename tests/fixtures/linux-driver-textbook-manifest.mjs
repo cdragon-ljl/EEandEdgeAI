@@ -1,5 +1,5 @@
 export const plannedArticles = [
-  { file: 'linux-driver-01-driver-environment-source-tree.md', order: 1, titleToken: '实验环境' },
+  { file: 'linux-driver-01-driver-environment-source-tree.md', order: 1, titleToken: '开发环境' },
   { file: 'linux-driver-02-kernel-module-first-experiment.md', order: 2, titleToken: '内核模块' },
   { file: 'linux-driver-03-vfs-character-device-cdev.md', order: 3, titleToken: '字符设备' },
   { file: 'linux-driver-04-character-led-driver-experiment.md', order: 4, titleToken: 'LED' },

@@ -1,0 +1,55 @@
+---
+import redirects from '../../data/linux-driver-legacy.json';
+import { withBase } from '../../lib/paths';
+
+export function getStaticPaths() {
+  return Object.entries(redirects).map(([legacy, targetPath]) => ({
+    params: { legacy },
+    props: { targetPath, title: '文章已迁移' },
+  }));
+}
+
+interface Props {
+  targetPath: string;
+  title: string;
+}
+
+const { targetPath, title } = Astro.props;
+const target = withBase(targetPath);
+const canonicalURL = new URL(target, Astro.site);
+---
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="refresh" content={`0;url=${target}`} />
+    <link rel="canonical" href={canonicalURL} />
+    <title>{title}</title>
+    <script is:inline define:vars={{ target }}>window.location.replace(target);</script>
+  </head>
+  <body>
+    <main>
+      <h1>{title}</h1>
+      <p>文章已迁移到新的课程章节。</p>
+      <a href={target}>前往新地址</a>
+    </main>
+  </body>
+</html>
+<style>
+  :global(body) {
+    margin: 0;
+    background: #fafafa;
+    color: #111827;
+    font-family: Inter, "Microsoft YaHei", sans-serif;
+  }
+  main {
+    margin: 18vh auto 0;
+    max-width: 42rem;
+    padding: 0 1.5rem;
+    text-align: center;
+  }
+  h1 { font-size: 1.5rem; line-height: 1.45; }
+  p { color: #6b7280; line-height: 1.7; }
+  a { color: #007aff; font-weight: 600; }
+</style>
