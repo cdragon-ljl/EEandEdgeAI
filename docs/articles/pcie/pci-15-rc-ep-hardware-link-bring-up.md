@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #11 · PCIe Endpoint 硬件与链路 Bring-up"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #15 · Root Complex、Endpoint 与链路 Bring-up"
 description: "PCIe 驱动开发经常被误解成“写一个 `pci_driver`，然后访问 BAR”。实际项目中，驱动能否进入 `probe()`，取决于更底层的一整条链路：参考时钟、复位、PERST#、供电、参考地、lane 配置、LTSSM、配置空间和资源分配。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: pcie
-order: 11
-tags: ["PCIe", "Linux Driver"]
+order: 15
+tags: ["PCIe", "Bring-up", "Linux 6.12"]
 draft: false
 ---
 PCIe Endpoint Bring-up 同时涉及链路两端。Root Complex 必须提供电源/时钟/复位、训练、配置访问和地址窗口；Endpoint 必须实现 LTSSM、Configuration Space、BAR、ATU、中断和 DMA。任一端未就绪，Host 侧 `pci_driver` 都没有执行机会。
+
+本文的软件、设备树和 Controller Driver 语义固定以 Linux 6.12 为基线。
 
 本篇以嵌入式 SoC 连接 FPGA、网卡或自研加速器为场景，从原理图走到 Linux；同时说明 SoC 自己运行 Linux 并充当 Endpoint 时，PCI Endpoint Framework 位于哪里。具体寄存器和设备树 binding 仍以目标 SoC/IP 手册为准。
 
@@ -305,7 +307,51 @@ Inbound window 把 Host 对 BAR 的 Memory TLP 映射到 EP 本地内存/寄存�
 - [PCI Endpoint Function ConfigFS](https://docs.kernel.org/PCI/endpoint/pci-endpoint-cfs.html)
 - [Linux PCI Express Port Bus Driver Guide](https://docs.kernel.org/PCI/pciebus-howto.html)
 
-## 七、小结
+## 七、PERST#、REFCLK 与电源的时序证据
+
+冷启动稳定性必须同时观察电源轨、Reference Clock 与 PERST#。
+
+Endpoint 应在电源和 REFCLK 满足规范/芯片手册条件后退出 Fundamental Reset。
+
+```mermaid
+sequenceDiagram
+    participant P as Power rails
+    participant C as REFCLK
+    participant R as PERST#
+    participant L as Endpoint LTSSM
+    P->>P: rails ramp and become stable
+    C->>C: reference clock stable
+    R->>R: remain asserted for required interval
+    R-->>L: deassert PERST#
+    L->>L: Detect -> Polling -> Configuration -> L0
+```
+
+仅看软件延时值不能证明硬件信号满足时序。
+
+若热重启稳定、冷启动失败，应重点比较 Power/Clock/Reset 相对关系与 Endpoint 固件启动时间。
+
+## 八、RC 与 EP 的地址窗口必须成对验证
+
+Host CPU 访问 EP BAR 依赖 RC Outbound 与 EP Inbound Window。
+
+EP DMA 访问 Host RAM 依赖 Host DMA Mapping 与 EP Outbound Window。
+
+```mermaid
+flowchart LR
+    CPU[Host CPU address] --> RCO[RC outbound ATU]
+    RCO --> BAR[EP BAR bus address]
+    BAR --> EPI[EP inbound ATU]
+    EPI --> LOCAL[EP local register/SRAM]
+    EPDMA[EP DMA local address] --> EPO[EP outbound ATU]
+    EPO --> HDMA[Host DMA address]
+    HDMA --> RAM[Host RAM]
+```
+
+先用 side-effect-free BAR ID Register 验证 Host->EP，再用受控 DMA Buffer 验证 EP->Host。
+
+配置空间可读只证明 Config Transaction 路径，不证明这两个 Memory 路径。
+
+## 九、小结
 
 PCIe Endpoint bring-up 的主线是：
 

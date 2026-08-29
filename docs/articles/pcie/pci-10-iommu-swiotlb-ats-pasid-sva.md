@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #07 · IOMMU 与地址转换"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #10 · IOMMU、SWIOTLB、ATS、PRI、PASID 与 SVA"
 description: "从 direct DMA 的风险开始，建立 requester、iommu_domain、IOVA、page table、IOTLB、group、fault、SWIOTLB、ATS/PRI/PASID 和 VFIO 模型。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: pcie
-order: 7
-tags: ["PCIe", "Linux Driver"]
+order: 10
+tags: ["PCIe", "IOMMU", "SVA", "Linux 6.12"]
 draft: false
 ---
 没有 IOMMU 时，PCIe Device 发出的 DMA address 通常直接进入系统物理地址路由。一个错误 descriptor 可以覆盖内核、其他进程或其他设备的内存。IOMMU 位于 Device requester 与 memory 之间，为 DMA 增加地址翻译和访问权限。
+
+本文的 DMA/IOMMU Core、VFIO 和 I/O Page Fault 语义固定以 Linux 6.12 为基线。
 
 它不只是“让 32-bit Device 访问高内存”，更重要的是把 Device 可访问范围限制在 DMA API 当前映射的页面。理解 IOMMU 后，DMA fault、VFIO passthrough、SVA 和压力下的 stale DMA 才能放到同一模型。
 
@@ -153,7 +155,149 @@ VFIO 则把 group、IOMMU mapping、BAR mmap 和 eventfd interrupt 暴露给受�
 - [VFIO - Virtual Function I/O](https://docs.kernel.org/driver-api/vfio.html)
 - [PCI-SIG Specifications](https://pcisig.com/specifications)
 
-## 八、小结
+## 八、Domain、Group 与 Device Attachment
+
+IOMMU Domain 表示一套 I/O Page Table 与地址空间策略。
+
+Device/Group Attach 到 Domain 后，同一 Requester 发出的 DMA Address 在该 Domain 中翻译。
+
+Group 是无法由硬件安全区分的最小隔离集合。
+
+```mermaid
+flowchart TD
+    DEV0[PCI Function 0 Requester ID] --> G[IOMMU Group]
+    DEV1[PCI Function 1 / alias] --> G
+    G --> D[IOMMU Domain]
+    D --> PT[I/O page tables]
+    PT --> P0[allowed physical pages]
+    PT --> P1[allowed physical pages]
+    BAD[unmapped IOVA] --> FAULT[IOMMU fault]
+```
+
+ACS/拓扑不足时，多个 Function 可能在同一 Group。
+
+不能安全地把其中一个交给 VFIO、另一个留给 Host Driver，因为 Peer-to-Peer/Alias 可能绕过隔离。
+
+## 九、Mapping 与 unmap 是权限生命周期
+
+DMA API map 不只是算地址。
+
+在 IOMMU 平台，它可能分配 IOVA、建立 Page Table Entry、执行 IOTLB Invalidation。
+
+unmap 撤销 Device 对这些 Page 的访问权。
+
+```mermaid
+stateDiagram-v2
+    [*] --> CpuOwned
+    CpuOwned --> Mapped: DMA API creates IOVA mapping
+    Mapped --> DeviceOwned: descriptor published
+    DeviceOwned --> Completed: device DMA completion
+    Completed --> Unmapped: DMA API unmap + IOTLB invalidation
+    Unmapped --> CpuOwned: CPU may reuse/free buffer
+    DeviceOwned --> Faulted: invalid IOVA/permission
+    Faulted --> Unmapped: quiesce/reset then revoke
+```
+
+在 Device 仍可能 DMA 时提前 unmap，会产生 IOMMU Fault；无 IOMMU 时则可能写入已复用 Page。
+
+timeout 不能成为提前 unmap 的充分条件。
+
+## 十、IOTLB 与 Page Size 的性能
+
+IOMMU 使用 IOTLB 缓存 IOVA Translation。
+
+大量小、短寿命 Mapping 会增加 Map/Unmap、Page Table 和 Invalidation 成本。
+
+大 Page/连续 IOVA 可减少 Translation Entry，但受 Buffer 物理布局、IOMMU Capability 和 DMA API 策略约束。
+
+长期 Ring/Buffer Pool 可以摊薄 Mapping 成本，但扩大 Device 长期访问范围。
+
+性能与最小权限需要权衡。
+
+指标包括 Mapping Rate、IOTLB Miss、Invalidation、Page Size、SWIOTLB Bounce 与 P99。
+
+## 十一、SWIOTLB 的复制路径
+
+设备 DMA Mask 无法覆盖目标 Physical Page，且没有合适 IOMMU 映射时，SWIOTLB 可使用低地址 Bounce Buffer。
+
+```mermaid
+sequenceDiagram
+    participant CPU as CPU buffer
+    participant SW as SWIOTLB bounce
+    participant DEV as limited-address device
+    CPU->>SW: copy for DMA_TO_DEVICE
+    SW->>DEV: device DMA reads bounce address
+    DEV->>SW: device DMA writes for DMA_FROM_DEVICE
+    SW->>CPU: copy back on sync/unmap
+```
+
+SWIOTLB 解决地址可达性，不提供 Device 隔离。
+
+Bounce Pool 耗尽会导致 DMA Mapping 失败。
+
+高吞吐设备长期依赖 bounce 会产生复制开销，应检查 DMA Mask 和平台配置。
+
+## 十二、ATS、PRI 与 PASID 是协作协议
+
+ATS 允许 Device 缓存 IOMMU Translation。
+
+Mapping 改变时系统需要发 Invalidation，Device 必须正确失效 ATC。
+
+PRI 允许 Device 对缺失 Page 发 Page Request，由系统处理后重试。
+
+PASID 给 Transaction 附加 Process Address Space ID，让一个 Function 区分多个地址空间。
+
+三者常为 SVA/Shared Virtual Addressing 提供基础，但每项都需要 Endpoint、Root Complex、IOMMU 与 Linux Driver 支持。
+
+只看到 Capability 不代表功能已启用。
+
+## 十三、SVA 共享进程地址空间的代价
+
+SVA 让 Device 使用与进程类似的 Virtual Address，并通过 PASID 选择 Process Address Space。
+
+它减少显式 Buffer Registration/Copy 的需求，但增加：
+
+- Process Exit 与 Device Request 的并发。
+- Page Fault/PRI 处理。
+- mmu_notifier 与地址失效。
+- PASID Binding 生命周期。
+- Device Fault/恶意访问隔离。
+
+Driver 必须在 unbind 前停止对应 PASID 的 Device Request，并等待在途 Page Request/DMA 收敛。
+
+## 十四、VFIO 的安全边界
+
+VFIO 把 IOMMU Group 作为可分配单元，将 Device 控制权交给用户空间/VMM。
+
+用户空间通过 IOMMU Container/IOAS 建立 Guest/User IOVA 到 Host Page Mapping。
+
+VFIO 还需要协调 IRQ、BAR mmap、reset 和 DMA Pinning。
+
+如果 Device 没有可用 IOMMU Group 隔离，`noiommu` 模式会显著降低安全性，不能当作等价部署。
+
+## 十五、Fault 记录要关联 Requester、IOVA 与状态
+
+IOMMU Fault 至少记录：
+
+- Segment/BDF/Requester ID。
+- IOVA。
+- Read/Write/Execute/Privilege/PASID。
+- Fault Reason。
+- Domain/Group。
+- 当时 Request ID、Ring Index、generation。
+
+单看一个 IOVA 无法定位是 Descriptor 被写坏、Mapping 提前撤销、长度越界还是旧 DMA。
+
+把 Fault 时间戳与 Queue submit/reset/remove 日志关联。
+
+## 十六、一手资料
+
+- [Linux 6.12 IOMMU subsystem](https://www.kernel.org/doc/html/v6.12/driver-api/iommu.html)
+- [Linux VFIO documentation](https://docs.kernel.org/driver-api/vfio.html)
+- [Linux stable IOMMU source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/iommu?h=linux-6.12.y)
+- [PCI-SIG specifications](https://pcisig.com/specifications)
+
+## 十七、小结
 
 IOMMU 按 requester/domain 把 IOVA 翻译到 physical page，并限制 read/write 权限；DMA API 让驱动跨 direct、IOMMU 和 SWIOTLB 工作。IOMMU group 表示最小隔离边界，fault 则直接暴露地址、权限和生命周期错误。
 

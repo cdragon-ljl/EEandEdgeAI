@@ -8,7 +8,7 @@ test('zephyr is registered as a first-class article series', () => {
   const seriesConfig = readFileSync('src/lib/series.ts', 'utf8');
   const articlesLib = readFileSync('src/lib/articles.ts', 'utf8');
 
-  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,freertos,rknn,riscv,fpga,zephyr,bsp,linux-driver,usb,pcie,video-audio,deep-learning\}\/\*\*\/!\(riscv-architecture-framework\|fpga-xc7z020-framework\|freertos-kernel-framework\)\.md'/);
+  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,freertos,rknn,riscv,fpga,zephyr,bsp,linux-driver,usb,pcie,video-audio,deep-learning\}\/\*\*\/!\(riscv-architecture-framework\|fpga-xc7z020-framework\|freertos-kernel-framework\|usb-framework\|pcie-framework\)\.md'/);
   assert.match(contentConfig, /z\.enum\(\['cuda', 'ee-system', 'freertos', 'rknn', 'riscv', 'fpga', 'zephyr', 'bsp', 'linux-driver', 'usb', 'pcie', 'video-audio', 'deep-learning'\]\)/);
   assert.match(seriesConfig, /export type SeriesId = 'cuda' \| 'ee-system' \| 'freertos' \| 'rknn' \| 'riscv' \| 'fpga' \| 'zephyr' \| 'bsp' \| 'linux-driver' \| 'usb' \| 'pcie' \| 'video-audio' \| 'deep-learning';/);
   assert.match(seriesConfig, /zephyr:\s*\{/);
@@ -21,7 +21,7 @@ test('riscv is registered as a first-class article series', () => {
   const seriesConfig = readFileSync('src/lib/series.ts', 'utf8');
   const articlesLib = readFileSync('src/lib/articles.ts', 'utf8');
 
-  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,freertos,rknn,riscv,fpga,zephyr,bsp,linux-driver,usb,pcie,video-audio,deep-learning\}\/\*\*\/!\(riscv-architecture-framework\|fpga-xc7z020-framework\|freertos-kernel-framework\)\.md'/);
+  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,freertos,rknn,riscv,fpga,zephyr,bsp,linux-driver,usb,pcie,video-audio,deep-learning\}\/\*\*\/!\(riscv-architecture-framework\|fpga-xc7z020-framework\|freertos-kernel-framework\|usb-framework\|pcie-framework\)\.md'/);
   assert.match(contentConfig, /z\.enum\(\['cuda', 'ee-system', 'freertos', 'rknn', 'riscv', 'fpga', 'zephyr', 'bsp', 'linux-driver', 'usb', 'pcie', 'video-audio', 'deep-learning'\]\)/);
   assert.match(seriesConfig, /export type SeriesId = 'cuda' \| 'ee-system' \| 'freertos' \| 'rknn' \| 'riscv' \| 'fpga' \| 'zephyr' \| 'bsp' \| 'linux-driver' \| 'usb' \| 'pcie' \| 'video-audio' \| 'deep-learning';/);
   assert.match(seriesConfig, /riscv:\s*\{/);
@@ -111,7 +111,7 @@ test('remaining RISC-V articles meet the long-form publication contract', () => 
 test('the RISC-V series framework is excluded from article collection loading', () => {
   const contentConfig = readFileSync('src/content/config.ts', 'utf8');
 
-  assert.match(contentConfig, /\*\*\/!\(riscv-architecture-framework\|fpga-xc7z020-framework\|freertos-kernel-framework\)\.md/);
+  assert.match(contentConfig, /\*\*\/!\(riscv-architecture-framework\|fpga-xc7z020-framework\|freertos-kernel-framework\|usb-framework\|pcie-framework\)\.md/);
 });
 
 test('zephyr articles include required frontmatter', () => {
@@ -135,7 +135,7 @@ test('bsp is registered as a first-class article series', () => {
   const seriesConfig = readFileSync('src/lib/series.ts', 'utf8');
   const articlesLib = readFileSync('src/lib/articles.ts', 'utf8');
 
-  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,freertos,rknn,riscv,fpga,zephyr,bsp,linux-driver,usb,pcie,video-audio,deep-learning\}\/\*\*\/!\(riscv-architecture-framework\|fpga-xc7z020-framework\|freertos-kernel-framework\)\.md'/);
+  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,freertos,rknn,riscv,fpga,zephyr,bsp,linux-driver,usb,pcie,video-audio,deep-learning\}\/\*\*\/!\(riscv-architecture-framework\|fpga-xc7z020-framework\|freertos-kernel-framework\|usb-framework\|pcie-framework\)\.md'/);
   assert.match(contentConfig, /z\.enum\(\['cuda', 'ee-system', 'freertos', 'rknn', 'riscv', 'fpga', 'zephyr', 'bsp', 'linux-driver', 'usb', 'pcie', 'video-audio', 'deep-learning'\]\)/);
   assert.match(seriesConfig, /export type SeriesId = 'cuda' \| 'ee-system' \| 'freertos' \| 'rknn' \| 'riscv' \| 'fpga' \| 'zephyr' \| 'bsp' \| 'linux-driver' \| 'usb' \| 'pcie' \| 'video-audio' \| 'deep-learning';/);
   assert.match(seriesConfig, /bsp:\s*\{/);
@@ -178,7 +178,7 @@ test('video-audio is registered as a first-class article series', () => {
   const seriesConfig = readFileSync('src/lib/series.ts', 'utf8');
   const articlesLib = readFileSync('src/lib/articles.ts', 'utf8');
 
-  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,freertos,rknn,riscv,fpga,zephyr,bsp,linux-driver,usb,pcie,video-audio,deep-learning\}\/\*\*\/!\(riscv-architecture-framework\|fpga-xc7z020-framework\|freertos-kernel-framework\)\.md'/);
+  assert.match(contentConfig, /pattern:\s*'\{cuda,ee-system,freertos,rknn,riscv,fpga,zephyr,bsp,linux-driver,usb,pcie,video-audio,deep-learning\}\/\*\*\/!\(riscv-architecture-framework\|fpga-xc7z020-framework\|freertos-kernel-framework\|usb-framework\|pcie-framework\)\.md'/);
   assert.match(contentConfig, /z\.enum\(\['cuda', 'ee-system', 'freertos', 'rknn', 'riscv', 'fpga', 'zephyr', 'bsp', 'linux-driver', 'usb', 'pcie', 'video-audio', 'deep-learning'\]\)/);
   assert.match(seriesConfig, /export type SeriesId = 'cuda' \| 'ee-system' \| 'freertos' \| 'rknn' \| 'riscv' \| 'fpga' \| 'zephyr' \| 'bsp' \| 'linux-driver' \| 'usb' \| 'pcie' \| 'video-audio' \| 'deep-learning';/);
   assert.match(seriesConfig, /'video-audio':\s*\{/);
@@ -219,9 +219,9 @@ test('usb and pcie are registered as independent first-class article series', ()
 test('usb articles include contiguous published frontmatter', () => {
   const usbDir = 'docs/articles/usb';
   assert.ok(existsSync(usbDir), 'USB article directory must exist');
-  const files = readdirSync(usbDir).filter((file) => file.endsWith('.md'));
+  const files = readdirSync(usbDir).filter((file) => file.endsWith('.md') && file !== 'usb-framework.md');
 
-  assert.equal(files.length, 10);
+  assert.equal(files.length, 14);
 
   for (const [index, file] of files.sort().entries()) {
     const markdown = readFileSync(join(usbDir, file), 'utf8');
@@ -235,9 +235,9 @@ test('usb articles include contiguous published frontmatter', () => {
 test('pcie articles include contiguous published frontmatter', () => {
   const pcieDir = 'docs/articles/pcie';
   assert.ok(existsSync(pcieDir), 'PCIe article directory must exist');
-  const files = readdirSync(pcieDir).filter((file) => file.endsWith('.md'));
+  const files = readdirSync(pcieDir).filter((file) => file.endsWith('.md') && file !== 'pcie-framework.md');
 
-  assert.equal(files.length, 16);
+  assert.equal(files.length, 22);
 
   const orders = files.map((file) => {
     const markdown = readFileSync(join(pcieDir, file), 'utf8');
@@ -247,7 +247,27 @@ test('pcie articles include contiguous published frontmatter', () => {
     return Number(markdown.match(/^order: (\d+)$/m)?.[1]);
   });
 
-  assert.deepEqual(orders.sort((a, b) => a - b), Array.from({ length: 16 }, (_, index) => index + 1));
+  assert.deepEqual(orders.sort((a, b) => a - b), Array.from({ length: 22 }, (_, index) => index + 1));
+});
+
+test('README reports measured USB, PCIe, and total published counts', () => {
+  const series = ['cuda', 'ee-system', 'freertos', 'rknn', 'riscv', 'fpga', 'zephyr', 'bsp', 'linux-driver', 'usb', 'pcie', 'video-audio', 'deep-learning'];
+  const counts = Object.fromEntries(series.map((name) => {
+    const count = readdirSync(join('docs/articles', name), { recursive: true })
+      .filter((file) => file.endsWith('.md'))
+      .filter((file) => /^draft: false$/m.test(readFileSync(join('docs/articles', name, file), 'utf8')))
+      .length;
+    return [name, count];
+  }));
+  const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
+  const readme = readFileSync('README.md', 'utf8');
+
+  assert.equal(counts.usb, 14);
+  assert.equal(counts.pcie, 22);
+  assert.equal(total, 313);
+  assert.match(readme, new RegExp(`13 个专题系列、${total} 篇已发布文章`));
+  assert.match(readme, /USB 驱动开发实战[^\n]+\| 14 \|/);
+  assert.match(readme, /PCIe 驱动开发实战[^\n]+\| 22 \|/);
 });
 
 test('fpga is registered as a first-class article series', () => {

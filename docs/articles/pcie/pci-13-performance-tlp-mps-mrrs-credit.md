@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #09 · PCIe 性能与稳定性"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #13 · TLP、MPS、MRRS、Credit 与性能稳定性"
 description: "从实际 Link 到 TLP、credit、outstanding、DMA、Ring、MSI-X、NUMA 和 IOMMU 建立分层性能模型，并把 P99、AER、reset 和资源守恒纳入验收。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: pcie
-order: 9
-tags: ["PCIe", "Linux Driver"]
+order: 13
+tags: ["PCIe", "Performance", "Linux 6.12"]
 draft: false
 ---
 PCIe 性能不是“Gen × Lane”一个数字。链路只提供原始传输能力，业务数据还要经过 TLP、flow control、DMA、内存系统、队列、中断和 CPU。任一层出现空洞，实际吞吐都可能远低于标称值。
+
+本文的 Linux 指标、PCIe Capability 和调优接口固定以 Linux 6.12 为基线。
 
 稳定性也不是“压力跑一小时没崩”。驱动必须证明请求、DMA mapping、buffer、completion 和 reset 长期守恒，并同时观察 AER 与尾延迟。本篇不给特定硬件编造测试结果，而是建立可复用的测量方法。
 
@@ -158,7 +160,153 @@ dmesg | grep -Ei 'aer|pcie|iommu|timeout' > errors.txt
 - [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
 - [PCI-SIG Specifications](https://pcisig.com/specifications)
 
-## 八、小结
+## 八、从编码速率估算单向上限
+
+先按代际编码效率计算每 Lane 有效 bit rate，再乘协商 Width。
+
+Gen1/2 使用 8b/10b，Gen3+ 使用 128b/130b。
+
+这仍只是 Data Link 可用 bit 上限，未扣除 TLP Header、LCRC、DLLP、SKP、Replay 与协议空洞。
+
+```mermaid
+flowchart LR
+    GT[GT/s per lane] --> ENC[encoding efficiency]
+    ENC --> LANE[encoded bit rate per lane]
+    WIDTH[negotiated lane width] --> RAW[aggregate link rate]
+    LANE --> RAW
+    RAW --> TLP[subtract TLP/DLLP/idle/replay]
+    TLP --> PAY[payload throughput ceiling]
+    PAY --> APP[DMA/memory/software efficiency]
+```
+
+必须使用 `LnkSta` 的 Current Speed/Width，不用设备/插槽标称最大值。
+
+## 九、TLP Payload 越小，固定开销比例越高
+
+Memory Write TLP 有 Header、可选 ECRC、LCRC 与链路 framing。
+
+32-byte Payload 与 256-byte Payload 使用相近 Header，前者效率明显更低。
+
+MPS 决定单 TLP 最大 Payload，但设备/Driver 是否真的形成大 TLP 还取决于 DMA Burst、Address Alignment、4 KiB Boundary 和 Request 合并。
+
+设置更大 MPS 可能提高效率，也可能超过路径某组件能力或增加单包阻塞。
+
+Linux PCI Core 根据路径能力配置，功能驱动不应擅自把一个 Endpoint 调到超过上游的值。
+
+## 十、MRRS、Tag 与 Outstanding Read 形成带宽时延积
+
+Non-Posted Read 必须等待 Completion。
+
+要填满高带宽高 RTT Link，需要足够 Outstanding Bytes：
+
+```text
+outstanding_bytes >= target_bandwidth * round_trip_latency
+```
+
+MRRS 限制单个 Read Request Size。
+
+Tag 数限制同时在途 Request 数。
+
+Completion Credit 与 Completer 能力限制返回。
+
+```mermaid
+flowchart TD
+    MRRS[Max Read Request Size] --> OB[outstanding bytes]
+    TAG[available tags] --> OB
+    RTT[completion round-trip latency] --> NEED[bandwidth-delay product]
+    OB --> SAT{enough to cover NEED?}
+    SAT -- no --> BUBBLE[link idle bubbles]
+    SAT -- yes --> COMP[completion/credit/memory become next limits]
+```
+
+盲目增大 MRRS 不一定改善性能。
+
+如果 Device 只能少量 Tag、Host Completion 分片或 Memory Latency 高，仍会有空洞。
+
+## 十一、RCB 与 Completion 分片
+
+Read Completion Boundary（RCB）影响 Completer 拆分 Completion 的边界。
+
+Completion 还受 MPS、Byte Count、4 KiB Boundary 和内部缓冲限制。
+
+Requester 必须能接受合法分片与乱序规则。
+
+性能分析应统计平均 Completion Payload，而不是只看 Request Size。
+
+## 十二、Queue Occupancy 能指出软件还是链路空洞
+
+同时记录：
+
+- SQ Occupancy。
+- CQ Batch Size。
+- Doorbell 次数。
+- DMA Engine Busy。
+- Link Utilization。
+- Interrupt/NAPI Poll Rate。
+
+```mermaid
+flowchart TD
+    LOW[low throughput] --> SQ{SQ occupancy}
+    SQ -- often empty --> SW[software submit/mapping/locking bottleneck]
+    SQ -- full --> CQ{CQ progress}
+    CQ -- slow, link busy --> HW[device/link/memory bottleneck]
+    CQ -- completed but not cleaned --> IRQ[interrupt/poll/CPU bottleneck]
+    CQ -- fault/reset --> ERR[AER/IOMMU/device recovery bottleneck]
+```
+
+只看 CPU Utilization 无法区分这些层。
+
+## 十三、Doorbell Batch 与 Interrupt Moderation 的双向批处理
+
+提交侧把多个 Descriptor 一次 Doorbell，减少 MMIO。
+
+完成侧把多个 CQ Entry 一次 IRQ/Poll，减少中断。
+
+两者都会增加等待凑批的延迟。
+
+高吞吐离线任务可使用较大 batch。
+
+交互/控制请求应保留低延迟通道或 flush 条件。
+
+混合负载最好按 Queue/Traffic Class 区分，而不是全设备一个参数。
+
+## 十四、NUMA、IOMMU 与内存带宽
+
+PCIe Device 连接某个 NUMA Node。
+
+Ring、Payload、IRQ CPU 和处理线程远离该 Node，会跨 Socket/Interconnect 搬运。
+
+IOMMU Mapping/IOTLB 与 SWIOTLB Bounce 也会增加开销。
+
+大块顺序 DMA 可能最终受 Memory Controller 带宽限制，而不是 PCIe Link。
+
+记录 `numactl`/sysfs locality、Memory Bandwidth、IOMMU Fault/PMU 与 CPU Cache Miss。
+
+## 十五、稳定性指标与 P99
+
+除了平均吞吐，至少记录：
+
+- P50/P95/P99/P99.9 latency。
+- Timeout/Reset 次数。
+- AER Correctable/Uncorrectable 增量。
+- IOMMU Fault。
+- Queue Full/Backpressure 时间。
+- Link Retrain/Speed Downgrade。
+- Interrupt Rate 与 CPU Softirq。
+- 24h/72h 数据校验错误。
+
+平均值可以掩盖每几分钟一次的恢复停顿。
+
+产品验收要把错误率和尾延迟纳入性能目标。
+
+## 十六、一手资料
+
+- [Linux 6.12 PCI driver API](https://www.kernel.org/doc/html/v6.12/driver-api/pci/pci.html)
+- [Linux PCIe AER](https://docs.kernel.org/PCI/pcieaer-howto.html)
+- [Linux stable PCI source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci?h=linux-6.12.y)
+- [PCI-SIG specifications](https://pcisig.com/specifications)
+
+## 十七、小结
 
 PCIe 性能由实际 Link、TLP 开销、MPS/MRRS、tag/credit、outstanding、Ring、doorbell、MSI-X、CPU/NUMA、DMA/IOMMU 和内存系统共同决定。任何调优都必须有分层指标。
 

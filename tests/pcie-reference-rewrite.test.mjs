@@ -112,3 +112,25 @@ test('PCIe legacy slugs redirect to one canonical rewritten article', () => {
   assert.match(source, /location\.replace/);
 });
 
+test('PCIe teaching modules expose the documented Linux 6.12 lifecycles', () => {
+  const sourceDir = 'docs/articles/pcie/src/linux-6.12';
+  const contracts = {
+    'pci_explorer.c': ['pci_register_driver', 'pci_cfg_access_lock', 'pci_find_ext_capability', 'sysfs_create_group', 'pcibios_err_to_errno'],
+    'pci_irq_demo.c': ['pci_alloc_irq_vectors', 'pci_irq_vector', 'request_threaded_irq', 'synchronize_irq', 'pci_resource_len'],
+    'pci_dma_ring.c': ['dma_alloc_coherent', 'dma_map_single', 'dma_wmb', 'dma_rmb', 'generation', 'readl_poll_timeout', 'pci_reset_function', 'pci_resource_len'],
+    'pci_epf_teaching.c': ['pci_epc_set_bar', 'pci_epc_raise_irq', 'pci_epf_alloc_space', 'unbind'],
+    Makefile: ['obj-m += pci_explorer.o', 'obj-m += pci_irq_demo.o', 'obj-m += pci_dma_ring.o', 'obj-m += pci_epf_teaching.o'],
+  };
+
+  for (const [file, markers] of Object.entries(contracts)) {
+    const path = join(sourceDir, file);
+    assert.ok(existsSync(path), `${path} must exist`);
+    const source = readFileSync(path, 'utf8');
+    for (const marker of markers) assert.ok(source.includes(marker), `${file} is missing ${marker}`);
+    assert.doesNotMatch(source, /TODO|TBD|placeholder/i);
+  }
+
+  const epf = readFileSync(join(sourceDir, 'pci_epf_teaching.c'), 'utf8');
+  assert.match(epf, /WRITE_ONCE\(regs->status, cpu_to_le32\(0\)\);[\s\S]+?wmb\(\);[\s\S]+?pci_epf_teaching_raise_irq/);
+  assert.match(epf, /if \(!teach->features->linkup_notifier\)/);
+});

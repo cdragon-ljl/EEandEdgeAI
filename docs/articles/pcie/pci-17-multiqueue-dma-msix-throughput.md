@@ -1,13 +1,17 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #12 · DMA 环形队列与 MSI-X 高吞吐设计"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #17 · Multi-queue DMA、MSI-X 与高吞吐设计"
 description: "PCIe 设备驱动的难点通常不在“能不能读一个 BAR 寄存器”，而在于如何让设备持续、高效、可恢复地搬运数据。网卡、采集卡、FPGA 和 AI 加速器普遍采用 **描述符环形队列 + DMA + MSI/MSI-X** 的组合。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: pcie
-order: 12
-tags: ["PCIe", "Linux Driver"]
+order: 17
+tags: ["PCIe", "Multi-queue", "MSI-X", "Linux 6.12"]
 draft: false
 ---
 PCIe 设备驱动的难点通常不在“能不能读一个 BAR 寄存器”，而在于如何让设备持续、高效、可恢复地搬运数据。网卡、采集卡、FPGA 和 AI 加速器普遍采用 **描述符环形队列 + DMA + MSI/MSI-X** 的组合。
+
+本文的数据结构、DMA API 和 IRQ 接口固定以 Linux 6.12 为基线，设备寄存器协议明确视为教学模型。
+
+这里的 multi-queue 指多组相互隔离的 SQ/CQ、MSI-X Vector 和 CPU 处理上下文，而不是给单 Ring 多加几把锁。
 
 这一篇从一个抽象的 PCIe Endpoint 数据通路出发，讲清楚缓冲区所有权、描述符、doorbell、completion、中断和内存屏障之间的关系，并给出 Linux 驱动中的关键代码骨架。代码用于说明结构，具体寄存器布局必须以设备硬件 spec 为准。
 
@@ -416,7 +420,60 @@ if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64))) {
 - [The MSI Driver Guide HOWTO](https://docs.kernel.org/PCI/msi-howto.html)
 - [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
 
-## 八、小结
+## 八、Queue、Vector 与 CPU 的映射
+
+每个 Queue Pair 最好有独立 SQ/CQ、锁、MSI-X Vector 与统计。
+
+```mermaid
+flowchart LR
+    Q0[SQ/CQ 0] --> V0[MSI-X 0]
+    Q1[SQ/CQ 1] --> V1[MSI-X 1]
+    QN[SQ/CQ n] --> VN[MSI-X n]
+    V0 --> C0[CPU/NAPI 0]
+    V1 --> C1[CPU/NAPI 1]
+    VN --> CN[CPU/NAPI n]
+    C0 --> M0[NUMA-local memory]
+    C1 --> M1[NUMA-local memory]
+```
+
+实际 Vector 少于 Queue 数时，可让多个 Queue 共享 Vector/Poll，但要避免一个繁忙 Queue 饿死其他 Queue。
+
+## 九、背压必须按 Queue 局部传播
+
+```mermaid
+stateDiagram-v2
+    [*] --> Running
+    Running --> Stopped: SQ space below threshold
+    Stopped --> Running: CQ clean frees enough descriptors
+    Running --> Throttled: latency/temperature/error policy
+    Throttled --> Running: policy clears
+    Running --> Resetting: timeout/AER
+    Resetting --> Running: generation rebuilt
+```
+
+一个 Queue Full 不应无条件停止全设备，除非硬件共享资源确实全局耗尽。
+
+上层 Flow/CPU 选择也要避免持续把负载送到已停止 Queue。
+
+## 十、Queue Reset 与 Device Reset 分层
+
+```mermaid
+flowchart TD
+    T[queue timeout] --> STOP[stop only affected upper queue]
+    STOP --> QRESET{hardware queue reset works?}
+    QRESET -- yes --> GEN[generation++ and rebuild queue]
+    QRESET -- no --> FRESET{Function Level Reset works?}
+    FRESET -- yes --> ALL[rebuild all queues/function state]
+    FRESET -- no --> BUS[request broader bus/slot recovery]
+    GEN --> RUN[resume affected queue]
+    ALL --> RUNALL[resume all queues]
+```
+
+优先使用最小恢复范围可减少其他 Queue 的业务中断。
+
+但硬件若共享 DMA Engine/Firmware Context，单 Queue Reset 不能假装隔离存在。
+
+## 十一、小结
 
 PCIe 高吞吐驱动的主线是：
 

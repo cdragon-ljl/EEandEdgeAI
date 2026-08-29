@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #05 · INTx、MSI 与 MSI-X"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #07 · INTx、MSI、MSI-X 与 Threaded IRQ"
 description: "从设备为什么需要异步通知开始，解释 INTx 共享电平、MSI Memory Write、MSI-X Table/PBA、多队列 vector、ordering、affinity 和中断合并。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: pcie
-order: 5
-tags: ["PCIe", "Linux Driver"]
+order: 7
+tags: ["PCIe", "Interrupt", "MSI-X", "Linux 6.12"]
 draft: false
 ---
 CPU 不能持续轮询每个 PCIe 设备寄存器。设备完成 DMA、收到网络包或发生错误时，需要异步通知 CPU。PCIe 兼容传统 INTx，同时提供 MSI 和 MSI-X。三者最终都会进入 Linux IRQ 子系统，但设备侧触发、共享关系和多队列能力不同。
+
+本文 API、IRQ Domain 与取消顺序固定以 Linux 6.12 为基线。
 
 ## 一、INTx 是需要设备撤销的共享电平事件
 
@@ -144,7 +146,155 @@ Teardown 时还要处理“迟到 MSI”。设备停止条件必须保证不再�
 - [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
 - [PCI-SIG Specifications](https://pcisig.com/specifications)
 
-## 七、小结
+## 七、vector 分配要允许能力降级
+
+推荐用 `pci_alloc_irq_vectors()` 表达最小/最大向量与允许类型。
+
+例如优先 MSI-X/MSI，必要时回退 INTx：
+
+```c
+nvec = pci_alloc_irq_vectors(pdev, 1, wanted,
+			     PCI_IRQ_MSIX | PCI_IRQ_MSI | PCI_IRQ_LEGACY);
+```
+
+返回值是实际分配向量数。
+
+驱动必须按实际数量重新决定 Queue Mapping，不能仍访问 `wanted` 个向量。
+
+```mermaid
+flowchart TD
+    A[pci_alloc_irq_vectors] --> N{actual vector count}
+    N -- enough MSI-X --> MQ[one/few queues per MSI-X vector]
+    N -- one MSI/MSI-X --> SQ[shared queue interrupt]
+    N -- legacy INTx --> LEG[shared IRQ + device cause check]
+    N -- error --> FAIL[unwind probe]
+```
+
+`pci_irq_vector(pdev, index)` 把 PCI Vector Index 转成 Linux IRQ Number。
+
+释放顺序是先 `free_irq()`，再 `pci_free_irq_vectors()`。
+
+## 八、INTx Handler 必须判断并清除设备原因
+
+INTx 是共享电平。
+
+Handler 首先读取 Device Interrupt Cause，若不是本设备事件返回 `IRQ_NONE`。
+
+若是本设备事件，按硬件协议 mask/ack/clear Source，再安排 Thread/Poll。
+
+如果不清 Device Source，电平持续有效会形成中断风暴。
+
+如果无条件返回 `IRQ_HANDLED`，会掩盖共享线上的错误来源。
+
+MSI/MSI-X 不共享传统 Pin，但 Handler 仍要处理 Queue Cause、Error Cause 与 Mask/Unmask 顺序。
+
+## 九、Threaded IRQ 解决可睡眠下半部
+
+`request_threaded_irq()` 注册 Primary Handler 与 Thread Function。
+
+Primary Handler 在硬中断上下文：
+
+- 快速读取/确认原因。
+- 必要时 mask Device Interrupt。
+- 返回 `IRQ_WAKE_THREAD`。
+
+Thread Function 可以睡眠，执行较慢控制流程，然后 unmask。
+
+```mermaid
+sequenceDiagram
+    participant DEV as Device
+    participant TOP as primary IRQ handler
+    participant TH as threaded handler
+    DEV-->>TOP: INTx/MSI/MSI-X
+    TOP->>DEV: read cause and mask/ack
+    TOP-->>TH: IRQ_WAKE_THREAD
+    TH->>TH: process sleepable recovery/control work
+    TH->>DEV: unmask vector/cause
+```
+
+高包率网络/存储 Queue 常使用 NAPI/Poll，而不是每个 Completion 都运行 Threaded Handler。
+
+选择取决于子系统合同。
+
+## 十、DMA Completion 的可见性先于消费
+
+Device 通常先 DMA 写 Completion/RX Data，再发 MSI-X。
+
+IRQ/Poll 看到完成标志后使用 `dma_rmb()`，再读取 Descriptor 的其他字段和 Payload Metadata。
+
+MSI-X Message 与 DMA Write 的 Ordering 还受 Device 实现、PCIe Attribute 与平台规则影响，硬件协议应明确“中断发布意味着哪些写已完成”。
+
+CPU 锁不能替代 DMA Barrier。
+
+如果中断到达但 Completion 内容偶尔是旧值，先检查 Device 发布顺序与 `dma_rmb()`，不要只增加 delay。
+
+## 十一、Affinity 是 Queue/CPU/NUMA 的联合设计
+
+多向量可以用 `irq_set_affinity_hint()` 或更现代的 affinity 管理接口给出提示。
+
+真实放置还受 irqbalance、cpuset、managed IRQ 和系统策略影响。
+
+理想数据局部性：
+
+```mermaid
+flowchart LR
+    RXQ[Device RX Queue i] --> V[MSI-X Vector i]
+    V --> CPU[CPU i]
+    CPU --> NAPI[NAPI/Poll i]
+    NAPI --> MEM[NUMA-local ring/page]
+    MEM --> STACK[flow processing on related CPU]
+```
+
+把所有向量固定到 CPU0 会失去 Multi-queue 价值。
+
+过度固定也可能与系统调度、隔离 CPU 或能耗策略冲突。
+
+## 十二、中断调节与 Lost Interrupt 检测
+
+Device Interrupt Moderation 合并多个 Completion。
+
+调节过强增加延迟，过弱增加 IRQ Rate。
+
+Lost Interrupt 的证据链：
+
+1. Device Queue Head/Tail 是否前进。
+2. Completion Memory 是否已有有效 Entry。
+3. MSI-X Table Entry 是否 Enabled/Masked。
+4. `/proc/interrupts` 对应 IRQ 是否增长。
+5. Handler 是否执行但未 Poll。
+6. Poll 是否因 budget/状态丢失未继续。
+
+如果 CQ 已有完成而 IRQ 不增长，可使用临时 Poll 证明数据面与中断面分界。
+
+不能把长期定时轮询当作修复而不查 MSI-X Root Cause。
+
+## 十三、remove/reset 的中断停止顺序
+
+1. 阻止上层新 Request。
+2. Mask Device Interrupt Sources。
+3. 停止 Device DMA/Queue。
+4. `synchronize_irq()` 等待在途 Handler/Thread。
+5. 停止 NAPI/Work。
+6. `free_irq()`。
+7. `pci_free_irq_vectors()`。
+8. 释放 Ring/BAR。
+
+先 free Ring 再 synchronize IRQ，会让延迟 Handler 访问已释放内存。
+
+reset 后 MSI-X Table/Device Mask State 可能丢失，需要重新初始化。
+
+## 十四、一手资料
+
+- [Linux 6.12 MSI Driver Guide](https://www.kernel.org/doc/html/v6.12/PCI/msi-howto.html)
+- [Linux generic IRQ documentation](https://docs.kernel.org/core-api/genericirq.html)
+- [Linux stable PCI MSI source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci/msi?h=linux-6.12.y)
+- [PCI-SIG specifications](https://pcisig.com/specifications)
+
+IRQ Number 是 Linux 分配结果，不是 MSI-X Table Index，也不是 Device Queue Number。
+
+驱动应保存三者的显式映射，不能通过简单加减在 reset/降级后猜测。
+
+## 十五、小结
 
 INTx 是共享电平语义，必须识别并撤销 source；MSI/MSI-X 是设备发出的 Memory Write，MSI-X 通过 Table/PBA 为多队列提供独立 vector。Linux 用 `pci_alloc_irq_vectors()` 和 `pci_irq_vector()` 统一管理能力与平台映射。
 

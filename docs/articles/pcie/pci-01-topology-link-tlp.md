@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #01 · PCIe 架构与基础概念"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #01 · 拓扑、Lane、Link、LTSSM 与 TLP"
 description: "从什么是 PCI Express 开始，建立点对点拓扑、Link/Lane、代际速率、三层协议、事务、流控、可靠性和链路训练模型，再映射到 Linux。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: pcie
 order: 1
-tags: ["PCIe", "Linux Driver"]
+tags: ["PCIe", "Protocol", "Linux 6.12"]
 draft: false
 ---
 PCI Express，简称 PCIe，是 CPU/内存系统连接高速外设的一套通用 I/O 互连协议。NVMe SSD、网卡、GPU、FPGA、采集卡和 AI 加速器都可以借助它访问寄存器、交换数据并向 CPU 发出通知。
+
+本文的 Linux 对象与工具固定以 Linux 6.12 为基线，协议层对照 PCI-SIG 公开资料。
 
 它不是“更快的 USB”，也不是一组 Linux API。PCIe 首先是一套硬件与协议共同定义的互连：设备如何形成点对点拓扑，串行链路如何训练，读写请求如何封装和返回，发送端如何受流控约束，错误如何被检测并恢复。Linux 的枚举、BAR、中断和 DMA 都建立在这些机制之上。
 
@@ -163,7 +165,134 @@ lspci -s 0000:01:00.0 -vv
 - [Linux PCI Express Port Bus Driver Guide](https://docs.kernel.org/PCI/pciebus-howto.html)
 - [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
 
-## 八、小结
+## 八、TLP 的类型决定路由与完成语义
+
+Transaction Layer Packet 可分为 Memory、I/O、Configuration、Message 与 Completion 等类别。
+
+Memory Write 通常是 Posted Request，Requester 发出后不等待 Completion。
+
+Memory Read 是 Non-Posted Request，Completer 必须返回一个或多个 Completion with Data。
+
+Configuration Read/Write 也需要 Completion，并按 BDF/路由类型到达目标 Function。
+
+Message TLP 承载中断、错误、电源管理等语义。
+
+```mermaid
+flowchart TD
+    REQ[TLP generated] --> TYPE{request type}
+    TYPE -- Memory Write / Message --> POST[Posted: no completion expected]
+    TYPE -- Memory Read / Config / IO --> NP[Non-Posted]
+    NP --> ROUTE[address or ID routing]
+    ROUTE --> CPL[Completer returns Completion]
+    CPL --> MATCH[Requester matches tag/requester ID]
+    POST --> FC[consume posted credits]
+    NP --> FC2[consume non-posted credits]
+```
+
+Posted 不表示没有错误。
+
+错误可通过 AER/Message/状态报告，但 Requester 不会为每笔 Write 收到成功确认。
+
+需要端到端确认的协议必须在 Device Register、Completion Queue 或上层消息中自行定义。
+
+## 九、Completion 用 Tag 关联并允许分片返回
+
+Requester 为 Non-Posted Request 分配 Tag。
+
+Completer 返回的 Completion Header 包含 Requester ID、Tag、Completion Status、Byte Count 与 Lower Address 等信息。
+
+一次大 Memory Read 可能被多个 Completion TLP 分片返回。
+
+Requester 要按 Tag 和字节范围重组。
+
+可同时在途的 Tag 数限制 Outstanding Read 深度。
+
+Extended Tag 等能力可增加并发，但设备、Root Port 与软件策略必须共同支持。
+
+Completion Status 包括 Successful Completion、Unsupported Request、Completer Abort 等。
+
+Completion Timeout 表示预期返回未按时到达，可能触发 AER。
+
+## 十、Flow Control Credit 是逐 Link 的接收缓冲合同
+
+接收端用 Flow Control DLLP 通告 Header/Data Credit。
+
+Posted、Non-Posted、Completion 分别计数。
+
+发送端只有足够 Credit 才能发相应 TLP。
+
+Credit 是每段 Link 的机制，不是端到端业务 Queue Depth。
+
+Switch 每个 Port 有自己的缓冲与 Credit 状态。
+
+Credit 耗尽会形成 backpressure，即使物理 Link 仍为 L0。
+
+因此高吞吐分析要同时考虑 TLP Size、Outstanding、Completion 返回速度与 Credit，而不只是 Lane 速率。
+
+## 十一、Ordering Attribute 不能由 CPU 锁替代
+
+PCIe 事务包含 Relaxed Ordering、No Snoop、ID-Based Ordering 等属性。
+
+设备协议还常定义 Descriptor、Payload、Doorbell、Completion 的发布顺序。
+
+CPU mutex 只序列化软件线程，不自动保证 DMA Memory 与 MMIO TLP 的 Device 可见顺序。
+
+Linux Driver 使用 `dma_wmb()`、`dma_rmb()`、`writel()`/`readl()` 等接口表达跨 CPU、Interconnect 与 Device 的顺序。
+
+错误使用 relaxed MMIO accessor 或缺少 DMA Barrier，会在弱内存序平台出现偶发错误。
+
+## 十二、Data Link 重放与 AER 的边界
+
+Data Link Layer 给 TLP 添加 Sequence Number 与 LCRC。
+
+接收端用 ACK/NAK DLLP 反馈。
+
+发送端保留 Replay Buffer，NAK 或 Replay Timer 到期时重发。
+
+这一机制对 Transaction Layer/Driver 通常透明。
+
+持续 Receiver Error、Bad DLLP、Replay Timeout 会在 AER 中留下 Correctable/Uncorrectable 证据。
+
+“业务成功”不代表链路没有重放；重放过多会消耗吞吐并预示信号或时钟问题。
+
+## 十三、从 Link 能力到 Linux 6.12 对象
+
+PCI Core 将每个 Function 表示为 `pci_dev`，每段 Bridge 拓扑表示为 `pci_bus`。
+
+PCIe Capability 中的 Link Capabilities/Control/Status 提供最大/当前 Speed、Width、ASPM 与错误状态。
+
+`lspci -vv` 是配置空间解码，不是物理协议抓包。
+
+Protocol Analyzer 能观察 TLP/DLLP/Training，但不理解 Linux Request Object 与 DMA Ownership。
+
+两类证据需要按 BDF、时间和业务请求关联。
+
+一手资料：
+
+- [PCI-SIG specifications](https://pcisig.com/specifications)
+- [Linux 6.12 PCI driver API](https://www.kernel.org/doc/html/v6.12/driver-api/pci/pci.html)
+- [Linux PCI Express Port Bus](https://docs.kernel.org/PCI/pciebus-howto.html)
+- [Linux stable PCIe capability helpers](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci/pci.c?h=linux-6.12.y)
+
+## 十四、链路降速和降宽是协议允许的恢复结果
+
+训练从双方共同支持的 Speed/Width 中选择可稳定工作组合。
+
+某条 Lane 失败时，链路可能以更窄 Width 进入 L0；高代际均衡失败时可能降到更低 Speed。
+
+因此“已经 L0”不等于达到设计性能。
+
+Bring-up 要同时记录 Max Capability 与 Negotiated Link Status，并在冷启动、热重启、ASPM 恢复和压力温漂下复测。
+
+Receiver Error、Replay 和 Recovery 状态增长，可解释为何链路虽未掉线却吞吐/尾延迟恶化。
+
+Switch 路径还要逐段读取每个 Port 的 `LnkSta`，不能只看 Endpoint 一端。
+
+任意一段降宽都会限制整条端到端路径。
+
+链路反复进入 Recovery 也可能造成业务抖动，而不一定触发完整 Link Down。
+
+## 十五、小结
 
 PCIe 是连接 CPU/内存与高速设备的串行点对点 fabric。RC、Switch 和 Endpoint 通过 Port/Link 形成树；Lane 和代际决定原始能力；Transaction/Data Link/Physical 三层分别处理请求、相邻链路可靠性和电气传输；Memory Read/Write、Completion、credit、ordering 和 LTSSM 共同决定软件可见行为。
 

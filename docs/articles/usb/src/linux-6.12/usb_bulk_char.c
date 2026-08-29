@@ -45,6 +45,7 @@ struct usb_bulk_char {
 	atomic_t writes_in_flight;
 	int error;
 	bool online;
+	bool suspended;
 	bool read_running;
 };
 
@@ -63,6 +64,7 @@ static void usb_bulk_delete(struct kref *ref)
 			  dev->read_buffer, dev->read_dma);
 	usb_free_urb(dev->read_urb);
 	kfifo_free(&dev->read_fifo);
+	usb_put_intf(dev->intf);
 	usb_put_dev(dev->udev);
 	kfree(dev);
 }
@@ -133,7 +135,7 @@ static int usb_bulk_start_read_locked(struct usb_bulk_char *dev)
 	int ret;
 
 	spin_lock_irqsave(&dev->state_lock, flags);
-	if (!dev->online) {
+	if (!dev->online || dev->suspended) {
 		spin_unlock_irqrestore(&dev->state_lock, flags);
 		return -ENODEV;
 	}
@@ -184,7 +186,7 @@ static int usb_bulk_open(struct inode *inode, struct file *file)
 	ret = mutex_lock_interruptible(&dev->io_mutex);
 	if (ret)
 		goto err_put_pm;
-	if (!dev->online) {
+	if (!dev->online || dev->suspended) {
 		ret = -ENODEV;
 		goto err_unlock;
 	}
@@ -324,16 +326,20 @@ static ssize_t usb_bulk_write(struct file *file, const char __user *buffer,
 	while (atomic_read(&dev->writes_in_flight) >= USB_BULK_MAX_WRITES) {
 		if (!READ_ONCE(dev->online))
 			return -ENODEV;
+		if (READ_ONCE(dev->suspended))
+			return -EHOSTUNREACH;
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
 		ret = wait_event_interruptible(dev->write_wait,
 			atomic_read(&dev->writes_in_flight) < USB_BULK_MAX_WRITES ||
-			!READ_ONCE(dev->online));
+			!READ_ONCE(dev->online) || READ_ONCE(dev->suspended));
 		if (ret)
 			return ret;
 	}
 	if (!READ_ONCE(dev->online))
 		return -ENODEV;
+	if (READ_ONCE(dev->suspended))
+		return -EHOSTUNREACH;
 
 	request = kzalloc(sizeof(*request), GFP_KERNEL);
 	urb = usb_alloc_urb(0, GFP_KERNEL);
@@ -345,6 +351,18 @@ static ssize_t usb_bulk_write(struct file *file, const char __user *buffer,
 	if (copy_from_user(transfer, buffer, count)) {
 		ret = -EFAULT;
 		goto err_free;
+	}
+
+	ret = mutex_lock_interruptible(&dev->io_mutex);
+	if (ret)
+		goto err_free;
+	if (!dev->online) {
+		ret = -ENODEV;
+		goto err_unlock_free;
+	}
+	if (dev->suspended) {
+		ret = -EHOSTUNREACH;
+		goto err_unlock_free;
 	}
 
 	request->dev = dev;
@@ -360,14 +378,18 @@ static ssize_t usb_bulk_write(struct file *file, const char __user *buffer,
 		atomic_dec(&dev->writes_in_flight);
 		kref_put(&dev->kref, usb_bulk_delete);
 		wake_up_interruptible(&dev->write_wait);
+		mutex_unlock(&dev->io_mutex);
 		kfree(request);
 		usb_free_urb(urb);
 		return ret;
 	}
 
+	mutex_unlock(&dev->io_mutex);
 	usb_free_urb(urb);
 	return count;
 
+err_unlock_free:
+	mutex_unlock(&dev->io_mutex);
 err_free:
 	kfree(transfer);
 	usb_free_urb(urb);
@@ -392,7 +414,7 @@ static __poll_t usb_bulk_poll(struct file *file, poll_table *wait)
 	if (!dev->online)
 		mask |= EPOLLHUP | EPOLLERR;
 	spin_unlock_irqrestore(&dev->state_lock, flags);
-	if (READ_ONCE(dev->online) &&
+	if (READ_ONCE(dev->online) && !READ_ONCE(dev->suspended) &&
 	    atomic_read(&dev->writes_in_flight) < USB_BULK_MAX_WRITES)
 		mask |= EPOLLOUT | EPOLLWRNORM;
 	return mask;
@@ -405,7 +427,7 @@ static const struct file_operations usb_bulk_fops = {
 	.read = usb_bulk_read,
 	.write = usb_bulk_write,
 	.poll = usb_bulk_poll,
-	.llseek = no_llseek,
+	.llseek = noop_llseek,
 };
 
 static struct usb_class_driver usb_bulk_class = {
@@ -433,7 +455,7 @@ static int usb_bulk_probe(struct usb_interface *intf,
 	if (!dev)
 		return -ENOMEM;
 	dev->udev = usb_get_dev(interface_to_usbdev(intf));
-	dev->intf = intf;
+	dev->intf = usb_get_intf(intf);
 	kref_init(&dev->kref);
 	mutex_init(&dev->io_mutex);
 	spin_lock_init(&dev->state_lock);
@@ -443,6 +465,7 @@ static int usb_bulk_probe(struct usb_interface *intf,
 	atomic_set(&dev->open_count, 0);
 	atomic_set(&dev->writes_in_flight, 0);
 	dev->online = true;
+	dev->suspended = false;
 	dev->read_size = max_t(size_t, USB_BULK_READ_SIZE,
 			       usb_endpoint_maxp(eps.bulk_in));
 	dev->bulk_in_pipe = usb_rcvbulkpipe(dev->udev,
@@ -485,6 +508,7 @@ err_free_urb:
 err_free_fifo:
 	kfifo_free(&dev->read_fifo);
 err_put_dev:
+	usb_put_intf(dev->intf);
 	usb_put_dev(dev->udev);
 	kfree(dev);
 	return ret;
@@ -500,14 +524,17 @@ static void usb_bulk_disconnect(struct usb_interface *intf)
 		return;
 	usb_deregister_dev(intf, &usb_bulk_class);
 
+	mutex_lock(&dev->io_mutex);
 	spin_lock_irqsave(&dev->state_lock, flags);
 	dev->online = false;
+	dev->suspended = true;
 	dev->read_running = false;
 	spin_unlock_irqrestore(&dev->state_lock, flags);
-	wake_up_interruptible_all(&dev->read_wait);
-	wake_up_interruptible_all(&dev->write_wait);
 	usb_kill_urb(dev->read_urb);
 	usb_kill_anchored_urbs(&dev->writes);
+	mutex_unlock(&dev->io_mutex);
+	wake_up_interruptible_all(&dev->read_wait);
+	wake_up_interruptible_all(&dev->write_wait);
 	kref_put(&dev->kref, usb_bulk_delete);
 }
 
@@ -518,8 +545,12 @@ static int usb_bulk_suspend(struct usb_interface *intf, pm_message_t message)
 	(void)message;
 	if (!dev)
 		return 0;
+	mutex_lock(&dev->io_mutex);
+	WRITE_ONCE(dev->suspended, true);
 	usb_bulk_stop_read(dev);
 	usb_kill_anchored_urbs(&dev->writes);
+	mutex_unlock(&dev->io_mutex);
+	wake_up_interruptible_all(&dev->write_wait);
 	return 0;
 }
 
@@ -531,6 +562,7 @@ static int usb_bulk_resume(struct usb_interface *intf)
 	if (!dev)
 		return 0;
 	mutex_lock(&dev->io_mutex);
+	WRITE_ONCE(dev->suspended, false);
 	if (atomic_read(&dev->open_count) > 0)
 		ret = usb_bulk_start_read_locked(dev);
 	mutex_unlock(&dev->io_mutex);

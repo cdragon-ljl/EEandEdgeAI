@@ -42,16 +42,17 @@ USB 2.0 设备状态通常分为 Attached、Powered、Default、Addressed、Conf
 
 ```mermaid
 stateDiagram-v2
+    state "Default" as DefaultState
     [*] --> Attached: 物理接入
     Attached --> Powered: 端口供电有效
-    Powered --> Default: Bus Reset 完成
-    Default --> Addressed: SET_ADDRESS 生效
+    Powered --> DefaultState: Bus Reset 完成
+    DefaultState --> Addressed: SET_ADDRESS 生效
     Addressed --> Configured: SET_CONFIGURATION 非零
     Configured --> Addressed: SET_CONFIGURATION 0
     Configured --> Suspended: 总线空闲/端口挂起
     Suspended --> Configured: Resume
-    Addressed --> Default: 再次 Bus Reset
-    Default --> [*]: 拔出或枚举失败
+    Addressed --> DefaultState: 再次 Bus Reset
+    DefaultState --> [*]: 拔出或枚举失败
 ```
 
 Default 状态有一个关键约束：设备地址仍是 0。

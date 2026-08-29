@@ -1,29 +1,47 @@
 ---
-import { getCollection } from 'astro:content';
-import { hrefFor, slugFor } from '../../lib/articles';
 import { withBase } from '../../lib/paths';
 
-export async function getStaticPaths() {
-  const articles = await getCollection(
-    'articles',
-    ({ data }) => !data.draft && (data.series === 'usb' || data.series === 'pcie'),
-  );
+export function getStaticPaths() {
+  const redirects = {
+    'usb-01-usb-architecture-enumeration': '/usb/usb-01-topology-speed-transfers/',
+    'usb-02-linux-usb-driver-framework': '/usb/usb-04-linux-usb-subsystem-architecture/',
+    'usb-03-usb-descriptors-deep-dive': '/usb/usb-03-descriptor-hierarchy/',
+    'usb-04-urb-and-data-transfer': '/usb/usb-07-urb-lifecycle-concurrency/',
+    'usb-05-usb-device-driver-practice': '/usb/usb-10-vendor-bulk-character-driver/',
+    'usb-06-usb-gadget-intro': '/usb/usb-12-gadget-composite-configfs-functionfs/',
+    'usb-07-usb-class-drivers': '/usb/usb-11-class-drivers-hid-msc-cdc-uvc-uac/',
+    'usb-08-usb-troubleshooting': '/usb/usb-14-debugging-usbmon-cherryusb/',
+    'usb-09-usb-host-controller-device-tree-bring-up': '/usb/usb-13-host-controller-dwc3-xhci-devicetree/',
+    'usb-10-mcu-usb-cherryusb-stack': '/usb/usb-14-debugging-usbmon-cherryusb/',
+    'pci-01-pcie-architecture-basics': '/pcie/pci-01-topology-link-tlp/',
+    'pci-02-pcie-enumeration-config-space': '/pcie/pci-02-enumeration-config-space/',
+    'pci-03-bar-and-mmio': '/pcie/pci-03-bar-resource-atu-mmio/',
+    'pci-04-linux-pci-driver-framework': '/pcie/pci-05-pci-driver-lifecycle-api/',
+    'pci-05-pcie-interrupts-msi-msix': '/pcie/pci-07-intx-msi-msix-threaded-irq/',
+    'pci-06-pcie-dma-data-movement': '/pcie/pci-08-dma-api-memory-order/',
+    'pci-07-iommu-address-translation': '/pcie/pci-10-iommu-swiotlb-ats-pasid-sva/',
+    'pci-08-pcie-device-driver-practice': '/pcie/pci-06-pci-explorer-capability-bar-sysfs/',
+    'pci-09-pcie-performance-stability': '/pcie/pci-13-performance-tlp-mps-mrrs-credit/',
+    'pci-10-pcie-troubleshooting': '/pcie/pci-18-system-debug-lspci-aer-iommu/',
+    'pci-11-pcie-endpoint-hardware-link-bring-up': '/pcie/pci-15-rc-ep-hardware-link-bring-up/',
+    'pci-12-pcie-dma-ring-msix-high-throughput': '/pcie/pci-17-multiqueue-dma-msix-throughput/',
+    'usb-pcie-01-bus-model-comparison': '/pcie/pci-19-usb-pcie-bus-model-comparison/',
+    'usb-pcie-02-driver-framework-comparison': '/pcie/pci-20-usb-pcie-driver-framework-comparison/',
+    'usb-pcie-03-debug-tools-comparison': '/pcie/pci-21-usb-pcie-debug-evidence-comparison/',
+    'usb-pcie-04-interview-questions': '/pcie/pci-22-usb-pcie-interview-design/',
+  } as const;
 
-  return articles.map((article) => ({
-    params: { slug: slugFor(article) },
-    props: {
-      targetPath: hrefFor(article),
-      title: article.data.title,
-    },
+  return Object.entries(redirects).map(([slug, targetPath]) => ({
+    params: { slug },
+    props: { targetPath },
   }));
 }
 
 interface Props {
   targetPath: string;
-  title: string;
 }
 
-const { targetPath, title } = Astro.props;
+const { targetPath } = Astro.props;
 const target = withBase(targetPath);
 const canonicalURL = new URL(target, Astro.site);
 ---
@@ -35,16 +53,16 @@ const canonicalURL = new URL(target, Astro.site);
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta http-equiv="refresh" content={`0;url=${target}`} />
     <link rel="canonical" href={canonicalURL} />
-    <title>{title}</title>
+    <title>USB/PCIe 文章已迁移</title>
     <script is:inline define:vars={{ target }}>
       window.location.replace(target);
     </script>
   </head>
   <body>
     <main>
-      <h1>{title}</h1>
-      <p>文章已移动到新的系列地址。</p>
-      <a href={target}>前往文章</a>
+      <h1>USB/PCIe 文章已迁移</h1>
+      <p>正在前往重写后的系列文章。</p>
+      <a href={target}>前往新文章</a>
     </main>
   </body>
 </html>

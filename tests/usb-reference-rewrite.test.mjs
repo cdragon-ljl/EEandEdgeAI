@@ -99,7 +99,7 @@ test('USB teaching modules expose the documented Linux 6.12 lifecycle', () => {
   const contracts = {
     'usb_example_common.h': ['enum usb_example_state', 'usb_find_common_endpoints', 'usb_endpoint_maxp'],
     'usb_hid_boot.c': ['usb_to_input_id', 'input_register_device', 'usb_alloc_coherent', 'usb_submit_urb', 'usb_kill_urb'],
-    'usb_bulk_char.c': ['usb_register_dev', 'kref', 'wait_queue_head_t', 'poll_wait', 'usb_anchor_urb', 'usb_autopm_get_interface'],
+    'usb_bulk_char.c': ['usb_register_dev', 'kref', 'wait_queue_head_t', 'poll_wait', 'usb_anchor_urb', 'usb_autopm_get_interface', 'usb_get_intf', 'usb_put_intf', 'bool suspended'],
     Makefile: ['obj-m += usb_hid_boot.o', 'obj-m += usb_bulk_char.o'],
   };
 
@@ -110,4 +110,14 @@ test('USB teaching modules expose the documented Linux 6.12 lifecycle', () => {
     for (const marker of markers) assert.ok(source.includes(marker), `${file} is missing ${marker}`);
     assert.doesNotMatch(source, /TODO|TBD|placeholder/i);
   }
+
+  const common = readFileSync(join(sourceDir, 'usb_example_common.h'), 'utf8');
+  assert.match(common, /usb_find_common_endpoints\(alt, &eps->bulk_in, NULL, NULL, NULL\)/);
+  assert.match(common, /usb_find_common_endpoints\(alt, NULL, &eps->bulk_out, NULL, NULL\)/);
+  assert.match(common, /usb_find_common_endpoints\(alt, NULL, NULL, &eps->int_in, NULL\)/);
+  assert.match(common, /usb_find_common_endpoints\(alt, NULL, NULL, NULL, &eps->int_out\)/);
+
+  const bulk = readFileSync(join(sourceDir, 'usb_bulk_char.c'), 'utf8');
+  const writeBody = bulk.match(/static ssize_t usb_bulk_write[\s\S]+?\r?\n}\r?\n\r?\nstatic __poll_t/)?.[0] ?? '';
+  assert.match(writeBody, /mutex_lock_interruptible[\s\S]+?usb_anchor_urb[\s\S]+?usb_submit_urb[\s\S]+?mutex_unlock/);
 });

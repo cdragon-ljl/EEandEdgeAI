@@ -31,5 +31,7 @@
     "tailwindcss": "^3.4.19",
     "typescript": "^5.9.3"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  }
 }

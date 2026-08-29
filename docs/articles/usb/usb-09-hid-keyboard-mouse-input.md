@@ -287,7 +287,7 @@ flowchart LR
     ID --> REG[input_register_device]
     PARENT --> REG
     BITS --> REG
-    REG --> EVDEV[/dev/input/eventX]
+    REG --> EVDEV["/dev/input/eventX"]
 ```
 
 能力位是用户空间发现合同。

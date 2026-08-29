@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #10 · PCIe 故障排查"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #18 · lspci、AER、IOMMU 与系统证据链"
 description: "按电源/PERST#/REFCLK/LTSSM、配置空间、BAR/ATU、驱动/IRQ、DMA/IOMMU、AER/reset 建立有进入条件的证据链。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: pcie
-order: 10
-tags: ["PCIe", "Linux Driver"]
+order: 18
+tags: ["PCIe", "Debugging", "AER", "Linux 6.12"]
 draft: false
 ---
 PCIe 故障常被一句“设备不工作”掩盖，但 `lspci` 看不到、BAR 读全 1、MSI-X 不增长、DMA 数据错误属于完全不同阶段。正确方法是为每层设置进入条件：上层证据未成立，不进入下层。
+
+本文的 sysfs、trace、AER 与 IOMMU 工具路径固定以 Linux 6.12 为基线。
 
 ## 一、先用决策树确定故障层
 
@@ -131,7 +133,175 @@ FLR/hot reset/slot reset 可能清配置和设备 ring。恢复不是 BDF 重新
 - [Linux PCI Express Port Bus Driver Guide](https://docs.kernel.org/PCI/pciebus-howto.html)
 - [PCI-SIG Specifications](https://pcisig.com/specifications)
 
-## 八、小结
+## 八、把故障定位写成有进入条件的树
+
+```mermaid
+flowchart TD
+    S[PCIe symptom] --> L{Link reaches L0 and DLLLA?}
+    L -- no --> PHY[power/REFCLK/PERST#/lane/LTSSM]
+    L -- yes --> C{BDF/config header readable?}
+    C -- no --> CFG[host bridge/ECAM/bus number/config ATU]
+    C -- yes --> B{BAR resource and MMIO valid?}
+    B -- no --> RES[bridge windows/resource/outbound ATU]
+    B -- yes --> D{driver bound and queues started?}
+    D -- no --> DRV[modalias/probe/unwind/PM]
+    D -- yes --> I{IRQ/CQ progress?}
+    I -- no --> IRQ[MSI-X table/domain/affinity/mask]
+    I -- yes --> DMA[DMA/IOMMU/data consistency/application]
+```
+
+每个“是”都要有证据，不能凭预期跳层。
+
+## 九、lspci 输出要同时看能力与当前状态
+
+`lspci -s BDF -nnvv` 重点：
+
+- `LnkCap`：最大能力。
+- `LnkSta`：当前 Speed/Width、Training、DLLLA。
+- `DevCap/DevCtl`：MPS/MRRS/Tag。
+- `MSI/MSI-X`：Capability 与 Enable/Mask。
+- `AER`：Status/Mask/Severity。
+- `Kernel driver in use`。
+
+Current 低于 Capability 可能是上游限制、Lane 配置、信号降级或政策。
+
+配置空间全 1 时不要继续 `setpci` 写值。
+
+`setpci` 适合受控读取/明确实验，不是猜寄存器的工具。
+
+## 十、sysfs 把对象、资源、中断和 IOMMU 关联
+
+```mermaid
+flowchart LR
+    DEV["/sys/bus/pci/devices/BDF"] --> CFG[config]
+    DEV --> RES[resource/resourceN]
+    DEV --> DRV[driver symlink]
+    DEV --> MSI[msi_irqs]
+    DEV --> IOMMU[iommu_group]
+    DEV --> PM[power/runtime_status]
+    DEV --> RESET[reset/reset_method]
+```
+
+`resource` 显示 PCI Core 分配，不证明 ATU/Device Register 正确。
+
+`msi_irqs` 显示已建立 Linux IRQ，不证明 Device 已产生中断。
+
+`iommu_group` 显示隔离拓扑，不证明每个 Descriptor Address 合法。
+
+## 十一、IRQ 与 CQ 要成对检查
+
+```mermaid
+sequenceDiagram
+    participant DEV as Device
+    participant CQ as Completion Memory
+    participant MSI as MSI-X/IRQ domain
+    participant H as Handler/Poll
+    DEV->>CQ: DMA write completion
+    DEV->>MSI: MSI-X message
+    MSI-->>H: Linux IRQ increments
+    H->>CQ: dma_rmb and consume
+```
+
+四种典型分界：
+
+- CQ 无完成、IRQ 无增长：Device Queue/DMA/Link。
+- CQ 有完成、IRQ 无增长：MSI-X/Mask/IRQ Domain。
+- IRQ 增长、CQ 未消费：Handler/Poll/Memory Ordering。
+- CQ 已消费、应用无数据：子系统/用户接口。
+
+用 `/proc/interrupts`、Device Head/Tail、Ring Dump 和 tracepoint 关联。
+
+## 十二、IOMMU Fault 是越权访问的直接记录
+
+记录 Requester ID、IOVA、Direction/Permission、PASID、Fault Reason 和时间。
+
+再查：
+
+- 对应 Request/Descriptor。
+- Mapping 建立与 unmap 时间。
+- Length 是否越界。
+- reset/remove generation。
+- DMA Mask/SWIOTLB。
+
+不要通过关闭 IOMMU 让 Fault 消失后就宣布修复。
+
+No-IOMMU 只会把显式 Fault 变成潜在内存破坏。
+
+## 十三、AER Header Log 与链路计数
+
+AER Status 指出 Error Class，Header Log 可能保存触发 TLP Header。
+
+Correctable Error 的增量速率、Replay、Bad DLLP 与 Receiver Error 可关联信号/ASPM。
+
+Fatal/Non-Fatal 要进入 PCI Error Recovery 状态机。
+
+```mermaid
+flowchart TD
+    A[AER event] --> SAVE[save full status/header/source before clear]
+    SAVE --> SEV{severity}
+    SEV -- Correctable --> RATE[measure rate and correlate ASPM/load]
+    SEV -- Non-Fatal --> REC[pci_error_handlers recovery]
+    SEV -- Fatal --> FREEZE[freeze queues and reset hierarchy]
+    REC --> VERIFY[verify DMA/IRQ/queues/generation]
+    FREEZE --> VERIFY
+```
+
+恢复后要验证错误 bit 清理、Link State、BAR、Bus Master、MSI-X 与 Device Queue，而不只是 `lspci` 又看到 BDF。
+
+## 十四、动态调试与 trace 的选择
+
+dynamic_debug：打开 PCI Core、Host Controller 和 Device Driver 的特定 `pr_debug()`。
+
+ftrace/function graph：观察 probe、PM、AER、IRQ/Work 调用时间。
+
+tracepoint：记录 IRQ、DMA/Queue（若 Driver 提供）、PM 与调度。
+
+perf：分析 CPU、softirq、cache、NUMA。
+
+协议分析仪：观察 TLP/DLLP/Link Training。
+
+示波器：观察 REFCLK、PERST#、Power、CLKREQ# 与信号完整性。
+
+工具要针对待证明事实，不是全部同时开启制造噪声。
+
+## 十五、建立可复现的故障包
+
+保存：
+
+- Kernel Version/Config/Command Line。
+- Firmware/Device Revision。
+- 完整拓扑 `lspci -t/-nnvv`。
+- sysfs config/resource/driver/msi/iommu snapshot。
+- dmesg 从 boot/link 到故障/恢复。
+- Queue Head/Tail/Generation/Timeout。
+- IRQ Counter 与 CPU Affinity。
+- AER/IOMMU Fault 原文。
+- 负载参数、数据校验和、复现概率。
+- Board/Slot/Cable/Power 对照。
+
+恢复动作前后都保存 snapshot，才能判断它改变了哪层状态。
+
+## 十六、回归验收
+
+- 冷启动/热重启各数百次。
+- 不同 Speed/Width 强制对照。
+- ASPM/L1SS on/off 对照。
+- IOMMU on/off 只用于定位，最终要求安全配置通过。
+- 满载 DMA + MSI-X 多队列。
+- runtime/system suspend。
+- FLR/AER/Hot Reset。
+- Surprise Removal（硬件支持时）。
+- 24h/72h P99、AER、IOMMU 与数据校验。
+
+## 十七、一手资料
+
+- [Linux 6.12 PCI driver API](https://www.kernel.org/doc/html/v6.12/driver-api/pci/pci.html)
+- [Linux PCI AER HOWTO](https://docs.kernel.org/PCI/pcieaer-howto.html)
+- [Linux PCI sysfs ABI](https://docs.kernel.org/PCI/sysfs-pci.html)
+- [Linux stable PCI source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci?h=linux-6.12.y)
+- [PCI-SIG specifications](https://pcisig.com/specifications)
+
+## 十八、小结
 
 PCIe 排错必须按电气与 LTSSM、配置访问、BAR/ATU、驱动/IRQ、DMA/IOMMU、AER/reset 逐层推进。每层都有明确证据和停止条件，不能跨层猜测。
 

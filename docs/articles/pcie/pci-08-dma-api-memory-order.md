@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #06 · DMA 与数据搬运"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #08 · DMA API、地址域、所有权与内存序"
 description: "从 CPU VA、PA、DMA address 到 coherent/streaming/SG API，再以 descriptor ring 推导所有权、barrier、doorbell、completion、reset 和用户内存。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: pcie
-order: 6
-tags: ["PCIe", "Linux Driver"]
+order: 8
+tags: ["PCIe", "DMA", "Memory Ordering", "Linux 6.12"]
 draft: false
 ---
 PCIe 设备的价值之一，是不让 CPU 用 MMIO 一字一字搬运大数据。设备内部 DMA Engine 读取 descriptor，直接访问 Host memory，再通过 completion 和中断通知驱动。性能来自异步并行，风险也来自异步：地址、cache、映射和 buffer ownership 任何一项错误都可能破坏内存。
+
+本文所有 DMA API 和内存屏障语义固定以 Linux 6.12 为基线。
 
 本篇先区分地址，再解释 Linux DMA API，最后以 descriptor ring 建立完整发布/完成/取消协议。
 
@@ -206,7 +208,91 @@ perf stat -e cycles,cache-misses ./workload
 - [DMA API](https://docs.kernel.org/core-api/dma-api.html)
 - [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
 
-## 八、小结
+## 八、Scatter-Gather Mapping 会合并物理段
+
+上层提供 `struct scatterlist` 后，驱动调用 `dma_map_sg()`。
+
+返回值是 DMA Segment 数，不一定等于输入 `nents`。
+
+IOMMU/DMA Layer 可以把相邻段合并成更少的 DMA Segment。
+
+硬件 Descriptor 必须遍历 `for_each_sg(..., mapped_nents)` 对应的 DMA Address/Length 视图，而不是继续使用原始 CPU Page 数。
+
+```mermaid
+flowchart LR
+    P0[CPU page segment 0] --> MAP[dma_map_sg]
+    P1[CPU page segment 1] --> MAP
+    P2[CPU page segment 2] --> MAP
+    MAP --> D0[DMA segment 0 merged]
+    MAP --> D1[DMA segment 1]
+    D0 --> DESC[hardware descriptors]
+    D1 --> DESC
+```
+
+unmap 时传原始 `nents` 和相同 Direction，具体按 DMA API 合同。
+
+Mapping Error/Segment 数超过硬件限制时，应拆分、bounce 或返回上层资源不足，不能截断。
+
+## 九、Bidirectional 不是偷懒选项
+
+`DMA_TO_DEVICE`、`DMA_FROM_DEVICE`、`DMA_BIDIRECTIONAL` 表达数据方向和 cache/权限语义。
+
+方向写错会让 non-coherent 平台看到 stale data。
+
+如果 Buffer 生命周期有清晰阶段，应选择精确方向。
+
+只有设备在同一映射期确实双向读写时才用 BIDIRECTIONAL。
+
+Direction 必须在 map、sync、unmap 中一致。
+
+## 十、长寿命 Streaming Mapping 的 sync
+
+若 Streaming Mapping 保持跨多个 CPU/Device Ownership 阶段，使用：
+
+- `dma_sync_single_for_cpu()`：设备交还后，CPU 访问前。
+- `dma_sync_single_for_device()`：CPU 修改完，再交给设备前。
+
+```mermaid
+stateDiagram-v2
+    [*] --> CpuOwned
+    CpuOwned --> DeviceOwned: dma_sync_for_device + descriptor publish
+    DeviceOwned --> CpuOwned: completion + dma_sync_for_cpu
+    DeviceOwned --> Unmapped: completion + dma_unmap
+    CpuOwned --> Unmapped: final unmap when device no longer owns
+```
+
+sync 只处理 DMA/Cache 可见性，不解决多 CPU 线程互斥。
+
+Queue Lock/Atomic State 与 DMA sync 分别处理软件并发和 Device Ownership。
+
+## 十一、DMA Address 位宽和 Segment Boundary
+
+`dma_set_mask_and_coherent()` 协商设备可发出的 DMA Address 位宽。
+
+64-bit 失败时可按设备能力尝试 32-bit，但这可能触发 IOMMU/SWIOTLB 或分配限制。
+
+硬件还可能限制单 Descriptor Length、Address Alignment、Boundary Crossing 与 SG Entry 数。
+
+DMA API 返回可达地址，不会自动把任意上层 Buffer 切成符合私有 Descriptor 的形状。
+
+Driver 要在 Queue Mapping 层满足硬件限制。
+
+## 十二、remove/reset 前必须证明 DMA 已停止
+
+清理顺序：停止新提交、命令设备停止、等待 idle、同步 IRQ/Poll、处理未完成 Request、unmap Payload、free coherent Ring。
+
+如果设备无法 quiesce，升级 FLR/Bus Reset，并在 reset 保证旧 DMA 不再发生后回收。
+
+IOMMU Fault 能暴露误 DMA，但 No-IOMMU 平台可能静默写坏内存。
+
+## 十三、一手资料
+
+- [Linux 6.12 DMA API HOWTO](https://www.kernel.org/doc/html/v6.12/core-api/dma-api-howto.html)
+- [Linux DMA API](https://docs.kernel.org/core-api/dma-api.html)
+- [Linux memory barriers](https://docs.kernel.org/core-api/wrappers/memory-barriers.html)
+- [Linux stable DMA mapping header](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/linux/dma-mapping.h?h=linux-6.12.y)
+
+## 十四、小结
 
 Linux DMA API 返回设备可用地址并管理 cache/IOMMU 生命周期。Coherent memory 适合长期共享控制结构，streaming mapping 表达阶段性所有权，scatter-gather 允许非连续页面被设备访问。
 

@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #04 · Linux PCI 驱动框架"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #05 · PCI Driver 生命周期与核心 API"
 description: "以资源依赖顺序组织 pci_driver：enable、BAR、DMA、IRQ、硬件启动、用户接口，以及 remove、runtime PM、AER 和 reset 的统一状态机。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: pcie
-order: 4
-tags: ["PCIe", "Linux Driver"]
+order: 5
+tags: ["PCIe", "Driver Lifecycle", "Linux 6.12"]
 draft: false
 ---
 前三篇已经证明：Endpoint 完成链路训练后，PCI Core 通过配置空间创建 `pci_dev`、分配 BAR，并把资源放入系统地址树。Device Driver 的工作是安全接管这些资源、配置设备、发布业务接口，并在任何失败或硬件消失时逆序收敛。
+
+本文所有 API 与生命周期回调固定以 Linux 6.12 为基线。
 
 驱动框架的核心不是 `module_pci_driver()` 宏，而是**状态发布边界**：设备何时可以发 DMA/中断，用户何时可以提交请求，发生错误后哪些对象仍可信。
 
@@ -225,7 +227,74 @@ teardown 测试包含：模块加载/卸载循环、用户 fd 保持时 remove�
 - [Linux PCI Error Recovery](https://docs.kernel.org/PCI/pci-error-recovery.html)
 - [PCI Power Management](https://docs.kernel.org/power/pci.html)
 
-## 七、小结
+## 七、注册、匹配与 probe 的真实入口
+
+`module_pci_driver()` 展开模块 init/exit，内部调用 `pci_register_driver()` 与 `pci_unregister_driver()`。
+
+Driver 注册后，PCI Bus 会尝试匹配已存在 Function；以后 Hotplug Function 也进入同一流程。
+
+```mermaid
+sequenceDiagram
+    participant M as module init
+    participant C as PCI Core
+    participant D as pci_driver
+    participant P as pci_dev
+    M->>C: pci_register_driver
+    C->>P: match pci_device_id
+    P-->>C: matched function
+    C->>D: probe(pdev, id)
+    D->>P: pci_set_drvdata after private object ready
+```
+
+`pci_set_drvdata()` 是关联点，不应早于私有对象完整初始化，也不应晚于用户接口发布。
+
+remove 开头可取回对象并阻止新入口。
+
+## 八、推荐的资源获取与逆序回滚
+
+```mermaid
+flowchart TD
+    P[probe] --> EN[pci_enable_device_mem]
+    EN --> REG[pci_request_regions]
+    REG --> DMA[dma_set_mask_and_coherent]
+    DMA --> MAP[pci_iomap]
+    MAP --> MASTER[pci_set_master]
+    MASTER --> IRQ[pci_alloc_irq_vectors/request_irq]
+    IRQ --> HW[start device queues]
+    HW --> PUB[publish subsystem/user interface]
+    PUB -. remove/fail .-> RHW[stop queues and DMA]
+    RHW --> RIRQ[free IRQ/vectors]
+    RIRQ --> RMAP[pci_iounmap]
+    RMAP --> RREG[pci_release_regions]
+    RREG --> DIS[pci_disable_device]
+```
+
+DMA Mask 通常应在分配 DMA Buffer 前设置。
+
+Bus Master 应在设备真正需要发 DMA 前打开，stop/remove 时先让设备停止，再清理映射与资源。
+
+Managed API 自动执行释放 callback，但仍要在 remove/PM/AER 中主动停止硬件。
+
+## 九、PM 与 AER 恢复通用配置和私有配置
+
+System/runtime suspend 常调用 `pci_save_state()`，resume 调用 `pci_restore_state()`，并恢复 enable/bus master。
+
+这些接口保存 PCI Configuration State，不包含 BAR 内 Device Queue、Firmware Context 与 Descriptor Ring。
+
+```mermaid
+stateDiagram-v2
+    Running --> Quiesced: block submit and stop DMA
+    Quiesced --> Saved: pci_save_state / disable
+    Saved --> Restored: D0 + pci_restore_state
+    Restored --> Rebuilt: rebuild device-private queues
+    Rebuilt --> Running: enable IRQ and publish
+    Running --> Error: AER error_detected
+    Error --> Rebuilt: slot_reset succeeds
+```
+
+AER `error_detected`、`slot_reset` 与 PM resume 可以复用底层 stop/rebuild helper，但不能重复注册用户接口。
+
+## 十、小结
 
 Linux PCI 驱动要按依赖顺序接管 `pci_dev`：enable、resource、DMA、bus master、MMIO、queue、IRQ、hardware、用户接口。错误和 remove 按相反顺序收敛，managed API 只能帮助释放，不能替代设备停机。
 

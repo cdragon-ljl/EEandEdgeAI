@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · USB/PCIe 驱动开发对比 #04 · 高频面试题与工程回答"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #22 · USB/PCIe 工程面试与系统设计"
 description: "USB 和 PCIe 是 Linux 驱动面试里很常见的两个方向。面试官通常不会只问概念，而是会围绕枚举、驱动匹配、传输、DMA、中断、IOMMU 和排查思路持续追问。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: pcie
-order: 16
-tags: ["USB", "PCIe", "Linux Driver"]
+order: 22
+tags: ["USB", "PCIe", "Interview", "Linux 6.12"]
 draft: false
 ---
 USB/PCIe 面试真正考察的不是命令清单，而是能否从现象判断当前层次、指出内核对象和异步所有权，并给出可验证证据。下面每题包含常见错误答案、正确推导和工程证据链。
+
+所有问题以 Linux 6.12 对象、API 与错误恢复语义为基线。
 
 ## 一、回答技术问题的四层结构
 
@@ -135,6 +137,172 @@ USB/PCIe 面试真正考察的不是命令清单，而是能否从现象判断�
 - [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
 - [Dynamic DMA Mapping Guide](https://docs.kernel.org/core-api/dma-api-howto.html)
 
-## 五、小结
+## 五、场景一：USB 能看到 VID/PID，却没有功能节点
+
+错误答案：重装用户程序或直接改功能驱动数据收发。
+
+正确分层：VID/PID 可见说明 EP0 枚举至少读取 Device Descriptor；还需确认 Configuration、Interface、modalias、Driver Match、probe 和子系统发布。
+
+```mermaid
+flowchart TD
+    LS[lsusb sees VID/PID] --> CFG{configuration/interfaces valid?}
+    CFG -- no --> DESC[inspect descriptors and SET_CONFIGURATION]
+    CFG -- yes --> BIND{interface driver symlink?}
+    BIND -- no --> ID[modalias/module/id_table]
+    BIND -- yes --> NODE{subsystem node published?}
+    NODE -- no --> PROBE[probe log/resource/unwind]
+    NODE -- yes --> DATA[test class/vendor data path]
+```
+
+追问：复合设备为何可由多个 Driver 同时管理？回答 `usb_interface` 是常见绑定单位，不是整个 `usb_device`。
+
+## 六、场景二：PCIe lspci 可见，BAR 读全 1
+
+错误答案：设备已枚举，所以一定是 Driver `readl()` 写错。
+
+正确推导：Configuration Transaction 与 Memory Transaction 可走不同窗口。检查 BAR Resource、Command Memory Enable、每级 Bridge Window、RC Outbound ATU、EP Inbound ATU 与 Device Power/Link。
+
+```mermaid
+flowchart TD
+    CFG[lspci config readable] --> BAR{BAR assigned and length valid?}
+    BAR -- no --> RES[resource allocation/window]
+    BAR -- yes --> CMD{Memory Space Enable?}
+    CMD -- no --> ENABLE[pci_enable_device_mem]
+    CMD -- yes --> WIN{bridge/RC ATU covers address?}
+    WIN -- no --> ATU[fix ranges/window/ATU]
+    WIN -- yes --> EP[check EP BAR/inbound/local register]
+```
+
+追问：为什么不能用普通指针解引用？因为 `__iomem` 需要 I/O accessor、字节序和顺序语义。
+
+## 七、场景三：DMA 完成中断到了，数据还是旧的
+
+错误答案：在 IRQ Handler 加 `msleep(1)`。
+
+正确推导：检查 Device 是否先 DMA 写数据/Completion 再发 MSI-X，Driver 是否观察 Owner/Phase 后执行 `dma_rmb()`，Streaming Mapping 是否 sync/unmap，CPU 是否在 DeviceOwned 阶段提前读。
+
+```mermaid
+sequenceDiagram
+    participant DEV as Device
+    participant MEM as DMA memory
+    participant IRQ as MSI-X handler/poll
+    DEV->>MEM: write payload and completion fields
+    DEV->>MEM: publish owner/phase last
+    DEV-->>IRQ: MSI-X
+    IRQ->>IRQ: observe owner then dma_rmb
+    IRQ->>MEM: read stable fields/payload
+```
+
+追问：coherent memory 为何仍要 barrier？一致性不等于 CPU/Device 发布顺序。
+
+## 八、场景四：设备 reset 后偶发完成了错误请求
+
+错误答案：把 request_id 清零即可。
+
+正确推导：旧 Completion 可能延迟到 reset 后，ID 已被新请求复用。reset 要停止提交、quiesce DMA、同步 IRQ、失败旧请求、清 CQ/SQ、增加 generation，再重新开放。
+
+```mermaid
+stateDiagram-v2
+    Running --> Stopping: timeout/reset
+    Stopping --> Quiesced: DMA and IRQ stopped
+    Quiesced --> Rebuilt: fail old requests, generation++
+    Rebuilt --> Running: reinitialize queues
+    Running --> DropOld: completion generation mismatch
+    DropOld --> Running
+```
+
+追问：generation 若不在硬件 Completion 中是否足够？不一定；还需 tag 设计、CQ 清理和硬件 reset 保证。
+
+## 九、场景五：打开省电后空闲首包超时
+
+错误答案：永久关闭所有电源管理。
+
+正确推导：USB 检查 autosuspend、remote wakeup、URB 重提交、Link PM；PCIe 检查 runtime resume、D-state、ASPM/L1SS、CLKREQ#、REFCLK 与 Device Queue 重建。
+
+```mermaid
+flowchart LR
+    IDLE[idle enters low power] --> WAKE[first request/wakeup]
+    WAKE --> CORE[parent/link/function resume]
+    CORE --> CFG[restore config and private state]
+    CFG --> IO[resubmit URB or rebuild DMA queue]
+    IO --> DONE[first request completes]
+    DONE --> METRIC[measure wake latency/P99/errors]
+```
+
+追问：关闭 ASPM 后稳定能证明什么？只能把问题收敛到链路空闲/时钟/恢复相关，不能单独证明 ASPM Core Bug。
+
+## 十、系统设计题的回答框架
+
+### 需求
+
+带宽、P99、队列数、热插拔、功耗、安全、恢复时间和硬件成本。
+
+### 对象
+
+USB：Device/Interface/Endpoint/URB。
+
+PCIe：Function/BAR/DMA Ring/MSI-X/IOMMU。
+
+### 状态机
+
+probe/start/submit/complete/stop/reset/remove/PM。
+
+### 所有权
+
+Buffer、Request、User Handle、DMA Mapping、IRQ/Work。
+
+### 证据
+
+usbmon/sysfs/dmesg 或 lspci/AER/IOMMU/Queue/IRQ。
+
+### Tradeoff
+
+吞吐与延迟、功耗与恢复、零拷贝与 Pinning、安全与复杂度。
+
+## 十一、更多高质量追问
+
+### 为什么 USB Bulk 不等于 PCIe DMA？
+
+Bulk 是 Host Controller 调度的 USB Transfer；PCIe DMA 是 Endpoint 作为 Requester 访问 Host Memory。
+
+### 为什么 MSI-X 适合多队列？
+
+Vector 可独立 mask、affinity 和映射 Queue，减少共享 Handler 与锁竞争。
+
+### IOMMU Fault 后能否直接重试？
+
+先确定 Mapping 生命周期、Descriptor 地址、Length 和 Device DMA 是否已停止；盲重试可能继续越权。
+
+### disconnect/remove 后 open fd 怎么办？
+
+撤销新入口，私有对象由 kref 保持，online=false 让旧 fd 返回 ENODEV/HUP，最后 close 释放。
+
+### Short Packet 是错误吗？
+
+USB Bulk IN 中可表示正常 Transfer 边界，业务协议决定是否满足消息长度。
+
+### MRRS 越大越好吗？
+
+不一定，还受 Tag、Completion、Credit、Memory 和路径能力影响。
+
+## 十二、证据化回答示例
+
+不要说：“我觉得是中断问题。”
+
+应说：“CQ Phase 已有效且 Device Head 前进，但 `/proc/interrupts` 对应 MSI-X Vector 不增长；下一步读取 MSI-X Capability/Table Mask 与 Device Cause，并用临时 Poll 验证完成数据面。若 IRQ 增长但 Poll 未消费，再查 Handler/NAPI 状态。”
+
+不要说：“换线好了就是线的问题。”
+
+应说：“换线使 Receiver Error/Replay 归零且链路从 Gen1 x1 恢复到 Gen3 x4，说明问题与物理链路质量相关；仍需交叉 Slot/设备并测 REFCLK/PERST#/Eye，确认具体根因。”
+
+## 十三、一手资料
+
+- [Linux 6.12 USB driver API](https://www.kernel.org/doc/html/v6.12/driver-api/usb/usb.html)
+- [Linux 6.12 PCI driver API](https://www.kernel.org/doc/html/v6.12/driver-api/pci/pci.html)
+- [Linux DMA API](https://docs.kernel.org/core-api/dma-api.html)
+- [Linux PCI error recovery](https://docs.kernel.org/PCI/pci-error-recovery.html)
+- [PCI-SIG specifications](https://pcisig.com/specifications)
+
+## 十四、小结
 
 高质量回答必须把概念、源码入口、异步所有权和验证证据连接起来。USB 重点是枚举、Interface、URB 和 disconnect；PCIe 重点是配置/BAR、DMA、MSI-X、IOMMU 和 reset。背 API 只能回答第一层，工程判断取决于能否证明状态变化。

@@ -28,9 +28,17 @@ usb_example_find_endpoints(struct usb_interface *intf,
 	int ret;
 
 	memset(eps, 0, sizeof(*eps));
-	ret = usb_find_common_endpoints(alt, &eps->bulk_in, &eps->bulk_out,
-					&eps->int_in, &eps->int_out);
-	if (ret)
+	ret = usb_find_common_endpoints(alt, &eps->bulk_in, NULL, NULL, NULL);
+	if (ret && ret != -ENXIO)
+		return ret;
+	ret = usb_find_common_endpoints(alt, NULL, &eps->bulk_out, NULL, NULL);
+	if (ret && ret != -ENXIO)
+		return ret;
+	ret = usb_find_common_endpoints(alt, NULL, NULL, &eps->int_in, NULL);
+	if (ret && ret != -ENXIO)
+		return ret;
+	ret = usb_find_common_endpoints(alt, NULL, NULL, NULL, &eps->int_out);
+	if (ret && ret != -ENXIO)
 		return ret;
 
 	if (eps->bulk_in && !usb_endpoint_maxp(eps->bulk_in))

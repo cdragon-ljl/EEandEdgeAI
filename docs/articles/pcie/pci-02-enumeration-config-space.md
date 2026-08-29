@@ -1,13 +1,15 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #02 · PCIe 枚举与配置空间"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #02 · BDF、配置空间与递归枚举"
 description: "设备还没有 BAR 地址时，系统如何发现它？本篇从配置访问、BDF、Header、Bridge 递归、BAR sizing、资源窗口和 Capability 走完 Linux PCIe 枚举。"
-pubDate: "2026-08-18"
+pubDate: "2026-08-29"
 series: pcie
 order: 2
-tags: ["PCIe", "Linux Driver"]
+tags: ["PCIe", "Enumeration", "Linux 6.12"]
 draft: false
 ---
 PCIe Endpoint 刚进入 L0 时，操作系统还不知道它的型号，也没有为 BAR 分配 CPU 可访问地址。若发现设备必须先访问 BAR，就会形成循环。PCI/PCIe 因此定义独立的 Configuration Space：即使普通 MMIO 尚未建立，Host 仍能按拓扑位置读取固定格式的配置寄存器。
+
+本文的扫描函数、配置访问和对象创建固定以 Linux 6.12 为基线。
 
 枚举就是从 root bus 出发，探测每个可能 Function，识别 Endpoint/Bridge，分配 bus number 与资源，解析 Capability 并创建 `pci_dev`。普通 Device Driver 的 `probe()` 发生在这条流程之后。
 
@@ -127,7 +129,182 @@ Hotplug 增加并发：PCIe Port Service/Hotplug Driver 检测 presence/link，P
 - [How To Write Linux PCI Drivers](https://docs.kernel.org/PCI/pci.html)
 - [Linux PCI Express Port Bus Driver Guide](https://docs.kernel.org/PCI/pciebus-howto.html)
 
-## 七、小结
+## 七、ECAM 把 BDF 与 Offset 变成地址
+
+Enhanced Configuration Access Mechanism 为每个 Segment/Bus/Device/Function 预留规则化窗口。
+
+常见地址关系概念为：
+
+```text
+ECAM_BASE
+  + (bus << 20)
+  + (device << 15)
+  + (function << 12)
+  + register_offset
+```
+
+每个 Function 获得 4 KiB Configuration Space。
+
+具体平台还要考虑 Segment、Bus Start 与 Firmware MCFG/Device Tree 范围。
+
+```mermaid
+flowchart LR
+    BDF[segment:bus:device.function] --> CALC[ECAM address calculation]
+    OFF[configuration offset 0..4095] --> CALC
+    CALC --> MMIO[Host Bridge config transaction]
+    MMIO --> CFG[Function configuration space]
+```
+
+并非所有平台都用标准 ECAM。
+
+SoC Root Complex 可以通过 `pci_ops` 使用 ATU 或专用配置寄存器，PCI Core 上层接口保持一致。
+
+## 八、Type 0 Header 与 Type 1 Header 的关键差异
+
+Type 0 用于 Endpoint Function，包含最多六个 BAR、Subsystem ID、Expansion ROM、Interrupt Pin/Line。
+
+Type 1 用于 PCI-to-PCI Bridge，包含两个 BAR、Primary/Secondary/Subordinate Bus Number 与三类 Bridge Window。
+
+Header Type bit 7 表示 Multi-function。
+
+扫描 Function 0 后，只有 Multi-function bit 置位才需要常规扫描 Function 1..7（仍需考虑 ARI 等扩展机制）。
+
+Bridge 的 Bus Number 在早期固件未配置时可能为 0。
+
+Linux 扫描会临时/正式分配 Secondary Number，再递归扫描，并更新 Subordinate 为下游最大 Bus Number。
+
+## 九、pci_scan_child_bus 的递归边界
+
+扫描当前 Bus 的每个 Slot/Function。
+
+发现 Bridge 后：
+
+1. 创建 Bridge `pci_dev`。
+2. 分配/读取 Secondary Bus Number。
+3. 创建 Child `pci_bus`。
+4. 扫描 Child Bus。
+5. 得到最大下游 Bus Number。
+6. 更新 Bridge Subordinate。
+
+```mermaid
+sequenceDiagram
+    participant C as pci_scan_child_bus
+    participant B as current pci_bus
+    participant F as config access
+    participant BR as bridge pci_dev
+    participant CH as child pci_bus
+    C->>B: iterate slots/devfn
+    C->>F: read Vendor ID/Header Type
+    F-->>C: bridge function found
+    C->>BR: setup Type 1 device
+    C->>CH: assign secondary bus and create child
+    C->>CH: recursive pci_scan_child_bus
+    CH-->>C: maximum subordinate bus number
+    C->>BR: program/update subordinate
+```
+
+Bus Number 是有限资源。
+
+深层 Switch、Hotplug 预留和 SR-IOV 会增加需求。
+
+Subordinate 范围太小会让后续 Hotplug Device 无法获得 Bus Number。
+
+## 十、BAR sizing 必须在设备未被驱动使用时完成
+
+标准 sizing 写全 1、读取 mask、恢复原值，再由最低有效位计算大小。
+
+64-bit BAR 要组合两个连续 dword。
+
+这会暂时改 Configuration Register，不能对正在运行的 Device 随意执行。
+
+PCI Core 在枚举/资源分配阶段统一完成。
+
+Firmware 预分配地址可能被保留，也可能因冲突/窗口不足被 Linux 重新分配。
+
+Command Register 的 Memory Space Enable 未打开时，BAR 地址即使有值也不会接受普通 Memory Request。
+
+## 十一、Bridge Window 必须包含所有下游 BAR
+
+Root Port/Switch Port 的 I/O、Memory 与 Prefetchable Window 控制事务下传。
+
+```mermaid
+flowchart TD
+    ROOT[Host bridge memory window] --> RP[Root Port memory base/limit]
+    RP --> SW[Switch downstream window]
+    SW --> BAR0[Endpoint non-prefetchable BAR]
+    SW --> PBAR[Endpoint prefetchable 64-bit BAR]
+    ROOT --> PRP[Root Port prefetchable window]
+    PRP --> PSW[Switch prefetchable window]
+    PSW --> PBAR
+```
+
+Non-prefetchable 与 Prefetchable Window 属性必须匹配。
+
+64-bit Prefetchable BAR 可能位于 4 GiB 以上，而 32-bit Bridge Window/Host Window 无法覆盖。
+
+资源分配失败日志需要结合每一级 Window 阅读。
+
+## 十二、Capability 链是可扩展配置结构
+
+标准 Capability Pointer 位于配置头，并形成 8-bit offset 链。
+
+PM、MSI、MSI-X、PCIe Capability 位于前 256 字节。
+
+Extended Capability 从 0x100 开始，使用 12-bit Next Pointer，包含 AER、ACS、ARI、SR-IOV、ATS、PRI、PASID 等。
+
+遍历时要防止：
+
+- Offset 未对齐。
+- Offset 越界。
+- Next 指向自身或形成环。
+- Capability 长度不足。
+
+Linux 6.12 的 `pci_find_capability()`、`pci_find_ext_capability()` 已实现通用遍历。
+
+## 十三、从枚举到 Driver Probe 的发布链
+
+`pci_dev` 身份、资源与 Capability 准备后，PCI Core 注册设备。
+
+uevent 产生 modalias，模块系统加载匹配 `pci_driver`。
+
+```text
+configuration function discovered
+  -> pci_setup_device
+  -> resources/capabilities initialized
+  -> device_add
+  -> pci_bus_type match
+  -> pci_driver probe wrapper
+  -> driver probe
+```
+
+`lspci` 能看见 Device，但 Driver 未绑定，说明枚举已跨过配置访问与对象创建，下一步查 modalias、ID Table 和 probe error。
+
+## 十四、Hotplug Rescan 与 Remove
+
+Hotplug Controller 或用户 rescan 会再次扫描 Bus 的空 Slot/Function。
+
+新增 Bridge 可能需要预留 Bus Number/Window。
+
+Remove 先解绑 Driver、停止 DMA/IRQ，再从对象树删除 Function 和 Child Bus。
+
+Surprise Removal 时 Configuration Space 可能已读全 1，清理路径不能依赖 Device 响应。
+
+`echo 1 > rescan` 只能触发软件扫描，不会修复 PERST#、REFCLK、LTSSM 或 ATU。
+
+## 十五、Linux 6.12 源码和一手资料
+
+- `drivers/pci/probe.c`：`pci_scan_child_bus` 与设备创建。
+- `drivers/pci/access.c`：`pci_bus_read_config*`。
+- `drivers/pci/setup-bus.c`：资源窗口。
+
+一手资料：
+
+- [Linux 6.12 PCI driver API](https://www.kernel.org/doc/html/v6.12/driver-api/pci/pci.html)
+- [Linux PCI resource allocation](https://docs.kernel.org/PCI/index.html)
+- [Linux stable PCI probe source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci/probe.c?h=linux-6.12.y)
+- [PCI-SIG specifications](https://pcisig.com/specifications)
+
+## 十六、小结
 
 PCIe 用独立 Configuration Space 解决“尚未分配普通地址时如何发现设备”。BDF 定位 Function，Type 0/Type 1 Header 区分 Endpoint 与 Bridge，Linux 递归扫描 bus、计算 BAR、分配资源并设置 bridge window，再解析 Capability 和创建 `pci_dev`。
 

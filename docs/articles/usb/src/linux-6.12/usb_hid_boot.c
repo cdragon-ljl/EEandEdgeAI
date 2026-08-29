@@ -4,10 +4,12 @@
  * A target interface must be unbound from usbhid before this driver can bind.
  */
 
+#include <linux/hid.h>
 #include <linux/input.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/usb.h>
+#include <linux/usb/input.h>
 
 #include "usb_example_common.h"
 
