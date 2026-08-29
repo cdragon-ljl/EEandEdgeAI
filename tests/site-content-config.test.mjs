@@ -264,7 +264,7 @@ test('README reports measured USB, PCIe, and total published counts', () => {
 
   assert.equal(counts.usb, 14);
   assert.equal(counts.pcie, 18);
-  assert.equal(total, 309);
+  assert.equal(total, 311);
   assert.match(readme, new RegExp(`13 个专题系列、${total} 篇已发布文章`));
   assert.match(readme, /USB 驱动开发实战[^\n]+\| 14 \|/);
   assert.match(readme, /PCIe 驱动开发实战[^\n]+\| 18 \|/);
