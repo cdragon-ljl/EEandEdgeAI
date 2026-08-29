@@ -8,15 +8,13 @@ tags: ["Linux BSP", "USB", "Host", "Gadget", "OTG", "PHY"]
 draft: false
 ---
 
-USB 接口“没有识别 U 盘”时，最先要回答的不是“缺哪个驱动模块”，而是这一个 Type-A、Micro-USB 或 Type-C 口在当前硬件上到底承担 host、device 还是 OTG 角色。
+一个可工作的端口首先需要 USB controller 驱动寄存器与 DMA，再由 USB PHY 连接总线电气；host 侧还要正确提供 VBUS，连接器和检测电路共同决定当前 role；随后 host 才能发起 enumeration，并为接口绑定相应 class driver。板卡作为外设时走的是 gadget 框架，由对端 host 完成枚举。
 
-host 负责提供 VBUS 并发起枚举；device 等待对端 host 枚举；OTG 需要基于 ID/VBUS/Type-C 控制器动态决定角色。
+因此“没有识别 U 盘”不能直接归结为缺少驱动模块。Type-A、Micro-USB 或 Type-C 连接器的实际接线、供电方向、ID/CC 检测和控制器能力共同决定端口是固定 host、固定 device 还是 dual-role。
 
-角色、USB PHY、控制器、VBUS 电源开关、连接检测和上层 class driver 缺一不可。
+本章聚焦 Linux BSP 集成：把控制器、PHY、供电、角色选择和功能绑定串成可验证的板级路径。USB 协议、descriptor、URB、具体 class 驱动以及 MCU/CherryUSB 的深入内容，继续阅读[USB 专题系列](../../usb/)。
 
-本章以“接口能稳定完成插入、枚举、传输、拔出并恢复”为主线组织 USB 调试。
-
-## 1. 先确定接口的物理角色和供电方向
+## 一、先确定接口角色和供电方向
 
 同一个 SoC USB controller 常既可作为 host，也可作为 gadget controller。
 
@@ -61,7 +59,7 @@ flowchart LR
     E --> F[mount, tty, HID or PC application]
 ```
 
-## 2. 第一步：让 DTS 描述 controller、PHY、VBUS 和角色
+## 二、用 DTS 描述 controller、PHY、VBUS 和角色
 
 USB controller 节点需要关联 PHY、clock、reset、interrupt 和可能的 VBUS regulator/role switch。
 
@@ -114,7 +112,7 @@ lsusb
 find /sys/bus/usb/devices -maxdepth 1 -type l | sort
 ```
 
-## 3. 第二步：用枚举日志区分物理连接、PHY 与 class driver
+## 三、用枚举日志区分物理层、协议与 class driver
 
 USB 枚举有明确的时序：检测 attach、端口 reset、读取 descriptor、选择 configuration，最后才绑定 mass storage、HID、CDC ACM 等 class driver。
 
@@ -162,7 +160,7 @@ mount -o ro /dev/sdX1 /mnt/usb-test
 
 首次验证建议只读挂载，避免因错误目标、文件系统错误或应用脚本写入破坏用户介质。
 
-## 4. 第三步：在 device/gadget 模式中显式管理功能组合
+## 四、在 device/gadget 模式中显式管理功能组合
 
 当板子作为 USB device 连接 PC 时，Linux gadget framework 需要提供明确功能，例如 ACM 串口、ECM/RNDIS 网络、mass storage 或自定义 FunctionFS。
 
@@ -204,7 +202,7 @@ flowchart TD
 
 只有真实产品需要双角色时，才引入 OTG/Type-C 状态机并进行电源和插拔全组合验证。
 
-## 5. 第四步：用插拔、过流和解绑回归证明接口可长期工作
+## 五、用插拔、过流和解绑回归验证接口恢复
 
 USB 的成功标准必须包含重复插拔、不同设备、异常断开和恢复。
 
@@ -229,6 +227,13 @@ flowchart TD
 | 插拔 | 设备节点、挂载和驱动清理 | PC 拔插后重新绑定 |
 | 重启 | controller 和 PHY 可恢复 | gadget 配置不依赖旧连接 |
 
+### 官方资料
+
+- [Linux USB API](https://docs.kernel.org/driver-api/usb/index.html)
+- [USB Gadget API for Linux](https://docs.kernel.org/driver-api/usb/gadget.html)
+- [Linux USB gadget configured through configfs](https://docs.kernel.org/usb/gadget_configfs.html)
+- [Linux USB Power Management](https://docs.kernel.org/driver-api/usb/power-management.html)
+
 ### 本章练习
 
 从原理图确认一个 USB 口的 connector 类型、实际角色、VBUS 来源、过流检测和 PHY/controller 对应关系。
@@ -239,7 +244,11 @@ flowchart TD
 
 为一个 device 口创建最小 ACM 或 ECM gadget，在 PC 端反复插拔并保存枚举与数据传输日志。
 
-### 本章验收
+## 六、小结与验收
+
+USB BSP 集成应沿着电源与角色、控制器与 PHY、枚举、功能绑定、数据传输和异常恢复逐层验证。固定角色产品应尽量固定硬件和 DTS 策略；只有真实需要双角色时，才引入 Type-C/OTG 状态机并验证全部供电组合。
+
+### 验收问题
 
 完成本章后，应能独立回答：
 
@@ -253,47 +262,5 @@ flowchart TD
 - 如何用重复插拔、过流和重启验证 USB 端口的恢复能力。
 
 当角色、供电、PHY、枚举和功能绑定都能逐层验证时，USB 接口才具备产品所需的可恢复性，而不是只在某一根线和某一个 U 盘上偶然可用。
-
-### 建议保留的 USB 接口档案
-
-每个 USB connector 都应在板级文档中有一张接口卡片：物理位置、连接器类型、固定或动态角色、controller/PHY 名称、VBUS 来源与额定电流、过流信号、可支持的速率、是否经过 hub/mux，以及允许连接的产品外设。
-
-测试记录至少保存插入和拔出时的 dmesg、lsusb -t 拓扑、枚举速度、class driver、传输结果和 VBUS 实测值。对 Type-C 口还应保留 CC/role 状态，不能仅凭 USB 设备节点出现判断供电方向正确。
-
-当发生反复重连时，先断开高功耗外设，观察 VBUS 是否跌落；随后使用短的已知良好线缆和直连口复测，再检查 hub、ESD、mux 和 PHY。一次性同时替换线、U 盘、hub 和 DTS 会失去定位价值。
-
-若产品需要导出 mass-storage gadget，发布前应明确后端镜像是否只读、何时允许 host 写入、Linux 本地是否会挂载该介质，以及异常断开后的数据恢复策略。
-
-USB 设备迁移到另一台 PC 时，host 的权限策略、已安装驱动和连接器能力会改变现象。测试 PC 的操作系统、端口类型、hub 以及 USB 视图也应写入记录，特别是在验证 gadget 网络、串口或历史兼容性时。
-
-对于 host 口，允许的最大电流应由 VBUS 开关、PMIC 和电源预算共同决定。插入高功耗硬盘、4G/5G 模块或多级 hub 前，先确认负载峰值与过流策略；发现低压重连时优先检查供电能力，而不是强行禁止 USB reset。
-
-接口从设备被拔出到内核完成清理可能会有短暂延迟。应用应处理节点消失、读写返回错误和重新枚举，而不应持有旧的 /dev/tty、block 或 network interface 句柄持续重试。
-
-对需要支持现场升级的 USB 口，还应写清被允许的设备类型、验证机制和权限。把任意 U 盘自动执行脚本或自动写入系统分区会给产品引入可被物理访问触发的安全风险。
-
-高速模式验证还需要记录实际协商 speed。一个设备退回 USB2 或 full-speed 时，枚举仍可能成功，但摄像头、网卡或存储的业务带宽会完全不同。
-
-对 USB 网卡或 USB 串口模块，设备节点出现后还要验证网络地址或串口参数、断开后的应用错误处理，以及重插后设备命名变化。class driver 的 probe 成功只是业务路径的起点。
-
-接口若使用外部 hub，hub 的上电与复位也属于链路。先验证无下游设备时 hub 自身是否稳定存在，再分别验证单设备和多个下游设备，避免把 hub 电源问题误判成某个外设的兼容性问题。
-
-任何需要启用 autosuspend 的 USB 产品，都应在空闲、持续传输、拔插和系统恢复场景下测试。只在 idle 下观察到低功耗不代表恢复时不会发生丢失或超时。
-
-对需要用户现场使用的端口，机械寿命和插拔方向也要进入系统测试。connector 松动、污染或反复受力造成的接触不良，软件日志通常只会表现为 disconnect/reconnect，仍需要结合物理检查处理。
-
-USB 错误报告应包含 bus/port 路径，尤其是在 hub 下。只写“U 盘断开”无法定位是上游 root hub、外部 hub 还是某个下游口发生故障。
-
-- 固定角色口的 dr_mode 与电源方向；
-- VBUS 空载和负载电压；
-- 插入设备的 VID/PID、速率和 port path；
-- 枚举失败的完整 dmesg；
-- class driver 与用户态功能结果；
-- 拔出后的节点清理和重插恢复；
-- autosuspend/系统恢复后的再次传输。
-
-这些项目组成接口最小回归表。设备类型增加、hub 变更或根文件系统升级后，应重新执行而不是沿用以前的一次成功记录。
-
-测试结束时应拔出所有外设并确认 host controller、hub 与应用资源已清理，再开始下一轮样本。
 
 > 🏷️ Linux BSP · USB · host · gadget · OTG · PHY · VBUS · enumeration

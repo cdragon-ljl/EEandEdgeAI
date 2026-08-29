@@ -8,17 +8,13 @@ tags: ["Linux BSP", "Block Device", "eMMC", "SD", "Storage"]
 draft: false
 ---
 
-看到 /dev/mmcblk0，并不意味着存储链路已经可靠。
+eMMC 与 SD 在 Linux 中最终表现为 block device，但设备节点只是整条链路的最上层结果。控制器首先由 MMC host 驱动管理，I/O 随后进入 block layer，由 request_queue 排队和下发；partition 划定不同用途的地址范围，filesystem 负责文件与元数据一致性，flush/FUA 才把上层持久化要求传递到设备能够保证的边界。
 
-它只说明 MMC host、卡识别和块层注册走到了能暴露设备节点的阶段。
+因此看到 `/dev/mmcblk0` 只说明卡识别与注册已完成，不能证明高速时序、持续 DMA、写缓存、突然掉电和介质寿命都可靠。应用的 `write()` 返回也通常只表示数据进入页缓存，真正的持久化语义还取决于文件系统事务、`fsync()`、块层命令和设备本身的缓存实现。
 
-真正的产品路径还包括分区表、文件系统、挂载时机、写缓存、断电行为、坏块/寿命告警和升级过程中的数据保护。
+本章以“向安全的数据分区提交一条记录，重启后仍能验证”为主线，从上层写入一路追到 eMMC/SD 控制器。根文件系统常位于同一介质，所有格式化、丢弃和破坏性实验都必须避开 boot、rootfs 与生产数据分区。
 
-本章以“向数据分区写入一条记录，断电重启后仍可验证”为主线，从文件系统一路追到 eMMC/SD 控制器。
-
-根文件系统通常也在块设备上，任何分区或格式化实验都必须避开当前 rootfs 和 boot 分区。
-
-## 1. 先画出一次文件写入经过的层次
+## 一、从一次文件写入看清整个存储栈
 
 用户态 write 不会直接变成一条 eMMC command。
 
@@ -64,7 +60,7 @@ findmnt /
 
 不要在不确定设备来源时运行 mkfs、dd、wipefs、fsck -y 或 block discard。
 
-## 2. 第一步：从设备树到 /dev/mmcblkX 确认 host 已正确工作
+## 二、从设备树到设备节点确认 MMC host
 
 MMC host 节点通常描述 bus-width、供电、cd/wp GPIO、pinctrl、clock、reset 和高速模式能力。
 
@@ -123,7 +119,7 @@ SD 卡通常可插拔，需要 card detect、写保护和更复杂的机械可�
 | 产品用途 | boot/rootfs/长期数据 | 扩展存储、导入导出 |
 | 主要风险 | 寿命、掉电、焊接和时序 | 接触不良、拔卡、伪卡和文件损坏 |
 
-## 3. 第二步：理解块层 request 与文件系统提交的边界
+## 三、理解 bio、request 与持久化边界
 
 块层面对的是扇区和 request，不知道“配置文件”或“数据库记录”的业务含义。
 
@@ -186,7 +182,7 @@ done
 
 只有确认业务瓶颈在队列层，才讨论参数调整；否则“调优”会破坏可复现性。
 
-## 4. 第三步：以 PARTUUID、挂载策略和文件系统保护数据分区
+## 四、用 PARTUUID、挂载策略和事务保护数据分区
 
 启动参数和 fstab 应使用 PARTUUID、UUID 或标签，而不是 /dev/mmcblk0pN。
 
@@ -229,7 +225,7 @@ flowchart LR
 | mkfs/wipe | 禁止 | 只允许精确目标和日志记录 |
 | 修改分区表 | 禁止 | 专用烧录/升级流程 |
 
-## 5. 第四步：用掉电、错误日志和寿命指标完成存储验收
+## 五、用掉电、错误日志和寿命指标验证存储
 
 存储链路测试必须包含“正常写完”和“在受控边界掉电”两种情况。
 
@@ -263,6 +259,12 @@ eMMC 的 health、life time、pre-EOL 等信息在部分设备和内核配置中
 | 文件系统频繁修复 | 突然掉电、介质错误或内核错误 | 自动 fsck -y 覆盖证据 |
 | 性能逐渐下降 | FTL GC、寿命、写放大或温控 | 用一次 benchmark 代表长期表现 |
 
+### 官方资料
+
+- [Multi-Queue Block IO Queueing Mechanism](https://docs.kernel.org/block/blk-mq.html)
+- [The Linux kernel MMC subsystem](https://docs.kernel.org/driver-api/mmc/index.html)
+- [Device Mapper writecache target](https://docs.kernel.org/admin-guide/device-mapper/writecache.html)
+
 ### 本章练习
 
 在安全的数据分区上记录其 PARTUUID、文件系统、挂载点和当前 rootfs 位置。
@@ -273,7 +275,11 @@ eMMC 的 health、life time、pre-EOL 等信息在部分设备和内核配置中
 
 在持续读写时收集 MMC 错误、fsync 延迟和温度，区分文件系统问题与 host/controller 问题。
 
-### 本章验收
+## 六、小结与验收
+
+块存储可靠性必须同时回答三件事：控制器能否稳定传输、块层能否正确完成请求、应用能否用事务和同步语义保护数据。设备节点、一次复制成功或单次跑分都只覆盖其中一小段。
+
+### 验收问题
 
 完成本章后，应能独立回答：
 
@@ -287,15 +293,5 @@ eMMC 的 health、life time、pre-EOL 等信息在部分设备和内核配置中
 - 如何用受控掉电与日志证明数据路径具备恢复能力。
 
 可靠的块存储不是“能 mount、能复制文件”，而是任何一层出错时都能定位、恢复并保护已确认的数据。
-
-### 建议保留的存储运行记录
-
-每次板级存储问题都应附带一次简短的运行记录：设备型号和 EXT_CSD/识别信息、内核版本、目标 PARTUUID、挂载选项、测试文件大小、写入次数、fsync p50/p99、重启方式以及 dmesg 中所有 MMC/文件系统事件。
-
-对比两个版本时必须使用同一张板、同一电源、同一分区和相同 workload；否则 FTL 垃圾回收、温度或已写入量的差异会被误判为内核回归。
-
-对 eMMC，容量接近耗尽时的写入延迟与空闲状态下可能完全不同。性能报告至少给出分区使用率，不能只报告一组“空盘顺序写”数字。
-
-当出现 I/O error 时，优先完整保存首次错误前后的日志和计数。反复重启、格式化或覆盖写会抹掉最有价值的现场证据。
 
 > 🏷️ Linux BSP · block layer · eMMC · SD · partition · filesystem · fsync · power-loss

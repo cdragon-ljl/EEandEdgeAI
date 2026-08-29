@@ -8,15 +8,13 @@ tags: ["Linux BSP", "ALSA", "ASoC", "I2S", "TDM", "Audio Codec"]
 draft: false
 ---
 
-声卡出现在 aplay -l 中，不代表麦克风、codec 时钟、I2S 数据、模拟增益和 PCM buffer 都正确。
+嵌入式音频首先由 codec 完成模拟与数字转换，SoC 侧通过 CPU DAI 收发采样；双方由 DAI link 描述连接参数，machine driver 把板级时钟、路由和器件粘合成一张声卡；DAPM 根据活动路径管理供电，最终由 ALSA PCM 向应用提供录放音接口。
 
-嵌入式 Linux 音频由 CPU DAI、codec DAI、machine driver、DAI link、clock/regulator、DAPM route 和 ALSA PCM 共同构成。
+声卡出现在 `aplay -l` 中，只说明这些组件已经完成注册，不能证明 MCLK/BCLK/LRCK、I2S 数据、麦克风偏置、模拟增益和 DMA buffer 都正确。无声、杂音、音调变化、特定采样率失败和持续运行后的 XRUN 分别指向不同层。
 
-录音没有数据、播放杂音、音调变快、只在某个 sample rate 失败或运行一段时间 XRUN，分别落在不同层。
+本章以“一次有限长度录音、回放和波形验证”为主线，建立 ASoC BSP bring-up 的证据链。采样、编码、回声消除、流媒体和应用管线的完整知识继续阅读[音视频专题系列](../../video-audio/)。
 
-本章以“录制一段单声道或立体声 PCM，再可听地播放并验证采样率”为主线，建立 ASoC 音频 bring-up 的可观测路径。
-
-## 1. 先把模拟与数字音频链路分开
+## 一、先把模拟链路与数字链路分开
 
 I2S/TDM 总线只能传输数字采样，不能证明麦克风偏置、codec 模拟输入、功放或耳机电路正确。
 
@@ -55,7 +53,7 @@ arecord -l
 amixer -c ACTUAL_CARD scontrols
 ```
 
-## 2. 第一步：在 DTS 中对齐 codec、CPU DAI 与音频时钟
+## 二、在 DTS 中对齐 codec、CPU DAI 与音频时钟
 
 ASoC sound card 节点通常把 CPU DAI、codec DAI、DAI format、bitclock/frame master、mclk 与 route 联系起来。
 
@@ -120,7 +118,7 @@ flowchart TD
 
 应按 DAI format 和实际 TDM slot 计算，再用逻辑分析仪/示波器确认 LRCK 频率、每帧 slot 数和 BCLK。
 
-## 3. 第二步：用 ALSA card、control 与 DAPM route 建立可见状态
+## 三、用 ALSA card、control 与 DAPM route 建立可见状态
 
 codec driver 注册 controls，machine driver 描述 widgets/routes，DAPM 根据活动 stream 和 mixer 状态打开所需电源路径。
 
@@ -178,7 +176,7 @@ sequenceDiagram
     P-->>A: read PCM frames
 ```
 
-## 4. 第三步：用格式、时钟和 buffer 证据定位无声、杂音与 XRUN
+## 四、用格式、时钟和 buffer 证据定位无声、杂音与 XRUN
 
 无声、噪声、音调异常和 XRUN 的根因不同。
 
@@ -211,7 +209,7 @@ XRUN 是音频流在 deadline 前没有填满或取走 period 的症状，不是
 
 先记录出现时的 CPU load、IRQ、频率、电源状态、DMA error 和用户态调度延迟，再调整 period/buffer。
 
-## 5. 第四步：通过回环、长录音和恢复测试验证声卡生命周期
+## 五、通过回环、长录音和恢复测试验证声卡生命周期
 
 有限录音成功后，继续测试多种支持的 rate、连续 capture/playback、暂停恢复和重启。
 
@@ -238,6 +236,13 @@ flowchart TD
 | 长时稳定 | XRUN 日志、CPU/温度、文件完整性 |
 | 恢复能力 | stop/start、重启、可选 suspend/resume |
 
+### 官方资料
+
+- [ALSA SoC Layer Overview](https://docs.kernel.org/sound/soc/overview.html)
+- [ASoC Machine Driver](https://docs.kernel.org/sound/soc/machine.html)
+- [Dynamic Audio Power Management](https://docs.kernel.org/sound/soc/dapm.html)
+- [ASoC Platform Driver and audio DMA](https://docs.kernel.org/sound/soc/platform.html)
+
 ### 本章练习
 
 从原理图整理 codec 的 I2C、供电、reset、MCLK、I2S/TDM 数据线和功放/麦克风连接。
@@ -248,7 +253,11 @@ flowchart TD
 
 在固定采样率下连续录制 30 分钟并同时播放，记录 XRUN、CPU load、温度和文件样本数。
 
-### 本章验收
+## 六、小结与验收
+
+ASoC 的价值在于把可复用的 codec 和 SoC 组件与板级 machine 描述分开。调试时也应沿同样边界推进：先证明模拟供电和器件可用，再证明时钟与采样格式，随后检查 DAPM 路由、DMA period 和应用参数，最后才讨论主观音质。
+
+### 验收问题
 
 完成本章后，应能独立回答：
 
@@ -262,39 +271,5 @@ flowchart TD
 - 如何用长录音、并发播放和恢复测试验证声卡稳定性。
 
 当模拟路径、DAI 时钟、PCM 队列和用户态样本都可独立观测时，音频问题才会从“听感异常”变成可定位的系统链路问题。
-
-### 建议保留的音频配置档案
-
-一组通过验收的音频参数应包含 card/device、capture/playback direction、codec driver、DAI format、CPU/codec master、MCLK/BCLK/LRCK 测量值、sample rate、sample width、slot width、channel map、关键 mixer control 和模拟增益。
-
-同一份 WAV 在不同 card 或不同 ALSA plugin 路径下可能被重采样。性能和质量测试应同时记录应用实际打开的 hw_params，不能只记录命令行希望使用的 48 kHz。
-
-对底噪、爆音和失真，保留原始 PCM、输入信号条件、录音增益、播放音量和外部测量结果。仅凭主观听感难以复现，也不利于比较 codec 供电、时钟抖动或 analog route 修改的影响。
-
-音频服务退出或声卡解绑前，必须停止 PCM stream 并等待 DMA period 完成。直接断电或关闭 MCLK 可能留下最后一段噪声，并使之后的恢复日志缺少真实根因。
-
-在多声卡系统中，应使用稳定的 card 标识或 udev/配置映射选择设备，而不是按枚举顺序选择 hw:0,0。USB 声卡、HDMI audio 或调试 codec 的插入会改变编号，导致测试脚本把板载录音结果写到错误设备。
-
-对每一种被产品支持的 sample rate、channel map 与 full-duplex 组合都应单独检查。某些 codec 能启动 48 kHz，却在 44.1 kHz、TDM 多通道或低延迟小 period 下暴露 PLL、slot 或 DMA 边界问题。
-
-出现连发 XRUN 时，要保存 /proc/interrupts、CPU/Devfreq、dmesg 和应用调度状态，检查是否与摄像头、网络或存储的大负载时间区间重合。这样能在系统级争用和单独的 audio driver 故障之间建立证据。
-
-音频时钟族还会影响 44.1 kHz 与 48 kHz 系列的精确性。若平台只能从特定 PLL 派生近似频率，必须测量实际 LRCK 并评估长期录音样本数漂移，不能仅依赖应用显示的 requested rate。
-
-需要回声消除、阵列麦克风或多 codec 的系统，应先把每个基础 DAI link 单独验收，再引入复杂算法和路由。基础 PCM 本身未稳定时，算法输出无法帮助定位 clock、channel 或增益问题。
-
-对播放路径，峰值音量和静音切换也应在外接负载下验证。功放 enable、pop suppression 和 DAPM 时序错误常在启动/停止瞬间出现，而连续正弦波测试不一定能暴露。
-
-量产时可使用受控的 loopback 或标准音频样本验证通道、幅度和噪声门限，但不应将测试 loopback route 留在正常产品配置中。工厂测试与运行时 mixer profile 必须分离并能明确回读。
-
-音频故障日志还应记录正在使用的 codec 供电和 MCLK 状态。这样在偶发静音时，能先判断是 stream/route 问题还是 codec 已因 PM 路径被错误关闭。
-
-- 录音和播放设备标识；
-- 实际 hw_params 与 mixer profile；
-- BCLK/LRCK/MCLK 的测量结果；
-- XRUN、温度和系统负载；
-- 原始 PCM 与外部听感/测量结论。
-
-每次修改音频时钟或 route 后，重新从静音、启动到停止执行一次完整回归。
 
 > 🏷️ Linux BSP · ALSA · ASoC · I2S · TDM · codec · DAPM · PCM · XRUN

@@ -57,6 +57,14 @@ const qualityContractFiles = new Set([
   'linux-driver-18-iommu-dma-address-translation.md',
   'linux-driver-19-firmware-remoteproc-rpmsg.md',
   'linux-driver-20-rtc-nvmem-eeprom-efuse.md',
+  'linux-driver-21-block-storage-emmc-sd.md',
+  'linux-driver-22-mtd-ubi-nor-nand.md',
+  'linux-driver-23-ethernet-mac-phy-netdev.md',
+  'linux-driver-24-usb-host-device-otg.md',
+  'linux-driver-25-v4l2-imx415-mipi-csi.md',
+  'linux-driver-26-alsa-asoc-i2s-audio.md',
+  'linux-driver-27-thermal-cpufreq-devfreq-pm.md',
+  'linux-driver-28-reliability-performance-debug.md',
 ]);
 const introOrder = {
   'linux-driver-02-first-kernel-module-and-char-device.md': ['内核空间', '模块', 'Kbuild', '字符设备', 'file_operations'],
@@ -79,6 +87,14 @@ const introOrder = {
   'linux-driver-18-iommu-dma-address-translation.md': ['IOVA', 'iommu_domain', 'IOMMU group', 'IOTLB', 'fault', 'dma-buf', 'dma_fence'],
   'linux-driver-19-firmware-remoteproc-rpmsg.md': ['request_firmware', 'remoteproc', 'resource table', 'virtio', 'rpmsg', 'endpoint', 'crash'],
   'linux-driver-20-rtc-nvmem-eeprom-efuse.md': ['RTC', 'NVMEM provider', 'NVMEM cell', 'EEPROM', 'eFuse', '校验'],
+  'linux-driver-21-block-storage-emmc-sd.md': ['block device', 'MMC host', 'block layer', 'request_queue', 'partition', 'filesystem', 'flush/FUA'],
+  'linux-driver-22-mtd-ubi-nor-nand.md': ['raw flash', 'MTD', 'eraseblock', 'bad block', 'UBI', 'UBIFS'],
+  'linux-driver-23-ethernet-mac-phy-netdev.md': ['PHY', 'MAC', 'DMA ring', 'NAPI', 'net_device', 'socket'],
+  'linux-driver-24-usb-host-device-otg.md': ['USB controller', 'USB PHY', 'VBUS', 'role', 'enumeration', 'class driver', 'gadget'],
+  'linux-driver-25-v4l2-imx415-mipi-csi.md': ['sensor', 'MIPI CSI-2', 'V4L2 sub-device', 'media graph', 'videobuf2', 'video node'],
+  'linux-driver-26-alsa-asoc-i2s-audio.md': ['codec', 'CPU DAI', 'DAI link', 'machine driver', 'DAPM', 'ALSA PCM'],
+  'linux-driver-27-thermal-cpufreq-devfreq-pm.md': ['thermal sensor', 'thermal zone', 'trip point', 'cooling device', 'CPUFreq', 'Devfreq', 'runtime PM'],
+  'linux-driver-28-reliability-performance-debug.md': ['现象', 'baseline', 'tracepoint', 'ftrace', 'perf', 'fault injection', 'watchdog', '发布门禁'],
 };
 const diagramMinimum = new Map([
   ['linux-driver-02-first-kernel-module-and-char-device.md', 2],
@@ -101,6 +117,14 @@ const diagramMinimum = new Map([
   ['linux-driver-18-iommu-dma-address-translation.md', 3],
   ['linux-driver-19-firmware-remoteproc-rpmsg.md', 3],
   ['linux-driver-20-rtc-nvmem-eeprom-efuse.md', 2],
+  ['linux-driver-21-block-storage-emmc-sd.md', 3],
+  ['linux-driver-22-mtd-ubi-nor-nand.md', 3],
+  ['linux-driver-23-ethernet-mac-phy-netdev.md', 3],
+  ['linux-driver-24-usb-host-device-otg.md', 3],
+  ['linux-driver-25-v4l2-imx415-mipi-csi.md', 4],
+  ['linux-driver-26-alsa-asoc-i2s-audio.md', 4],
+  ['linux-driver-27-thermal-cpufreq-devfreq-pm.md', 3],
+  ['linux-driver-28-reliability-performance-debug.md', 4],
 ]);
 const officialSourcePattern = /https:\/\/(?:docs\.kernel\.org|www\.kernel\.org|git\.kernel\.org|github\.com\/torvalds\/linux|devicetree-specification\.readthedocs\.io)/gi;
 
@@ -173,6 +197,16 @@ test('DMA and IOMMU articles preserve official API boundaries', () => {
   const iommu = bodyOf('linux-driver-18-iommu-dma-address-translation.md');
   assert.match(iommu, /关闭 IOMMU[\s\S]+内存破坏/);
   assert.match(iommu, /dma-buf[\s\S]+attachment[\s\S]+dma_fence/i);
+});
+
+test('integration guides link to the dedicated deep-dive series', () => {
+  const usb = bodyOf('linux-driver-24-usb-host-device-otg.md');
+  const video = bodyOf('linux-driver-25-v4l2-imx415-mipi-csi.md');
+  const audio = bodyOf('linux-driver-26-alsa-asoc-i2s-audio.md');
+
+  assert.match(usb, /\]\(\.\.\/\.\.\/usb\/\)/);
+  assert.match(video, /\]\(\.\.\/\.\.\/video-audio\/\)/);
+  assert.match(audio, /\]\(\.\.\/\.\.\/video-audio\/\)/);
 });
 
 export { learningPath };

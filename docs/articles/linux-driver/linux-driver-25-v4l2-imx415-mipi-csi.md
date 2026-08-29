@@ -8,17 +8,13 @@ tags: ["Linux BSP", "V4L2", "IMX415", "MIPI CSI-2", "ISP", "Media Controller"]
 draft: false
 ---
 
-摄像头节点出现 /dev/videoX，不表示 IMX415 已经真正输出了正确图像。
+摄像头数据从 sensor 产生，经 MIPI CSI-2 物理链路进入接收端；sensor 驱动注册为 V4L2 sub-device，多个实体通过 media graph 组成管线；采集驱动再用 videobuf2 管理 DMA 缓冲区，最终才由 video node 向用户态提供帧。
 
-一帧图像需要 sensor 电源、xclk、reset、I2C 寄存器配置、MIPI CSI-2 lane、CSI receiver、ISP/media graph、buffer queue 和 V4L2 format 协商连续成立。
+因此出现 `/dev/videoX` 只说明某个节点已注册，不表示 IMX415 已正确上电、输出目标 mode，也不表示 lane、像素格式、ISP 和 buffer queue 已连续工作。黑帧、花屏、帧率为零、首帧成功后停顿和 CSI error 都需要沿实际数据路径分层定位。
 
-任意一环错配都可能表现为黑帧、绿屏、帧率为零、只在首帧成功或长时间后 CSI error。
+本章聚焦 RV1126 + IMX415 的 BSP bring-up：从电源、时钟、I2C 和 endpoint 一路验证到稳定采集。像素格式、ISP、编码、流媒体和应用管线的完整内容见[音视频专题系列](../../video-audio/)。所有 lane 数、link frequency、寄存器、地址和端点编号仍须以当前模组原理图、sensor datasheet 与正在使用的 Rockchip SDK 为准。
 
-本章以 RV1126 + IMX415 的一条采集链路为主线，目标是从板级时序一路验证到用户态稳定得到带正确时间戳和格式的帧。
-
-所有 lane 数、link frequency、时钟、寄存器、I2C 地址和 endpoint 编号都必须以当前 IMX415 模组原理图、sensor datasheet 和正在使用的 Rockchip SDK 为准。
-
-## 1. 先画出一帧从 sensor 到用户态的真实路径
+## 一、先画出一帧从 sensor 到用户态的真实路径
 
 图像采集不是单一驱动的工作。
 
@@ -56,7 +52,7 @@ v4l2-ctl -d /dev/videoX --all
 
 如果系统没有 media-ctl 或 v4l2-ctl，需要先在 rootfs 中启用对应工具。没有拓扑证据就修改 sensor DTS，通常只能靠猜测反复试错。
 
-## 2. 第一步：让 DTS 描述 sensor 的电源、时钟与 MIPI endpoint
+## 二、用 DTS 描述 sensor 电源、时钟与 MIPI endpoint
 
 IMX415 节点应描述 I2C 连接、供电 rail、外部时钟、reset/pwdn、pinctrl 和 CSI endpoint。
 
@@ -130,7 +126,7 @@ cat /sys/kernel/debug/regulator/regulator_summary | grep -i -E 'cam|avdd|dvdd'
 
 debugfs 节点和 clock 名称取决于内核配置。实际板端时序仍应由示波器确认，不要把 framework 显示 enabled 当作电压和时钟真的到达模组。
 
-## 3. 第二步：通过 media graph 完成 format 和链路协商
+## 三、通过 media graph 完成 format 与链路协商
 
 V4L2 media controller 的 entity、pad 和 link 描述的是硬件视频路径。
 
@@ -177,7 +173,7 @@ v4l2-ctl -d /dev/videoX --get-fmt-video
 
 只改应用请求的 3840x2160，无法让 sensor 在未支持的 lane/frequency 下产生该模式。
 
-## 4. 第三步：用 V4L2 buffer queue 验证真实帧而不是只看节点
+## 四、用 videobuf2 队列验证真实帧与所有权
 
 video node 正常的最低证据是成功 request buffers、queue、stream on、dequeue 多帧，并检查每帧 bytesused、sequence、timestamp 和 error flag。
 
@@ -226,7 +222,7 @@ vb2 负责 V4L2 buffer queue 与 memory type。mmap、userptr、DMABUF 等模式
 
 若要将帧交给 RGA、VENC 或 NPU，优先使用框架支持的 dma-buf 路径并遵守 fence/queue 同步，不要从 mmap 地址手工推导 DMA 地址。
 
-## 5. 第四步：以 CSI 错误、图像属性和长时间采集定位问题
+## 五、结合 CSI 错误、帧属性和长时间采集定位问题
 
 传感器问题需要同时看寄存器/日志、CSI error counter、帧统计和实际像素。
 
@@ -259,6 +255,13 @@ flowchart TD
 
 对可支持的 sensor test pattern，可先验证 sensor 到 CSI 的纯数字路径，再恢复真实镜头图像。这能把光学/曝光问题与 MIPI 数据路径问题拆开。
 
+### 官方资料
+
+- [Video for Linux API](https://docs.kernel.org/userspace-api/media/v4l/v4l2.html)
+- [V4L2 sub-device userspace API](https://docs.kernel.org/userspace-api/media/v4l/dev-subdev.html)
+- [Media Controller devices](https://docs.kernel.org/userspace-api/media/mediactl/media-controller.html)
+- [videobuf2 framework](https://docs.kernel.org/driver-api/media/v4l2-videobuf2.html)
+
 ### 本章练习
 
 从 IMX415 模组原理图整理 AVDD/DVDD/DOVDD、xclk、reset、I2C 地址、lane 数和 CSI 连接表。
@@ -269,7 +272,11 @@ flowchart TD
 
 进行 30 分钟连续采集，保存 CSI/ISP 错误、掉帧统计、温度和首尾帧图像。
 
-### 本章验收
+## 六、小结与验收
+
+摄像头 bring-up 的关键是让板级时序、sub-device 状态、media link、格式传播和 buffer completion 形成同一条证据链。看到节点或单张图像都不够，必须能解释每个 mode 的时钟、带宽、队列和长期错误计数。
+
+### 验收问题
 
 完成本章后，应能独立回答：
 
@@ -283,19 +290,5 @@ flowchart TD
 - 如何用 sequence、timestamp、CSI error 和长时间采集证明链路稳定。
 
 当一帧图像从上电、寄存器、lane、media link 到 buffer completion 都有独立证据时，摄像头 bring-up 才能从“试到有画面”为止，进化为可复现的工程闭环。
-
-### 建议保留的相机模式档案
-
-每一个已验收的 IMX415 mode 应记录 sensor driver 版本、寄存器 mode 名、宽高、fps、Bayer code、lane 数、link frequency、xclk、曝光范围、ISP/IQ 配置、media graph 快照和对应的 video node。
-
-首帧、稳态帧和热态帧都应保存原始样本或无损截图，以及 sequence、timestamp、CSI error、温度和 DDR/ISP 负载摘要。这样图像质量或掉帧出现回归时，可以区分 mode 配置变化、ISP 调参变化与硬件信号边际。
-
-摄像头启动或停止时，应保证应用先停止 queue，再关闭 stream；不要在仍有 buffer in flight 时直接解绑 sensor 或切断其电源。否则保存下来的错误常是资源生命周期问题，而不是 sensor 数据问题。
-
-在同一模式下重复停止与启动也应作为回归项。许多 sensor 在首次 stream-on 正常、第二次启动异常时，会暴露 reset、寄存器页、buffer queue 或 clock disable/enable 的遗漏。记录每次启动的首帧时间和首个有效 sequence，可以把这类问题从“偶发黑帧”变成可统计的生命周期错误。
-
-对镜头和 ISP 参数有生产差异的产品，校准版本也必须随模式档案保存。相同的 CSI 原始数据在不同 lens shading、曝光或白平衡配置下可能呈现明显差异，这属于图像调参/校准边界，不能误修到 MIPI 驱动中。
-
-采集服务应把实际选择的 mode 和 ISP 配置写进启动日志。这样现场拿到一帧异常图像时，才能首先确认运行时并没有落到另一种默认分辨率或色彩格式。
 
 > 🏷️ Linux BSP · V4L2 · IMX415 · MIPI CSI-2 · ISP · media controller · vb2 · camera bring-up

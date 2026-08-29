@@ -8,15 +8,13 @@ tags: ["Linux BSP", "MTD", "UBI", "UBIFS", "SPI NOR", "NAND"]
 draft: false
 ---
 
-原始 SPI NOR 和 NAND flash 不是缩小版 eMMC。
+SPI NOR、SPI NAND 与并行 NAND 属于 raw flash，软件直接面对其擦写限制。Linux 先用 MTD 表达原始介质，最基本的更新单位是 eraseblock；NAND 还可能在出厂或运行中出现 bad block；UBI 在 MTD 之上管理逻辑擦除块、磨损与坏块，UBIFS 再在 UBI volume 上提供可写文件系统。
 
-eMMC 内部已经提供 flash translation layer、坏块管理与块设备语义；原始 flash 则把擦除块、坏块、ECC、wear leveling 和掉电恢复的责任暴露给软件栈。
+这与 eMMC 的块设备模型不同。eMMC 已在器件内部用 FTL 隐藏擦除和坏块细节，而原始 Flash 的驱动、ECC、分区、卷管理与文件系统必须共同承担这些责任。把 `/dev/mtdX` 当作普通磁盘分区格式化，或把 UBI 当作一种“修复坏介质”的命令，都会越过真实的层次边界。
 
-Linux 的 MTD 负责描述原始介质，UBI 在其上处理逻辑擦除块、磨损均衡和坏块，UBIFS 则是在 UBI volume 上提供文件系统。
+本章以“建立一个掉电后仍能重新挂载的数据卷”为主线，先判断何时使用 MTD/UBI，再完成设备树布局、attach、volume、文件提交和故障恢复。所有擦除与格式化操作仅允许在明确的测试分区或测试板上进行。
 
-本章以“为可更新的数据卷建立断电后仍可挂载的存储路径”为主线，说明什么时候使用 MTD/UBI，而不是把每个 /dev/mtdX 当作普通磁盘。
-
-## 1. 先按介质语义选择块层还是 MTD/UBI
+## 一、先按介质语义选择块层还是 MTD/UBI
 
 一个存储芯片连接在 SPI 或 NAND controller 上，不自动决定它是否应使用 UBI。
 
@@ -58,7 +56,7 @@ mount | grep -E 'ubi|ubifs'
 
 如果任何来源对分区名称、大小或用途的描述不一致，停止操作并回到当前 SDK 的分区表和打包脚本核对。
 
-## 2. 第一步：让 DTS 和 MTD 分区准确表达原始介质布局
+## 二、让 DTS 与 MTD 准确表达原始介质布局
 
 flash controller 节点描述 SPI/NAND controller 的时钟、DMA、pinctrl 和 chip select。
 
@@ -133,7 +131,7 @@ cat /sys/class/mtd/mtdX/size
 
 NAND 还可能包含出厂坏块和运行中出现的坏块，因此“固定物理 offset 连续存放 N 个文件”不是可维护设计。
 
-## 3. 第二步：让 UBI 管理坏块和可写 volume
+## 三、让 UBI 管理逻辑擦除块和可写 volume
 
 UBI 将 MTD eraseblock 转换为逻辑 eraseblock，并在坏块、磨损均衡和 volume 管理之间建立一层抽象。
 
@@ -189,7 +187,7 @@ flowchart LR
 
 升级中需要写入完整候选镜像、保留回滚路径并记录 commit 状态，因此应预先计算 volume 容量和最坏情况下可用 PEB。
 
-## 4. 第三步：以 UBIFS 文件事务处理可写数据
+## 四、用 UBIFS 与应用事务处理可写数据
 
 UBIFS 是日志型 flash 文件系统，能适应 UBI 的逻辑擦除块和坏块管理，但它不懂应用的多文件业务事务。
 
@@ -235,7 +233,7 @@ ubiupdatevol、ubimkvol、ubirmvol 等是 volume 级维护工具。
 | 查看坏块/volume 状态 | ubinfo、日志、health 监控 |
 | 擦除原始分区 | 专用烧录/恢复流程 |
 
-## 5. 第四步：通过坏块、掉电与重挂载验证恢复行为
+## 五、通过坏块、掉电与重挂载验证恢复行为
 
 原始 flash 的可靠性测试不能只看一次 mount 成功。
 
@@ -266,6 +264,12 @@ flowchart TD
 | 可用空间异常减少 | UBI reserve、bad block、volume 配置 | 把数据写进 rootfs volume |
 | ECC/bitflip 告警 | NAND 介质、controller、温度 | 忽略日志继续量产 |
 
+### 官方资料
+
+- [UBI File System](https://docs.kernel.org/filesystems/ubifs.html)
+- [MTD NAND Driver Programming Interface](https://docs.kernel.org/driver-api/mtdnand.html)
+- [SPI NOR framework](https://docs.kernel.org/driver-api/mtd/spi-nor.html)
+
 ### 本章练习
 
 从现有 DTS、/proc/mtd 和烧录配置整理一张原始 flash 分区表，标明 boot、factory、rootfs 和数据区的读写权限。
@@ -276,7 +280,11 @@ flowchart TD
 
 收集一次 UBI attach、UBIFS mount、ECC 或 bad block 相关日志，能够说明它来自哪一层。
 
-### 本章验收
+## 六、小结与验收
+
+原始 Flash 的每一层都保留了下一层不能替代的职责：MTD 暴露介质，UBI 管理擦除块与坏块，UBIFS 管理文件系统一致性，应用仍需定义自身的提交语义。只有分层验证，掉电恢复才不会被误解为“文件系统会自动保存最后一次写入”。
+
+### 验收问题
 
 完成本章后，应能独立回答：
 
@@ -290,13 +298,5 @@ flowchart TD
 - 为什么未知分区上的 ubiformat 是不可接受的排障方式。
 
 当原始 flash 的物理限制、UBI 的映射职责和应用的数据提交边界被分别验证后，NAND 存储才具备可恢复而非侥幸可用的基础。
-
-### 建议保留的 UBI 介质档案
-
-对每块测试或量产 flash，记录 MTD 名称、总大小、erase size、ECC 信息、坏块数量、UBI attach 参数、volume 名称和大小、UBIFS 挂载选项及镜像 hash。
-
-这些字段是诊断“同一镜像为何在另一块板上 attach 失败”的基础。只保留 rootfs 文件版本，无法判断是否分区、header 偏移或介质状态发生了变化。
-
-升级前后都应收集一次 UBI/UBIFS 日志，并在完成后验证 factory 区仍为只读且未被触碰。可写 data volume 的空间耗尽、坏块增长和反复 mount recovery 需要作为运维告警，而不是等到无法启动才处理。
 
 > 🏷️ Linux BSP · MTD · UBI · UBIFS · SPI NOR · NAND · bad block · ECC
