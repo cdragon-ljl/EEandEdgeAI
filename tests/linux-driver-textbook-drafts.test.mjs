@@ -134,6 +134,33 @@ const expectedRedirects = {
 const sorted = (values) => [...values].sort();
 const setDifference = (left, right) => sorted(new Set(left.filter((value) => !right.has(value))));
 
+const withoutFencedCode = (source) => {
+  let inFence = false;
+  return source.split(/\r?\n/).filter((line) => {
+    if (/^\s*(```|~~~)/.test(line)) {
+      inFence = !inFence;
+      return false;
+    }
+    return !inFence;
+  }).join('\n');
+};
+
+const validateDraft = (source, file, article) => {
+  const frontmatter = source.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] ?? '';
+  assert.ok(article, `${file} is not in the curriculum manifest`);
+  assert.match(frontmatter, /(?:^|\r?\n)series:\s*linux-driver\s*(?:\r?\n|$)/);
+  assert.match(frontmatter, new RegExp(`(?:^|\\r?\\n)order:\\s*${article.order}\\s*(?:\\r?\n|$)`));
+  assert.match(frontmatter, /(?:^|\r?\n)draft:\s*true\s*(?:\r?\n|$)/);
+
+  const body = withoutFencedCode(source.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, ''));
+  assert.ok((body.match(/^#\s+/gm) ?? []).length <= 1, `${file} must have at most one H1`);
+  assert.doesNotMatch(body, /TBD|TODO|初学者扩展讲解|本章验收|验收问题|建议保留/);
+  assert.ok((body.match(/^##\s+.*(?:第一步|第二步|第三步|第四步).*$/gm) ?? []).length < 4,
+    `${file} has too many numbered process H2 headings`);
+  assert.match(source, /https?:\/\/(?:www\.)?(?:kernel\.org|docs\.kernel\.org|devicetree\.org|docs\.kernel\.org\/doc\/html\/latest\/)/,
+    `${file} must cite an official Linux, kernel source, Devicetree, or subsystem document`);
+};
+
 test('defines the exact 30-article curriculum manifest', () => {
   assert.deepEqual(plannedArticles, expectedArticles.map(([file, order, titleToken]) => ({ file, order, titleToken })));
 });
@@ -152,6 +179,36 @@ test('maps every historical slug to its exact redirect target', () => {
   assert.deepEqual(legacyRedirects, expectedRedirects);
 });
 
+test('accepts drafts without H1 and ignores headings inside fenced code', () => {
+  const source = `---
+series: linux-driver
+order: 1
+draft: true
+---
+This draft intentionally has no H1.
+
+\`\`\`c
+# explanation
+## 第一步 implementation detail
+\`\`\`
+
+https://kernel.org/doc/html/latest/`;
+  assert.doesNotThrow(() => validateDraft(source, plannedArticles[0].file, plannedArticles[0]));
+});
+
+test('rejects duplicate prose H1 headings', () => {
+  const source = `---
+series: linux-driver
+order: 1
+draft: true
+---
+# First title
+# Duplicate title
+
+https://kernel.org/doc/html/latest/`;
+  assert.throws(() => validateDraft(source, plannedArticles[0].file, plannedArticles[0]), /at most one H1/);
+});
+
 test('validates every existing textbook draft', () => {
   if (!existsSync(draftDirectory)) return;
 
@@ -159,20 +216,6 @@ test('validates every existing textbook draft', () => {
   const draftFiles = readdirSync(draftDirectory).filter((file) => file.endsWith('.md'));
   for (const file of draftFiles) {
     const source = readFileSync(join(draftDirectory, file), 'utf8');
-    const article = manifestByFile.get(file);
-    assert.ok(article, `${file} is not in the curriculum manifest`);
-
-    const frontmatter = source.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] ?? '';
-    assert.match(frontmatter, /(?:^|\r?\n)series:\s*linux-driver\s*(?:\r?\n|$)/);
-    assert.match(frontmatter, new RegExp(`(?:^|\\r?\\n)order:\\s*${article.order}\\s*(?:\\r?\\n|$)`));
-    assert.match(frontmatter, /(?:^|\r?\n)draft:\s*true\s*(?:\r?\n|$)/);
-
-    const body = source.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '');
-    assert.equal((body.match(/^#\s+/gm) ?? []).length, 1, `${file} must have one H1`);
-    assert.doesNotMatch(body, /TBD|TODO|初学者扩展讲解|本章验收|验收问题|建议保留/);
-    assert.ok((body.match(/^##\s+.*(?:第一步|第二步|第三步|第四步).*$/gm) ?? []).length < 4,
-      `${file} has too many numbered process H2 headings`);
-    assert.match(source, /https?:\/\/(?:www\.)?(?:kernel\.org|docs\.kernel\.org|devicetree\.org|docs\.kernel\.org\/doc\/html\/latest\/)/,
-      `${file} must cite an official Linux, kernel source, Devicetree, or subsystem document`);
+    validateDraft(source, file, manifestByFile.get(file));
   }
 });
