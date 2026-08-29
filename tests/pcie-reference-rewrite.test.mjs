@@ -22,10 +22,6 @@ export const pcieFiles = [
   'pci-16-linux-pci-endpoint-framework.md',
   'pci-17-multiqueue-dma-msix-throughput.md',
   'pci-18-system-debug-lspci-aer-iommu.md',
-  'pci-19-usb-pcie-bus-model-comparison.md',
-  'pci-20-usb-pcie-driver-framework-comparison.md',
-  'pci-21-usb-pcie-debug-evidence-comparison.md',
-  'pci-22-usb-pcie-interview-design.md',
 ];
 
 export const pcieLegacyRedirects = {
@@ -62,10 +58,6 @@ const topicMarkers = [
   ['pci_epc_set_bar', 'configfs', 'MSI-X', 'unbind'],
   ['multi-queue', 'doorbell', 'backpressure', 'generation'],
   ['lspci -vv', 'AER', 'IOMMU fault', 'FLR'],
-  ['Host', 'Root Complex', 'URB', 'DMA'],
-  ['usb_interface', 'pci_dev', 'disconnect', 'remove'],
-  ['usbmon', 'lspci -vv', 'protocol analyzer', '证据'],
-  ['错误答案', '证据链', 'MSI-X', 'IOMMU'],
 ];
 
 const officialSourcePattern = /https:\/\/(?:docs\.kernel\.org|www\.kernel\.org|git\.kernel\.org|www\.pcisig\.com|pcisig\.com)/g;
@@ -75,7 +67,7 @@ function articleBody(markdown) {
   return markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
 }
 
-test('PCIe reference rewrite publishes the approved 22-article sequence', () => {
+test('PCIe reference rewrite publishes the approved 18-article sequence', () => {
   pcieFiles.forEach((file, index) => {
     const path = join('docs/articles/pcie', file);
     assert.ok(existsSync(path), `${path} must exist`);

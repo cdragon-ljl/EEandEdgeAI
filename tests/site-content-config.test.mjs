@@ -237,7 +237,7 @@ test('pcie articles include contiguous published frontmatter', () => {
   assert.ok(existsSync(pcieDir), 'PCIe article directory must exist');
   const files = readdirSync(pcieDir).filter((file) => file.endsWith('.md') && file !== 'pcie-framework.md');
 
-  assert.equal(files.length, 22);
+  assert.equal(files.length, 18);
 
   const orders = files.map((file) => {
     const markdown = readFileSync(join(pcieDir, file), 'utf8');
@@ -247,7 +247,7 @@ test('pcie articles include contiguous published frontmatter', () => {
     return Number(markdown.match(/^order: (\d+)$/m)?.[1]);
   });
 
-  assert.deepEqual(orders.sort((a, b) => a - b), Array.from({ length: 22 }, (_, index) => index + 1));
+  assert.deepEqual(orders.sort((a, b) => a - b), Array.from({ length: 18 }, (_, index) => index + 1));
 });
 
 test('README reports measured USB, PCIe, and total published counts', () => {
@@ -263,11 +263,11 @@ test('README reports measured USB, PCIe, and total published counts', () => {
   const readme = readFileSync('README.md', 'utf8');
 
   assert.equal(counts.usb, 14);
-  assert.equal(counts.pcie, 22);
-  assert.equal(total, 313);
+  assert.equal(counts.pcie, 18);
+  assert.equal(total, 309);
   assert.match(readme, new RegExp(`13 个专题系列、${total} 篇已发布文章`));
   assert.match(readme, /USB 驱动开发实战[^\n]+\| 14 \|/);
-  assert.match(readme, /PCIe 驱动开发实战[^\n]+\| 22 \|/);
+  assert.match(readme, /PCIe 驱动开发实战[^\n]+\| 18 \|/);
 });
 
 test('fpga is registered as a first-class article series', () => {

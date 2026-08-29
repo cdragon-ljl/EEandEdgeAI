@@ -2,7 +2,7 @@
 
 `EEandEdgeAI` 是一个面向嵌入式、驱动与端侧 AI 工程师的系统化技术学习站，内容从 C/C++、RTOS 和 Linux BSP 延伸到 RISC-V、FPGA、GPU/NPU、深度学习与音视频工程。
 
-当前站点包含 **13 个专题系列、313 篇已发布文章**。文章强调原理、源码调用链、硬件数据路径和真实工程约束，而不是只给出 API 用法或命令清单。
+当前站点包含 **13 个专题系列、309 篇已发布文章**。文章强调原理、源码调用链、硬件数据路径和真实工程约束，而不是只给出 API 用法或命令清单。
 
 ## 在线阅读
 
@@ -22,7 +22,7 @@
 | [Linux BSP 开发实战](https://cdragon-ljl.github.io/EEandEdgeAI/bsp/) | 20 | 板级 bring-up、U-Boot、内核、设备树、rootfs、服务、OTA、维护与量产 |
 | [Linux 驱动开发实战](https://cdragon-ljl.github.io/EEandEdgeAI/linux-driver/) | 28 | 设备模型、内核资源、外设总线、DMA、存储、网络、多媒体与驱动可靠性 |
 | [USB 驱动开发实战](https://cdragon-ljl.github.io/EEandEdgeAI/usb/) | 14 | USB 协议与枚举、usbcore 对象、URB/并发、HID/Bulk、Gadget、xHCI/DWC3 与 usbmon |
-| [PCIe 驱动开发实战](https://cdragon-ljl.github.io/EEandEdgeAI/pcie/) | 22 | TLP/配置/BAR、PCI Core、MSI-X/DMA/IOMMU、PM/AER、Endpoint Framework 与高吞吐 |
+| [PCIe 驱动开发实战](https://cdragon-ljl.github.io/EEandEdgeAI/pcie/) | 18 | TLP/配置/BAR、PCI Core、MSI-X/DMA/IOMMU、PM/AER、Endpoint Framework 与系统调试 |
 | [音视频开发实战](https://cdragon-ljl.github.io/EEandEdgeAI/video-audio/) | 26 | V4L2、Media Controller、ALSA/ASoC、ISP、编解码、FFmpeg、GStreamer 与流媒体 |
 | [神经网络与深度学习](https://cdragon-ljl.github.io/EEandEdgeAI/deep-learning/) | 27 | 神经网络基础、CNN、RNN/LSTM、Transformer、视觉、生成、强化学习与 ARM 部署 |
 

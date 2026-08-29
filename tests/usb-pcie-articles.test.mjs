@@ -13,11 +13,11 @@ test('USB and PCIe publish only the rewritten canonical article sets', () => {
   const pcie = publishedFiles('docs/articles/pcie', 'pcie-framework.md');
 
   assert.equal(usb.length, 14);
-  assert.equal(pcie.length, 22);
+  assert.equal(pcie.length, 18);
   assert.deepEqual(usb.map((file) => Number(file.match(/^usb-(\d+)/)?.[1])),
     Array.from({ length: 14 }, (_, index) => index + 1));
   assert.deepEqual(pcie.map((file) => Number(file.match(/^pci-(\d+)/)?.[1])),
-    Array.from({ length: 22 }, (_, index) => index + 1));
+    Array.from({ length: 18 }, (_, index) => index + 1));
 
   assert.ok(!usb.some((file) => file.includes('usb-architecture-enumeration')));
   assert.ok(!pcie.some((file) => file.startsWith('usb-pcie-')));

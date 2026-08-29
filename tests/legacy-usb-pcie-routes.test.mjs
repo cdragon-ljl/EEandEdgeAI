@@ -23,10 +23,10 @@ test('legacy usb-pcie article routes generate redirects for split series', () =>
     'usb-10-mcu-usb-cherryusb-stack': '/usb/usb-14-debugging-usbmon-cherryusb/',
     'pci-01-pcie-architecture-basics': '/pcie/pci-01-topology-link-tlp/',
     'pci-12-pcie-dma-ring-msix-high-throughput': '/pcie/pci-17-multiqueue-dma-msix-throughput/',
-    'usb-pcie-01-bus-model-comparison': '/pcie/pci-19-usb-pcie-bus-model-comparison/',
-    'usb-pcie-02-driver-framework-comparison': '/pcie/pci-20-usb-pcie-driver-framework-comparison/',
-    'usb-pcie-03-debug-tools-comparison': '/pcie/pci-21-usb-pcie-debug-evidence-comparison/',
-    'usb-pcie-04-interview-questions': '/pcie/pci-22-usb-pcie-interview-design/',
+    'usb-pcie-01-bus-model-comparison': '/pcie/',
+    'usb-pcie-02-driver-framework-comparison': '/pcie/',
+    'usb-pcie-03-debug-tools-comparison': '/pcie/',
+    'usb-pcie-04-interview-questions': '/pcie/',
   };
 
   assert.match(source, /getStaticPaths/);
