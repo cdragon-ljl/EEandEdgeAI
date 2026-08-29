@@ -53,7 +53,7 @@ const topicMarkers = [
   ['D3hot', 'ASPM', 'CLKREQ#', 'runtime PM'],
   ['pci_error_handlers', 'error_detected', 'FLR', 'secondary bus reset'],
   ['MPS', 'MRRS', 'credit', 'P99'],
-  ['NAPI', 'skb', 'MSI-X', 'descriptor ring'],
+  ['rtw88', 'rtw_pci_probe', 'descriptor ring', 'PCI Glue'],
   ['PERST#', 'REFCLK', 'LTSSM', 'address translation'],
   ['pci_epc_set_bar', 'configfs', 'MSI-X', 'unbind'],
   ['multi-queue', 'doorbell', 'backpressure', 'generation'],
@@ -112,7 +112,7 @@ test('PCIe reference rewrite publishes the approved 18-article sequence', () => 
 });
 
 test('PCIe teaching structure explains mechanisms before constraints', () => {
-  pcieFiles.slice(0, 10).forEach(assertTeachingStructure);
+  pcieFiles.slice(0, 14).forEach(assertTeachingStructure);
 });
 
 test('PCIe legacy slugs redirect to one canonical rewritten article', () => {

@@ -1,6 +1,6 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #12 · AER、FLR、Hot Reset 与错误恢复状态机"
-description: "以 Linux 6.12 为基线，系统讲解 AER 错误分级、pci_error_handlers 恢复回调、DMA 静止、FLR、PM Reset、Secondary Bus Reset 与恢复失败升级。"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #12 · AER、FLR、Hot Reset 与错误恢复"
+description: "从一次 AER 错误记录出发，沿 Root Port、PCI Core 和 pci_error_handlers 建立检测、隔离、复位、重建和恢复链，并比较 FLR、PM Reset、Secondary Bus Reset 与 Hot Reset。"
 pubDate: "2026-08-29"
 series: pcie
 order: 12
@@ -8,440 +8,255 @@ tags: ["PCIe", "AER", "Reset", "Linux 6.12"]
 draft: false
 ---
 
-PCIe 错误恢复不是“打印 AER 后重新初始化一次”。
+第 11 篇讨论了计划内 Suspend，但 PCIe 设备也会在运行中遇到 Completion Timeout、Malformed TLP、Unsupported Request、Surprise Down 或内部错误。真正困难的不是执行某个 Reset，而是在设备状态已经不可信时，安全停止旧 DMA、选择合适复位范围并让 Driver 重新建立运行合同。
 
-错误可能只需要记录，也可能让 Transaction Layer、Link 或整个下游层级失去可靠状态。
+Advanced Error Reporting（AER）提供标准错误状态、Mask、Severity 和 Header Log，Root Port/PCI Core 再调用功能驱动的 `pci_error_handlers`。它能告诉软件发生了哪类协议错误，却不能自动恢复设备私有 Ring、Firmware 和 Request Ownership。
 
-Reset 的影响范围也不同：
+本文以 Linux 6.12 为基线，从一次错误事件沿完整恢复链推导，再比较 FLR、PM Reset、Secondary Bus Reset、Hot Reset 和更大范围的复位。设备只作为错误源，不依赖某款芯片私有错误寄存器。
 
-- Function Level Reset（FLR）只针对一个 Function。
-- PM Reset 借助 Power State 迁移复位 Function。
-- Secondary Bus Reset 影响 Bridge 下游全部 Function。
-- Hot Reset 在链路层传播，影响同一路径上的设备。
-- Slot Power Cycle 进一步重置供电与硬件。
+## 一、先看问题：发现错误后为什么不能立即 reset
 
-本文固定以 Linux 6.12 为基线，围绕“先停止 DMA，再选择最小必要恢复范围”建立状态机。
+假设设备 TX Request 超时，同时 Root Port 记录 Non-Fatal Completion Timeout。如果 Driver 立即执行 FLR，却没有先停止提交和 Mask IRQ，另一个 CPU 可能继续写 Doorbell；如果 Reset 后直接 Free 旧 Buffer，设备或 Fabric 中的旧 DMA 还可能晚到。
 
-## 一、错误首先按可恢复性分级
-
-Advanced Error Reporting（AER）扩展 PCIe 基础错误能力。
-
-常见分级：
-
-- Correctable：硬件已纠正，事务可以继续。
-- Uncorrectable Non-Fatal：当前事务/功能受影响，但系统可能继续。
-- Uncorrectable Fatal：链路或设备状态不可信，常需 reset。
-
-```mermaid
-flowchart TD
-    ERR[PCIe error detected] --> C{Correctable?}
-    C -- yes --> LOG[record status/source/counters]
-    C -- no --> U{Uncorrectable severity}
-    U -- Non-Fatal --> NF[isolate affected function and recover]
-    U -- Fatal --> F[freeze channel and reset hierarchy]
-    LOG --> MON[monitor recurrence and performance]
-    NF --> CB[pci_error_handlers]
-    F --> CB
-```
-
-Severity 可以由 Capability/平台配置影响。
-
-同一类 Error Bit 在不同设备/拓扑中后果可能不同。
-
-## 二、Correctable 不等于可以忽略
-
-常见 Correctable Error：
-
-- Receiver Error。
-- Bad TLP/Bad DLLP。
-- Replay Number Rollover。
-- Replay Timer Timeout。
-- Advisory Non-Fatal。
-
-硬件可通过重放恢复，业务请求可能成功。
-
-但持续增长说明信号质量、ASPM/时钟、链路拥塞或设备实现存在问题。
-
-应记录速率而不是只记录总数。
-
-低频偶发与每秒数千次对性能/可靠性的意义完全不同。
-
-Correctable Storm 还会消耗日志、中断和重放带宽。
-
-## 三、Uncorrectable Error 的语义
-
-常见项目：
-
-- Data Link Protocol Error。
-- Surprise Down Error。
-- Poisoned TLP。
-- Flow Control Protocol Error。
-- Completion Timeout。
-- Completer Abort。
-- Unexpected Completion。
-- Malformed TLP。
-- Unsupported Request。
-- ACS Violation。
-
-Unsupported Request 不总是硬件坏。
-
-软件访问未实现 BAR/Capability、错误地址或设备处于不允许状态也会触发。
-
-Completion Timeout 可能来自设备 hang、链路问题、ATU/路由错误或错误 MRRS/Tag 流程。
-
-错误 bit 是调查入口，不是单一根因结论。
-
-## 四、AER Capability 中的关键寄存器组
-
-Endpoint/Port AER Extended Capability 常包含：
-
-- Uncorrectable Error Status/Mask/Severity。
-- Correctable Error Status/Mask。
-- Advanced Error Capabilities and Control。
-- Header Log。
-- Root Error Command/Status（Root Port）。
-- Error Source Identification。
-
-Header Log 保存触发错误的 TLP Header 片段，若硬件支持且日志有效，可帮助定位 Requester ID、地址和类型。
-
-读取后要按规范清除 W1C Status。
-
-不要用普通 read-modify-write 误清其他并发 bit。
-
-## 五、错误消息如何到达 Root Port
-
-Endpoint 检测错误后可发送 ERR_COR、ERR_NONFATAL 或 ERR_FATAL Message。
-
-Root Port 汇总状态并向系统报告，Linux AER Service Driver 处理中断/消息，定位 Error Source 并协调恢复。
-
-```mermaid
-sequenceDiagram
-    participant EP as Endpoint
-    participant RP as Root Port AER
-    participant AER as Linux AER service
-    participant CORE as PCI Core
-    participant DRV as Function driver
-    EP-->>RP: ERR_COR / ERR_NONFATAL / ERR_FATAL
-    RP-->>AER: Root Error interrupt/message
-    AER->>AER: read source, status, header log
-    AER->>CORE: start recovery for affected hierarchy
-    CORE->>DRV: error_detected(channel state)
-    DRV-->>CORE: recovery result vote
-```
-
-Firmware-first AER 平台可能由 Firmware 先收集/处理，再通过 APEI 等机制交给 OS。
-
-Linux 是否拥有 AER Control 取决于 ACPI _OSC 等平台协商。
-
-## 六、pci_channel_state 描述通道可信程度
-
-`error_detected()` 接收 `pci_channel_state_t`：
-
-- `pci_channel_io_normal`：通道仍可正常 I/O，但有错误需要通知。
-- `pci_channel_io_frozen`：I/O 通道冻结，MMIO/DMA 不可信，需要 reset。
-- `pci_channel_io_perm_failure`：永久失败，应断开。
-
-驱动不能在 frozen 状态继续读写 BAR 来“看寄存器是否正常”。
-
-此时 MMIO 可能返回全 1、触发新错误或访问错误目标。
-
-可以操作纯软件状态、停止上层 Queue、标记 Request，但硬件访问要遵循 Core 恢复阶段。
-
-## 七、pci_error_handlers 的五段恢复回调
-
-典型：
-
-```c
-static const struct pci_error_handlers teach_err_handlers = {
-	.error_detected = teach_error_detected,
-	.mmio_enabled = teach_mmio_enabled,
-	.slot_reset = teach_slot_reset,
-	.resume = teach_error_resume,
-};
-```
-
-某些驱动还实现 reset_prepare/reset_done 等与 reset API 相关回调。
-
-状态机：
+错误恢复因此至少包含五个阶段：检测错误、阻止新请求、收回或隔离旧 ownership、选择并执行 Reset、重建设备后重新开放业务。
 
 ```mermaid
 stateDiagram-v2
     [*] --> Running
-    Running --> ErrorDetected: AER reports error
-    ErrorDetected --> CanRecover: NEED_RESET not required
-    ErrorDetected --> Frozen: driver votes NEED_RESET
-    CanRecover --> MmioEnabled: PCI Core enables MMIO
-    MmioEnabled --> Running: RECOVERED + resume
-    Frozen --> SlotReset: hierarchy reset succeeds
-    SlotReset --> Running: driver reinitializes + resume
-    ErrorDetected --> Disconnect: permanent failure
-    Frozen --> Disconnect: reset fails
+    Running --> ErrorDetected: AER / timeout / health check
+    ErrorDetected --> Quiescing: block submissions, mask IRQ
+    Quiescing --> Resetting: stop DMA or isolate device
+    Resetting --> Rebuilding: reset completes
+    Rebuilding --> Running: rings, IRQ and state restored
+    ErrorDetected --> Disconnected: device unavailable
+    Rebuilding --> Disconnected: restore fails
 ```
 
-各 Function Driver 的返回值会被 PCI Core 汇总，选择恢复路径。
+因为旧请求与新请求可能使用相同 Ring Slot/Request ID，所以 Reset 边界还要增加 Generation。恢复成功只表示新一代可以运行，不应把 Reset 前迟到的 Completion 交给新请求。
 
-同一下游层级中一个驱动要求 disconnect，可能影响整体结果。
+## 二、AER 先按可恢复性分类
 
-## 八、error_detected 的第一责任是隔离数据面
+AER 将错误分为 Correctable 和 Uncorrectable，Uncorrectable 再按 Severity 区分 Non-Fatal 与 Fatal。分类决定是否需要中断数据路径和扩大恢复范围。
 
-驱动应：
+| 类别 | 代表性错误 | 常见处理思路 |
+| --- | --- | --- |
+| Correctable | Receiver Error、Bad DLLP、Replay Timer | 链路硬件已纠正，记录趋势与性能影响 |
+| Uncorrectable Non-Fatal | Completion Timeout、Unsupported Request | Function/路径可能需要恢复，系统可继续 |
+| Uncorrectable Fatal | Surprise Down、Poison/严重协议错误 | Link/下游可能不可靠，扩大隔离与 Reset |
 
-1. 原子阻止新上层请求。
-2. 标记 Queue/error generation。
-3. 停止软件 timer/work 产生新 Doorbell。
-4. 若通道 normal 且允许，停止 Device Queue。
-5. 若 frozen，不依赖 MMIO 成功，转入等待 Core reset。
-6. 返回 CAN_RECOVER、NEED_RESET 或 DISCONNECT。
+Correctable 不等于可以无限忽略。Receiver Error 和 Replay 持续增长可能预示信号、时钟、ASPM 或连接器问题，并消耗带宽。Non-Fatal 也不等于 Driver 一定能恢复，设备内部状态可能已经损坏。
 
-在该回调中同步等待仍需 MMIO 的 Request 可能永久卡住。
+Severity Register 允许平台把某些 Uncorrectable Error 定义为 Fatal/Non-Fatal，Mask Register 决定是否上报。调试时必须同时读取 Status、Mask、Severity，否则只看错误名称无法解释系统为何采取某种恢复策略。
 
-应把未完成 Request 保留到 reset/quiesce 明确后统一失败。
+## 三、Root Port 负责收集和定位错误消息
 
-## 九、mmio_enabled 是有限硬件检查窗口
+Endpoint 或链路通过 Error Message 向上游报告，Root Port AER Capability 保存 Root Error Status、Source ID，并为部分错误记录 TLP Header Log。Linux PCIe AER Service Driver 处理 Root Port 服务并把错误关联到受影响的设备层级。
 
-PCI Core 在恢复部分 MMIO 后调用 `mmio_enabled()`。
+```mermaid
+sequenceDiagram
+    participant EP as Endpoint / Link
+    participant RP as Root Port AER
+    participant CORE as Linux PCI Core
+    participant DRV as Function driver
+    EP->>RP: ERR_COR / ERR_NONFATAL / ERR_FATAL message
+    RP->>RP: latch root status, source ID, header log
+    RP->>CORE: AER service interrupt
+    CORE->>DRV: error_detected channel state
+    DRV-->>CORE: recovery result
+    CORE->>CORE: reset/recovery orchestration
+```
 
-驱动可读取安全状态寄存器，判断设备是否能自行恢复，或仍需要 reset。
+Header Log 可以保存出错 TLP 的 Header DW，帮助判断 Requester/Completer、地址、Length、Tag 和事务类型。但并非所有错误都有有效 Header，日志也可能只保留第一笔，所以它是定位证据而不是完整抓包。
 
-不能在这里无条件重新开放上层 Queue。
+有效记录应把 AER Source BDF、受影响 Endpoint、Header、Driver Queue/Request、IOMMU Fault 和时间关联起来。只截取一行 `AER: Corrected error received` 会丢掉定位所需上下文。
 
-DMA Engine、MSI-X Table、Device Context 可能仍不可靠。
+## 四、pci_error_handlers 把恢复阶段交给功能驱动
 
-若读取结果表明 Queue/Firmware 丢失，应返回 NEED_RESET。
+功能驱动通过 `struct pci_error_handlers` 提供回调：
 
-若设备状态完整，可返回 RECOVERED，随后 `resume()` 正式开放。
+```c
+static const struct pci_error_handlers demo_err_handlers = {
+    .error_detected = demo_error_detected,
+    .mmio_enabled = demo_mmio_enabled,
+    .slot_reset = demo_slot_reset,
+    .resume = demo_error_resume,
+};
 
-## 十、slot_reset 在通用 reset 后重建 Function
+static struct pci_driver demo_driver = {
+    .name = "pcie_teaching",
+    .id_table = demo_ids,
+    .probe = demo_probe,
+    .remove = demo_remove,
+    .err_handler = &demo_err_handlers,
+};
+```
 
-Core 执行适当 reset、恢复 D0、重新启用设备后调用 `slot_reset()`。
+这些回调不是四个互不相关的通知，而是 PCI Core 驱动的 Recovery State Machine。Driver 返回值告诉 Core 自己能否继续、需要 Reset、已经恢复还是必须断开。
 
-驱动通常：
+因为具体调用序列取决于 Channel State、平台和返回结果，所以 Driver 应把“停止数据路径”“恢复配置”“重建硬件”“开放请求”拆成明确 Helper，而不是假设每次都会调用所有回调。
 
-- `pci_restore_state()` 由 Core/驱动合同完成或确认。
-- 重新 `pci_enable_device_mem()`。
-- `pci_set_master()`。
-- 验证 BAR Mapping 仍有效或重新映射。
-- 重建 Device Queue、Ring、Doorbell、Firmware Context。
-- 清除 stale Interrupt/Error。
-- 保持上层 Queue 关闭，直到全部成功。
+## 五、error_detected() 的首要任务是隔离旧数据路径
+
+`error_detected()` 接收 `pci_channel_state_t`，此时 MMIO 是否安全取决于 Channel State。Driver 应先把软件状态切到 Recovering，阻止新提交，并停止不依赖不可信 MMIO 的异步路径。
+
+```c
+static pci_ers_result_t
+demo_error_detected(struct pci_dev *pdev,
+                    pci_channel_state_t state)
+{
+    struct demo_dev *demo = pci_get_drvdata(pdev);
+
+    demo_block_submissions(demo);
+    demo_mark_recovering(demo);
+    demo_mask_software_paths(demo);
+
+    if (state == pci_channel_io_perm_failure)
+        return PCI_ERS_RESULT_DISCONNECT;
+
+    return PCI_ERS_RESULT_NEED_RESET;
+}
+```
+
+若 Channel Frozen，Driver 不应继续大量 `readl()/writel()` 试探设备，因为 MMIO 可能返回全 1或触发更多错误。可以安全完成的软件动作包括阻止 Upper Layer、取消 Timer、标记 Request 和安排后续回收。
+
+返回 `NEED_RESET` 表示 Driver 不能仅靠重新启用 MMIO 恢复；返回 `CAN_RECOVER` 表示愿意尝试不复位恢复；`DISCONNECT` 表示设备应停止使用。返回值必须符合 Driver 实际能力，不能为了“继续运行”总是返回 Recovered。
+
+## 六、mmio_enabled、slot_reset 和 resume 各有边界
+
+若 Core 重新允许 MMIO，可能调用 `mmio_enabled()` 让 Driver 检查设备状态或执行轻量恢复。如果寄存器仍不可信，Driver 可以继续请求 Reset，而不是强行启动 Queue。
+
+`slot_reset()` 在 Reset 后调用，此时 PCI 配置和 BAR 访问应恢复，但设备私有状态通常回到复位值。Driver 需要重新 Enable、恢复 Bus Master、验证 Device ID/Version、重建 Ring Base、Producer/Consumer、Interrupt Route 和 Feature Register。
+
+```c
+static pci_ers_result_t demo_slot_reset(struct pci_dev *pdev)
+{
+    struct demo_dev *demo = pci_get_drvdata(pdev);
+    int ret;
+
+    ret = pci_enable_device_mem(pdev);
+    if (ret)
+        return PCI_ERS_RESULT_DISCONNECT;
+
+    pci_restore_state(pdev);
+    pci_set_master(pdev);
+
+    ret = demo_rebuild_after_reset(demo);
+    return ret ? PCI_ERS_RESULT_DISCONNECT
+               : PCI_ERS_RESULT_RECOVERED;
+}
+```
+
+`resume()` 才开放正常业务：清 Recovering，Unmask IRQ，Wake Queue，并让 Upper Layer 重新提交。因为开放入口是最后一步，所以任一恢复阶段失败都不会让外部看到半初始化设备。
+
+## 七、恢复前必须明确 DMA ownership 怎样结束
+
+AER 错误可能发生在 Device 正在读写 Host Memory 时。若 Function/Link 已被隔离，旧 DMA 也许停止；若只是软件 Timeout，设备可能仍运行。Driver 需要依据 Controller/Reset Contract 判断何时可以 Unmap 和 Free。
+
+```text
+block new submissions
+  -> mask/disable notification paths when safe
+  -> stop or isolate DMA engine
+  -> synchronize IRQ, poll and workers
+  -> classify in-flight requests as completed/canceled/lost
+  -> only then unmap and free old buffers
+```
+
+Timeout 本身不是 ownership 返回。提前 Free 可能造成旧 DMA 写入新对象；保留所有 Buffer 又可能让恢复永远泄漏。因此可靠设备协议要提供 Queue Stop、Function Reset 或 Link Isolation 的硬件边界。
+
+IOMMU 可以在旧 Mapping 被撤销后记录 Fault，帮助发现延迟 DMA，但不能让错误访问正确。恢复代码仍应先停止 Device，再 Unmap。
+
+## 八、FLR 复位单个 Function
+
+Function Level Reset（FLR）由 PCIe Capability 或 AF Capability 表示，目标是复位一个 Function 而不影响同设备其他 Function 和上游 Link。Linux 可通过 `pci_reset_function()` 或更合适的 Reset API/Method Selection 触发。
+
+FLR 通常清除设备私有状态、停止内部操作并要求软件等待规定完成时间，但 BAR 配置、MSI 状态和 Driver 资源是否需要恢复仍由 PCI Core/Driver Contract 决定。FLR 也不能保证清除板卡上跨 Function 共享的 Firmware/Engine。
+
+因为 FLR Scope 最小，它通常优先于 Bus/Link Reset；但只有 Device 宣告支持且 Driver 确认共享资源安全时才适用。把不支持 FLR 的 Function 强制写某个私有 Reset Bit，不属于通用 PCIe 方法。
+
+## 九、PM Reset、Secondary Bus Reset 与 Hot Reset 影响范围不同
+
+不同 Reset Method 解决不同层级故障：
+
+| Reset | 典型范围 | 适用条件与风险 |
+| --- | --- | --- |
+| FLR | 单个 Function | Capability 支持，优先最小化影响 |
+| PM Reset | Function D3hot -> D0 | Device/平台允许，依赖 PM Capability |
+| Secondary Bus Reset | Bridge 下游全部设备 | 会影响同一 Secondary Bus 的所有 Function |
+| Hot Reset | 一段 Link/下游路径 | 重新训练，影响该 Link 后设备 |
+| Fundamental/平台复位 | 板卡/控制器更大范围 | 可能需要 PERST#、电源循环和重新枚举 |
+
+Secondary Bus Reset 通过 Bridge Control 作用于下游 Bus，因此不能只看目标 Endpoint。若同一 Switch Port 后还有存储或管理 Function，复位会同时中断它们；Driver/用户态必须在执行前协调整个 Scope。
+
+Hot Reset 通过 Link Training 语义让下游进入复位并重新训练，适合 Link/Protocol State 损坏，但也会丢失路径下所有 Device State。它与“热插拔移除”不是同一个操作。
+
+## 十、选择 Reset 要从故障层和影响范围推导
+
+如果仅某个 Function Queue Hang，而配置空间、Link 和其他 Function 正常，优先尝试 Function Scope；如果 Bridge 后多个设备同时 Completion Timeout、Link 状态异常，则 Function Reset 可能治标不治本，需要检查 Link/Bus Scope。
 
 ```mermaid
 flowchart TD
-    RESET[PCI Core reset complete] --> D0[function accessible in D0]
-    D0 --> CFG[restore/verify PCI config]
-    CFG --> MASTER[pci_enable_device_mem + pci_set_master]
-    MASTER --> PRIV[rebuild device-private queues]
-    PRIV --> IRQ[rebuild/enable MSI-X state]
-    IRQ --> TEST[self-test / status validation]
-    TEST --> VOTE[PCI_ERS_RESULT_RECOVERED]
+    ERR[error detected] --> LINK{link/config path alive?}
+    LINK -- no --> HOT[hot reset / platform recovery]
+    LINK -- yes --> FUNC{single function state corrupt?}
+    FUNC -- yes --> FLR{FLR supported and safe?}
+    FLR -- yes --> DOFLR[function reset]
+    FLR -- no --> PM[PM or device-specific reset]
+    FUNC -- no --> BUS{multiple downstream devices affected?}
+    BUS -- yes --> SBR[coordinate secondary bus reset]
+    BUS -- no --> DIAG[continue protocol and software diagnosis]
 ```
 
-返回 RECOVERED 后仍要等 `resume()` 再允许上层提交。
+Reset 不是错误原因分析的替代品。若 Receiver Error 持续增长，反复 FLR 不会修复信号完整性；若 Driver 提前 Unmap，Bus Reset 只能暂时清空症状。每次恢复都应保留触发原因、Scope、耗时和结果。
 
-## 十一、resume 是恢复发布点
+## 十一、generation 隔离 Reset 前后的请求
 
-`resume()` 表示参与恢复的 Function 都达到可继续状态。
+Reset 后 Ring Index、Request ID 和 Completion Slot 可能从零开始，但旧 IRQ、Worker 或 DMA Completion 仍可能迟到。Driver 每次 Reset 增加 Generation，Request 和 Callback 都携带它；Generation 不匹配的完成不能作用于新请求。
 
-驱动可以：
-
-- 增加 generation。
-- 开启 IRQ/NAPI/Poll。
-- 重新启动 watchdog。
-- 唤醒被停止的网络/块/字符队列。
-- 让新 Request 进入。
-
-旧 Request 必须在此之前明确完成、重试或失败。
-
-不能把 reset 前 DeviceOwned Descriptor 当作仍会完成。
-
-## 十二、DMA quiesce 是所有 reset 的共同前提
-
-Reset 可能停止 Device Logic，但软件不能在未确认前释放 DMA Buffer。
-
-安全原则：
-
-1. 阻止新 Descriptor。
-2. 请求 Device 停止 DMA（若 MMIO 可用）。
-3. 同步 IRQ/Poll。
-4. 等待硬件定义的 idle/quiesce。
-5. reset。
-6. 只有在 reset 保证旧 DMA 不再发生后，unmap/free。
-
-IOMMU 可以把 reset 后误 DMA 转成 fault，但不能让错误内存访问变得正确。
-
-No-IOMMU 平台上误 DMA 可能静默破坏内存。
-
-## 十三、Function Level Reset 的范围
-
-FLR 由 PCIe Capability 或 SR-IOV Capability 声明。
-
-它复位一个 Function，不应影响同一 Device 的其他 Function 或 Link。
-
-软件触发后必须等待规范规定的完成时间，并确认设备可访问。
-
-Linux 使用 `pci_reset_function()`/`pci_try_reset_function()` 等接口选择适用 reset 方法。
-
-驱动不要直接写 Initiate FLR bit 后立即访问 BAR。
-
-Core 需要序列化、保存/恢复配置并等待。
-
-FLR 通常清除 Device 私有状态，但 BAR 配置等 PCI State 的恢复由 Core 协调。
-
-## 十四、PM Reset 利用 D3hot 到 D0
-
-某些 Function 没有 FLR，但从 D3hot 回到 D0 会执行功能复位。
-
-PCI Core 可把它作为 reset method 之一。
-
-是否有效取决于 PM Capability 和设备行为。
-
-若 Device 声明 No_Soft_Reset 等语义，不能假设 PM Transition 会清状态。
-
-D3cold 的影响更大，还依赖平台电源控制与 Link retrain。
-
-## 十五、Secondary Bus Reset 的影响范围
-
-对 Bridge Control 的 Secondary Bus Reset bit 操作，会复位桥下游 Bus 层级。
-
-所有下游 Function 都受影响。
-
-```mermaid
-flowchart TD
-    BR[Bridge Function] --> B[Secondary Bus]
-    B --> EP0[Endpoint Function A]
-    B --> SW[Downstream Switch]
-    SW --> EP1[Endpoint Function B]
-    SBR[Secondary Bus Reset] --> BR
-    SBR -. affects .-> EP0
-    SBR -. affects .-> SW
-    SBR -. affects .-> EP1
+```text
+generation 7 request id 42 submitted
+  -> error and reset
+  -> generation becomes 8
+  -> request id 42 reused in generation 8
+  -> delayed generation 7 completion arrives
+  -> reject because generation mismatch
 ```
 
-不能由单个叶子驱动在不知道兄弟设备状态时擅自触发。
+Generation 只保护软件关联，不会阻止旧 DMA 写内存，所以仍要先完成硬件隔离。它解决的是“迟到通知/完成被误认”，而 Reset Contract 解决“旧设备访问停止”。
 
-PCI Core/Slot/管理层需要协调全部 Function Driver 停止和恢复。
+## 十二、Surprise Removal 不应进入无限恢复
 
-## 十六、Hot Reset 与 Fundamental Reset
+Surprise Removal 时 Link/Configuration Space 可能已经不可访问，Vendor ID 读全 1，MMIO Read 返回全 1或触发异常。Driver 应阻止请求、停止软件路径并等待 PCI Core Removal，而不是在 `slot_reset()` 中无限重试。
 
-Hot Reset 通过 TS1/TS2 等链路训练序列传播，让 Link Partner 进入复位语义。
+清理路径不能依赖 Device ACK，因为硬件可能已经消失。需要用软件状态、IRQ Synchronization、IOMMU Isolation 和 Reference Count 保证 Host Object 安全释放。
 
-它通常影响该 Link 下游，不一定切断电源。
+若设备是关键存储或网络，Upper Layer 可能选择 Failover、重试其他路径或向用户报告永久错误。PCIe Driver 不应伪造成功来隐藏数据可能丢失的事实。
 
-Fundamental Reset 与 PERST#、上电时序相关，影响更彻底。
+## 十三、怎样验证“恢复成功”而不只是“设备又出现”
 
-Slot Power Cycle 则真正移除/恢复电源。
+恢复验收至少覆盖：配置空间可读、BAR Resource/Mapping 有效、Link Speed/Width 符合预期、AER Status 已按规则处理、DMA Ring 重建、IRQ 计数增长、旧 Request 已完成或明确失败、新业务通过、再次 Reset 不泄漏资源。
 
-恢复范围从 FLR 到 Power Cycle 逐步扩大，副作用和耗时也增大。
+```bash
+lspci -s BDF -vv
+cat /sys/bus/pci/devices/BDF/aer_dev_correctable 2>/dev/null
+cat /proc/interrupts
+```
 
-策略应选择能恢复问题的最小范围，并在失败时升级。
+需要做连续恢复压力，而不是单次手工 Reset。记录每代 Generation、在途 Request 数、恢复耗时、P99、IOMMU Fault 和 AER 增量，才能发现只在第二次或并发 Reset 中出现的状态泄漏。
 
-## 十七、Reset Method 的选择与 reset_method sysfs
+## 十四、本篇检查点
 
-Linux PCI Core 探测设备支持的 reset method，并按优先级尝试。
+现在应当能够从 AER Message 讲到 Root Port 状态、Source ID、PCI Core 和 `pci_error_handlers`，并说明 `error_detected()` 先隔离，`slot_reset()` 重建，`resume()` 最后开放业务。
 
-用户空间可在支持的内核/设备上通过 `reset_method` 查看/配置方法，通过 `reset` 触发 Function Reset。
+还应能按影响范围比较 FLR、PM Reset、Secondary Bus Reset 和 Hot Reset，解释 Timeout 为什么不自动归还 DMA ownership，以及 Generation 为什么只能隔离旧 Completion、不能替代硬件停止。
 
-运行中设备由 Driver 拥有时，用户空间随意 reset 会破坏 Queue/DMA。
+## 十五、小结：下一篇把性能问题拆成可计算因素
 
-应通过驱动、VFIO 或设备管理框架协调。
+AER 提供标准错误证据，Recovery 则需要 Driver、PCI Core、Root Port 和平台共同完成。正确顺序是检测、阻止新请求、隔离旧数据路径、选择最小安全 Reset Scope、重建设备，再恢复业务。
 
-`reset` 文件存在不代表任何时刻触发都安全。
+下一篇回到正常运行，解释为什么 Link 已是目标 Speed/Width 仍达不到吞吐：我们会用 MPS、MRRS、Header、Tag、Credit、Outstanding 和 Queue Depth 对一笔 4096-byte 传输做计算，再把 Interrupt、DMA Mapping 和 P99 放入系统瓶颈模型。
 
-## 十八、Surprise Removal 与 Error Recovery 的边界
+**一手资料**
 
-Surprise Down 可能表示设备物理消失。
-
-如果 Link Partner 不再存在，反复 reset 无法恢复。
-
-驱动 remove/hotplug 路径必须能在 MMIO 不可访问的情况下清理软件对象。
-
-不能要求读一个“停止完成寄存器”成功后才退出，否则拔卡会永久 hang。
-
-对可热插拔 Slot，要区分 Presence Detect、Data Link Layer Link Active、AER Surprise Down 和用户发起移除。
-
-## 十九、Virtual Function 与 PF 恢复
-
-SR-IOV PF reset 可能影响所有 VF。
-
-VF FLR 通常只复位一个 VF，但 PF/Firmware 仍参与资源重建。
-
-PF Driver 需要协调：
-
-- 停止 VF 资源分配。
-- 通知/解绑 VF Driver 或虚拟机。
-- 清理 mailbox 与 Queue。
-- reset 后恢复 VF 配置。
-
-不能只恢复 PF 自己的 netdev 就宣布设备恢复。
-
-## 二十、错误恢复的 generation
-
-每轮 reset 增加 Driver Generation。
-
-Queue、Request、Firmware Command 和 Completion 都应能关联 generation 或不可复用 tag。
-
-reset 前未完成 Request 统一失败或按上层合同重试。
-
-延迟 MSI-X/Completion 若 generation 不匹配只能丢弃并计数。
-
-generation 不替代 `synchronize_irq()` 与 DMA quiesce，但能防止语义上旧完成命中新请求。
-
-## 二十一、验证恢复而不是只验证重新枚举
-
-故障注入矩阵：
-
-- Correctable Receiver Error 计数增长。
-- Unsupported Request。
-- Completion Timeout。
-- Frozen Channel。
-- FLR 期间满载 DMA。
-- Secondary Bus Reset 下多个 Function。
-- reset 与 remove 并发。
-- reset 与 runtime suspend 并发。
-- reset 后延迟旧 Completion。
-
-验证：
-
-- 所有旧 Request 有明确结果。
-- 没有 reset 后旧 DMA。
-- BAR、MSI-X、Queue 与 Firmware State 已重建。
-- 上层 netdev/block/char 状态正确。
-- 重复 reset 不泄漏资源。
-- 恢复有界，失败能升级或断开。
-
-## 二十二、Linux 6.12 源码入口
-
-- `drivers/pci/pcie/aer.c`
-- `drivers/pci/pcie/err.c`
-- `drivers/pci/pci.c`
-- `drivers/pci/quirks.c` 中 reset quirk
-- 具体 Driver 的 `pci_error_handlers`
-
-阅读时同时看 PCI Core 如何聚合回调返回值，以及设备驱动如何 quiesce 私有 DMA。
-
-## 二十三、一手资料
-
-- [Linux 6.12 PCI error recovery](https://www.kernel.org/doc/html/v6.12/PCI/pci-error-recovery.html)
-- [Linux PCI AER HOWTO](https://docs.kernel.org/PCI/pcieaer-howto.html)
-- [Linux stable AER source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/pci/pcie/aer.c?h=linux-6.12.y)
-- [PCI-SIG specifications](https://pcisig.com/specifications)
-
-## 二十四、小结
-
-AER 把错误分为 Correctable、Uncorrectable Non-Fatal 与 Fatal，并通过 Root Port/AER Service 协调恢复。
-
-Correctable Error 已被硬件恢复，但持续增长仍是重要链路证据。
-
-`pci_error_handlers` 通过 `error_detected`、`mmio_enabled`、`slot_reset`、`resume` 构成分段恢复状态机。
-
-Frozen Channel 中不能继续依赖 MMIO。
-
-所有 reset 前必须先阻止新请求并让 DMA 静止，reset 后重建 PCI 配置、BAR/Bus Master、MSI-X 与 Device 私有 Queue。
-
-FLR、PM Reset、Secondary Bus Reset、Hot Reset 与 Power Cycle 的影响范围逐级扩大。
-
-恢复策略选择最小必要范围，失败时有界升级。
-
-generation、同步 IRQ 与 Request 统一失败共同防止旧完成污染新状态。
-
-只有旧请求、DMA、配置、Queue 和上层发布状态全部闭合，错误恢复才真正完成。
+- [Linux 6.12 PCI Error Recovery](https://www.kernel.org/doc/html/v6.12/PCI/pci-error-recovery.html)
+- [Linux 6.12 PCI driver API](https://www.kernel.org/doc/html/v6.12/driver-api/pci/pci.html)
+- [Linux PCIe AER HOWTO](https://docs.kernel.org/PCI/pcieaer-howto.html)

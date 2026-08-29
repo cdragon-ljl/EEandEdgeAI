@@ -1,473 +1,191 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #14 · 从 igc 源码理解 Ring、skb、NAPI 与 MSI-X"
-description: "固定 Linux v6.12 的 Intel igc 驱动，沿 probe、BAR、net_device、TX/RX Ring、page/skb、NAPI、MSI-X、PM、AER、remove 与 shutdown 阅读真实 PCIe NIC 数据路径。"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #14 · rtw88 PCI Glue：BAR、DMA Ring、IRQ 与 NAPI"
+description: "以 Linux 6.12 RTL8822CE/rtw88 为局部源码案例，沿 ID Match、rtw_pci_probe、BAR2、DMA Descriptor Ring、MSI/INTx、NAPI、ASPM 和 Remove 组合前述 PCIe 机制。"
 pubDate: "2026-08-29"
 series: pcie
 order: 14
-tags: ["PCIe", "Network Driver", "NAPI", "Linux 6.12"]
+tags: ["PCIe", "rtw88", "RTL8822CE", "Linux 6.12"]
 draft: false
 ---
 
-PCIe Driver 框架、DMA Ring 和 MSI-X 如果只停留在教学伪设备，很难看到它们如何与成熟内核子系统结合。
+前十三篇已经分别讲过 Driver Match、BAR、DMA、Descriptor Ring、IRQ、NAPI、PM 和 Recovery。真实驱动不会把它们放在互不相干的示例中，因此本篇要解决的问题是：一块真实 PCIe 无线网卡怎样在一次 Probe 中建立这些资源，并在 TX、RX 和 Remove 中维持所有权？
 
-网络驱动是最完整的公开范例之一：
+本文选择 Linux 6.12 主线 `rtw88` 的 RTL8822CE PCI Glue 作为局部案例。选择它是为了观察通用机制怎样落地，不是把系列改成 Realtek 驱动教程；Realtek 私有寄存器和 Descriptor Bit 只属于对应芯片，不能推广成 PCIe 规范。
 
-- PCI Function 负责 BAR、DMA Mask、IRQ 与 PM。
-- `net_device` 负责用户可见网络接口和 Queue 状态。
-- Descriptor Ring 负责 Device/CPU 所有权。
-- `sk_buff` 与 page 负责网络数据内存。
-- NAPI 在中断与轮询之间平衡吞吐。
-- MSI-X 把 Queue 分散到 CPU。
-- AER/reset/remove 必须关闭全部异步路径。
+源码路径以 Linux v6.12 `drivers/net/wireless/realtek/rtw88/pci.c` 与 `rtw8822ce.c` 为准。野火章节用于参考“从对象到接口再到真实源码”的教学层次，本文的正文、图示和推导重新编写。
 
-本文固定阅读 Linux `v6.12` tag 的 `drivers/net/ethernet/intel/igc/`。
+## 一、先看问题：rtw88 由哪几层共同组成
 
-它不是 igc 寄存器手册，也不复制整份源码；重点是提炼可迁移的对象、状态和调用链。
-
-## 一、先区分通用机制与 igc 私有实现
-
-通用 PCIe NIC 机制：
-
-- `pci_driver` probe/remove。
-- BAR MMIO。
-- coherent Descriptor Ring 与 streaming Payload DMA。
-- MSI-X Multi-queue。
-- NAPI Poll。
-- `net_device` 注册、Queue Stop/Wake。
-- PM 与 AER 恢复。
-
-igc 私有内容：
-
-- 具体 Device ID。
-- Register Offset 与 bit 定义。
-- Descriptor Format。
-- Hardware MAC/PHY/NVM 操作表。
-- Queue 数上限与 Offload Capability。
-- Reset/Link 配置细节。
+`rtw88` 不是一个单文件 Driver。RTL8822CE 模块负责 PCI ID 与 Chip Specification，公共 PCI Glue 负责 BAR、DMA、IRQ 和 NAPI，rtw88 Core 管理 Firmware/无线状态，mac80211/cfg80211 再把设备接入 Linux 无线子系统。
 
 ```mermaid
 flowchart TD
-    PCI[Linux PCI Core] --> IGC[igc PCI driver]
-    IGC --> HW[igc hardware abstraction/registers]
-    IGC --> NET[Linux net_device]
-    NET --> TX[TX queues and descriptor rings]
-    HW --> RX[RX queues and descriptor rings]
-    TX --> DMA[DMA API]
-    RX --> DMA
-    TX --> NAPI[NAPI/MSI-X]
-    RX --> NAPI
-    NAPI --> STACK[Linux network stack]
+    CHIP[rtw8822ce.c: ID and chip spec] --> PCI[pci.c: PCI Glue]
+    PCI --> CORE[rtw88 core]
+    CORE --> MAC[mac80211 / cfg80211]
+    PCI --> BAR[BAR2 MMIO]
+    PCI --> RING[TX and RX descriptor ring]
+    PCI --> IRQ[one MSI or INTx vector]
+    PCI --> NAPI[RX NAPI poll]
 ```
 
-阅读时不要把 `igc_*` 函数名当作所有网卡统一 API。
+这种分层让多个 rtw88 芯片复用同一套 PCI 生命周期。因为 `id->driver_data` 提供具体 Chip Information，所以 `rtw_pci_probe()` 可以保持通用；芯片差异通过 Hardware Specification 与 Operation Table 进入，而不是复制整套 Probe。
 
-要看它在哪个通用 callback 中实现什么合同。
+阅读时首先标记边界：`pci_enable_device()`、`pci_request_regions()`、DMA API 和 IRQ Vector 是 Linux PCI/Driver 机制；Channel、Rate、Firmware Command 和 Realtek Register 是设备业务。只有前一类可以直接迁移到其他 PCIe 驱动。
 
-## 二、pci_device_id 是 Function 匹配入口
+## 二、RTL8822CE 模块只负责匹配和选择规格
 
-驱动提供 `struct pci_device_id igc_pci_tbl[]`，列出支持的 Intel Device ID。
+Linux 6.12 的 `rtw8822ce.c` 很短，ID Table 匹配 Realtek `0xC822` 与 `0xC82F`，`driver_data` 指向 `rtw8822c_hw_spec`。`struct pci_driver` 的 `.probe`、`.remove`、PM、Shutdown 和 Error Handler 则指向公共 PCI 实现。
 
-`MODULE_DEVICE_TABLE(pci, ...)` 生成模块 alias。
-
-PCI Core 匹配后调用 `igc_probe(struct pci_dev *pdev, const struct pci_device_id *ent)`。
-
-匹配成功只证明 Device ID 受支持。
-
-probe 仍要验证 DMA、BAR、MAC/NVM、Queue 与中断资源。
-
-真实产品 Driver 还可能根据 `driver_data` 选择不同 Hardware Variant/Info Table。
-
-## 三、igc_probe 建立 PCI 与 netdev 两棵对象关系
-
-probe 大致完成：
-
-1. 启用 PCI Memory Resource。
-2. 设置 DMA Mask。
-3. 请求 BAR Region。
-4. 设置 Bus Master。
-5. 分配 multi-queue `net_device`。
-6. 建立 adapter 私有对象并关联 `pdev`/`netdev`。
-7. 映射 BAR。
-8. 初始化硬件操作、MAC/NVM/PHY。
-9. 选择 Queue/Interrupt 方案。
-10. 注册 netdev。
-
-```mermaid
-sequenceDiagram
-    participant C as PCI Core
-    participant P as igc_probe
-    participant PCI as pci_dev
-    participant N as net_device
-    participant H as igc hardware
-    C->>P: matched pci_dev
-    P->>PCI: enable, DMA mask, regions, bus master, iomap
-    P->>N: alloc_etherdev_mq and init netdev_ops
-    P->>H: reset/check NVM/MAC/PHY capabilities
-    P->>N: register_netdev
-    N-->>C: network interface published
+```text
+PCI ID match
+  -> choose rtw8822c hardware specification
+  -> call common rtw_pci_probe
+  -> common PCI Glue uses chip-specific sizes and operations
 ```
 
-用户空间能看到网卡的发布点是 `register_netdev()`。
+这说明 ID Table 不只是“允许绑定”。匹配项还把设备族信息传入公共代码，因此 Probe 后续知道 Descriptor Size、Chip Operation 和能力差异。RTL8821CE 的组织方式相同，但 ID 和 Chip Specification 不同。
 
-在它之前所有私有对象、锁、work、Queue Count 和基础 Hardware State 必须完整。
+## 三、rtw_pci_probe() 按依赖顺序建立设备
 
-## 四、adapter 把 pci_dev、net_device 与硬件状态连接
-
-Intel Driver 常使用 adapter 私有结构保存：
-
-- `struct net_device *netdev`。
-- `struct pci_dev *pdev`。
-- Hardware abstraction object。
-- TX/RX Ring 数组。
-- Queue Vector/NAPI。
-- Interrupt Capability。
-- Watchdog/Reset Work。
-- Link/Stats/Feature 状态。
-
-`pci_set_drvdata(pdev, netdev)` 或等价关联让 PM/remove 从 `pdev` 找到网络对象。
-
-`netdev_priv(netdev)` 找到 adapter。
-
-对象关系是双向导航，但最终释放顺序必须单一。
-
-通常 remove 通过 `pdev` 得到 netdev，注销后释放 netdev，adapter 随之释放。
-
-## 五、BAR 映射只给出寄存器入口
-
-Driver 使用 PCI Resource API 请求并映射 Memory BAR。
-
-映射得到 `void __iomem *`，寄存器访问使用 `readl()`/`writel()` 等 MMIO accessor。
-
-不能普通解引用。
-
-posted write 可能需要后续 read flush，具体由硬件寄存器合同决定。
-
-BAR 正确映射不代表 Device 已就绪。
-
-还要完成 reset、NVM 校验、MAC Address、PHY、Queue 和 Interrupt 初始化。
-
-## 六、net_device 把驱动接入网络栈
-
-`net_device` 包含：
-
-- `netdev_ops`：open/stop/start_xmit/set_features 等。
-- `ethtool_ops`：Link/统计/Ring/Coalesce 等管理。
-- Hardware Feature 与当前 Feature。
-- TX Queue 与 Traffic Control 状态。
-- MAC Address、MTU、Watchdog。
-
-`ndo_open` 才真正分配/启动运行时 Ring、请求 IRQ 并打开 Device。
-
-probe 不一定让数据面长期运行。
-
-这一区分支持 Interface administratively down 时节省资源和功耗。
-
-## 七、ndo_open 的发布顺序
-
-典型 open：
-
-1. 分配 TX/RX Ring Resource。
-2. 配置 Queue DMA Base/Length/Head/Tail。
-3. 分配 MSI-X/IRQ 与 Queue Vector。
-4. 启用 NAPI。
-5. 配置 MAC/PHY/Offload。
-6. 启动 RX/TX Unit。
-7. 开中断。
-8. 启动 Network TX Queue。
-
-任一步失败按逆序释放。
-
-上层 Queue 必须最后开放，避免 `ndo_start_xmit` 进入半初始化 Ring。
-
-## 八、TX 数据路径从 skb 到 Descriptor
-
-网络栈调用 `ndo_start_xmit(struct sk_buff *skb, struct net_device *dev)`。
-
-驱动选择 TX Ring，检查剩余 Descriptor，分析 Offload，上 DMA Mapping，填写 Descriptor，执行 Barrier，更新 Tail/Doorbell。
-
-```mermaid
-flowchart LR
-    SKB[sk_buff from network stack] --> Q[select TX queue/ring]
-    Q --> SPACE{enough descriptors?}
-    SPACE -- no --> STOP[netif_tx_stop_queue]
-    SPACE -- yes --> MAP[dma_map_single / dma_map_page]
-    MAP --> DESC[fill context/data descriptors]
-    DESC --> B[dma_wmb]
-    B --> TAIL[writel TX tail]
-    TAIL --> DEV[device DMA reads payload]
-    DEV --> DONE[TX completion]
-    DONE --> UNMAP[dma_unmap + free skb]
-    UNMAP --> WAKE[netif_tx_wake_queue if space]
-```
-
-`skb` 可能有线性 head 和多个 fragment。
-
-每个 DMA Mapping 都要记录，以便 completion 或错误回滚逐一 unmap。
-
-## 九、TX Descriptor 与 skb 所有权
-
-`ndo_start_xmit` 返回 `NETDEV_TX_OK` 后，驱动拥有 skb，最终必须释放。
-
-如果 Ring 资源不足，正确做法通常是提前 stop Queue，仍按网络驱动合同处理返回。
-
-不要接受 skb 后在 Mapping 失败时泄漏。
-
-Driver 常在某个末尾 Descriptor 的 software buffer_info 保存 skb 指针和时间戳。
-
-Device 更新完成状态后，Clean Path：
-
-- `dma_unmap_*`。
-- 累计 bytes/packets。
-- `dev_kfree_skb_any()` 或合适释放。
-- 清 software metadata。
-- 推进 next_to_clean。
-
-在 Device 完成前 CPU 不能释放/改写 Payload。
-
-## 十、TX Queue Stop/Wake 是 Ring 背压
-
-Ring 剩余 Descriptor 低于一个最大 skb 所需数量时，驱动停止该 `netdev_queue`。
-
-停止后要重新检查空间，处理 stop 与 completion 并发，避免 Lost Wakeup。
-
-Completion 清出足够空间后 wake Queue。
-
-这把硬件 Ring Capacity 传播给网络栈。
-
-只在完全 Ring Full 后才 stop 可能已经来不及容纳多 fragment skb。
-
-阈值应考虑 Context Descriptor、TSO Fragment 和安全余量。
-
-## 十一、RX Ring 先准备可 DMA 的 Buffer
-
-RX 路径由 Driver 预先给 Descriptor 填 DMA Address。
-
-设备收到 Frame 后 DMA 写入 Buffer，并更新 Descriptor Status/Length。
-
-驱动在 NAPI Poll 中：
-
-1. 检查 Descriptor 完成标志。
-2. `dma_rmb()` 后读取长度/状态。
-3. 同步或解除 DMA Mapping。
-4. 构造/填充 skb。
-5. 设置 protocol、checksum、VLAN、RSS hash 等 metadata。
-6. 交给 GRO/Network Stack。
-7. 补充新的 RX Buffer。
-
-RX Ring 缺 Buffer 会导致丢包，即使链路与中断都正常。
-
-## 十二、page 与 skb 的关系
-
-现代 RX Driver 常使用 page-based buffer，而不是每包提前分配完整 skb。
-
-一个 Page 可通过 page_pool/复用策略承载一个或多个接收片段。
-
-收到数据后 Driver 可能：
-
-- 构造小 skb 并复制小包。
-- `build_skb()`/fragment 方式让 skb 引用 Page。
-- 为大包、多 Buffer Frame 组装 frags。
-
-Page 所有权在 Device DMA、Driver、skb/Network Stack 和回收池之间迁移。
+官方 v6.12 源码中的主路径可以整理为：分配 `ieee80211_hw/rtw_dev`，初始化 rtw88 Core，Claim PCI Function，建立 BAR 与 DMA Ring，初始化 NAPI，读取 Chip Information 和 PHY，注册 mac80211 Hardware，最后申请 IRQ。
 
 ```mermaid
 stateDiagram-v2
-    [*] --> DriverFreePage
-    DriverFreePage --> DeviceOwned: map/fill RX descriptor
-    DeviceOwned --> DriverCompleted: RX descriptor done
-    DriverCompleted --> StackOwned: attach page to skb
-    DriverCompleted --> DriverFreePage: copy packet and recycle
-    StackOwned --> Recycle: skb released
-    Recycle --> DriverFreePage: page_pool/reuse
-    DeviceOwned --> DriverFreePage: stop/reset after DMA quiesce
+    [*] --> CoreAllocated
+    CoreAllocated --> PCIClaimed: rtw_pci_claim
+    PCIClaimed --> BARAndRings: rtw_pci_setup_resource
+    BARAndRings --> NAPIReady: rtw_pci_napi_init
+    NAPIReady --> ChipReady: chip and PHY setup
+    ChipReady --> Published: rtw_register_hw
+    Published --> IRQReady: rtw_pci_request_irq
+    IRQReady --> Running
 ```
 
-具体 igc 版本的 RX Buffer 实现应以 `v6.12` 源码为准。
+每个错误标签都撤销已经成功的阶段。IRQ 申请发生在 mac80211 注册之后，所以 IRQ 失败时源码先注销 `ieee80211_hw`，再销毁 NAPI、Ring、BAR 与 PCI Claim；这仍然符合“先撤销外部入口，再释放内部资源”的原则。
 
-不要把其他 Driver 的 page_pool 细节硬套到 igc。
+因为设备中断在 Start 前保持受控状态，所以注册上层对象与申请 IRQ 的具体先后可以由该驱动合同决定。不能只从一份模板判断顺序对错，要检查什么时候硬件真正可能产生事件。
 
-## 十三、NAPI 为什么替代每包中断
+## 四、PCI Claim 与 BAR2 映射建立寄存器访问
 
-每个 Packet 一个硬中断会在高 Packet Rate 下耗尽 CPU。
+`rtw_pci_claim()` 调用 `pci_enable_device()`、`pci_set_master()` 并保存 Driver Data，使 Function 能响应资源事务并具备 Bus Master 权限。它不重新扫描设备，也不自己给 BAR 分配全局地址，因为这些结果已经位于 `pci_dev->resource[]`。
 
-NAPI 模式：
+资源建立函数先 `pci_request_regions()`，再读取 BAR2 长度并调用 `pci_iomap()`，映射结果保存在 PCI Private Object 中。后续 `rtw_pci_read8/16/32` 和写函数最终使用标准 I/O Accessor 访问这段 `__iomem`。
 
-1. MSI-X Handler 确认 Queue Event，屏蔽/延迟该 Queue Interrupt。
-2. `napi_schedule()`。
-3. Poll 按 budget 清 RX/TX Completion。
-4. 若工作未清完，继续 Poll，不立即开中断。
-5. 若少于 budget 且队列清空，`napi_complete_done()` 并重开中断。
+```mermaid
+flowchart LR
+    RES[pci_dev resource array] --> CLAIM[pci_request_regions]
+    CLAIM --> MAP[pci_iomap BAR2]
+    MAP --> BASE[rtwpci MMIO base]
+    BASE --> ACCESS[readb/readw/readl and write accessors]
+```
+
+BAR2 是 Realtek 设备协议选择，不是 PCIe 规则。其他设备可能使用 BAR0 或多个 BAR，因此能迁移的是 Request/Map/Accessor 的生命周期，而不是 BAR Number。
+
+## 五、Descriptor Ring 与 Packet Buffer 使用不同 DMA 语义
+
+TX/RX Descriptor Ring 由 `dma_alloc_coherent()` 分配，因为 CPU 与设备长期共享控制字段。TX `skb` 在提交时使用 `DMA_TO_DEVICE` Streaming Mapping，RX Buffer 使用 `DMA_FROM_DEVICE`，完成或销毁时按原方向解除映射。
+
+```text
+TX descriptor ring -> coherent allocation
+RX descriptor ring -> coherent allocation
+TX skb payload     -> streaming map to device
+RX skb buffer      -> streaming map from device
+```
+
+这与第 08 篇建立的模型完全一致：Coherent Ring 不等于自动有内存顺序，Streaming Payload 也不能在设备 Ownership 期间由 CPU 随意访问。设备私有 Descriptor 中保存 DMA Address，但字段宽度与字节序只由 Realtek ABI 决定。
+
+初始化失败时，源码只释放已经分配的 TX/RX Ring 和 Buffer；这说明批量资源初始化仍需要精确记录进度，不能在第 `i` 项失败后假设全部数组都有效。
+
+## 六、TX 路径体现 Map、Descriptor、Kick 与回收
+
+HCI Operation 把发送入口映射到 `rtw_pci_tx_write()`，把硬件通知映射到 `rtw_pci_tx_kick_off()`。TX 路径选择 Hardware Queue，确认 Descriptor 可用，Map `skb`，填写 Buffer Descriptor，并把 `skb` 加入对应软件队列，随后更新 Hardware Write Pointer。
 
 ```mermaid
 sequenceDiagram
-    participant DEV as NIC Queue
-    participant IRQ as MSI-X handler
-    participant NAPI as NAPI poll
-    participant STACK as network stack
-    DEV-->>IRQ: queue interrupt
-    IRQ->>IRQ: mask/ack vector cause
-    IRQ->>NAPI: napi_schedule
-    NAPI->>DEV: clean RX/TX up to budget
-    NAPI->>STACK: GRO receive skbs
-    alt queue still has work
-        NAPI->>NAPI: remain scheduled
-    else work below budget and queue empty
-        NAPI->>IRQ: complete and re-enable interrupt
-    end
+    participant CORE as rtw88 core
+    participant TX as rtw_pci_tx_write
+    participant DMA as DMA API
+    participant RING as TX ring
+    participant DEV as RTL8822CE
+    CORE->>TX: skb and queue
+    TX->>DMA: map payload DMA_TO_DEVICE
+    DMA-->>TX: dma address
+    TX->>RING: fill descriptor and remember skb
+    CORE->>TX: kick off queue
+    TX->>DEV: publish hardware write pointer
+    DEV->>RING: consume descriptor
 ```
 
-NAPI budget 通常限制 RX 工作，TX Clean 也要避免无限占用 Poll。
+TX Completion 进入 `rtw_pci_tx_isr()`，Driver 读取 Hardware Read Pointer，回收已完成 `skb`，按保存的 DMA Address Unmap，再向上层报告发送状态。可迁移的数据路径是 Map → Publish → Completion → Unmap，Queue Index 和 Descriptor Bit 不能迁移。
 
-## 十四、MSI-X Queue Vector 的组织
+## 七、RX 使用预映射 Buffer 与 NAPI 批量消费
 
-MSI-X 允许多个向量。
+RX Ring 初始化时为每个 Slot 准备 `skb`，建立 `DMA_FROM_DEVICE` Mapping，并把 DMA Address 写入 Descriptor。设备收到 Frame 后写入 Buffer 和 RX Descriptor，随后产生中断。
 
-Driver 可让 Queue Pair 绑定一个 Vector/NAPI，并另设 Misc/Link Vector。
+IRQ 路径调度 NAPI，`rtw_pci_napi_poll()` 按 Budget 调用 RX Consumer。Consumer 将 Buffer 同步给 CPU、解析设备私有 RX Descriptor、把 Frame 交给 `ieee80211_rx_napi()`，再把原 Buffer同步回 Device 并推进 Ring Index。
 
-Queue Vector 常保存：
+NAPI 完成后重新 Enable Interrupt，并再次检查 DMA Ring 是否已经出现新数据。因为 Frame 可能在 Poll Complete 与中断恢复的窗口到达，所以这次 Recheck 是防止丢事件的必要握手，而不是重复工作。
 
-- RX/TX Ring 指针。
-- NAPI Object。
-- IRQ Number。
-- Interrupt Moderation 参数。
-- CPU Affinity 信息。
+## 八、该版本只使用一个 MSI 或 INTx Vector
 
-RSS/Flow Steering 把流分散到多个 RX Queue。
+Linux 6.12 `rtw_pci_request_irq()` 申请最少和最多各一个 Vector，默认允许 MSI 与 INTx；Module Parameter 可以禁止 MSI。随后 Driver 注册 Hard Handler 和 Thread Function。
 
-XPS 影响 TX Queue 选择。
+因此这个案例**没有使用 MSI-X 多队列 Vector**。MSI-X 是第 07 篇介绍的通用机制，第 17 篇还会讨论多队列设计，但不能为了“完整”而把源码不存在的机制写进 rtw88。
 
-IRQ Affinity 与 NUMA 应让 Queue、CPU 和内存尽量接近。
+Hard Handler 先关闭设备中断并返回 `IRQ_WAKE_THREAD`。Thread Function 读取并清除设备 Interrupt Status，处理各 TX Queue Completion，RX 事件则安排 NAPI，最后只在 `running` 状态下重新 Enable Interrupt。
 
-## 十五、中断调节在吞吐与延迟间权衡
+一个 Vector 可以承载多个事件源，所以真正的事件分类来自设备 Status 和 Ring，而不是 Linux IRQ Number。这再次说明中断只是通知，业务事实仍在 Completion/Descriptor 中。
 
-Interrupt Moderation/ITR 让设备累计一批 Completion 后再中断。
+## 九、Start/Stop 展示正确的异步停止合同
 
-调节高：中断少、吞吐好、延迟增加。
+`rtw_pci_start()` 先 Enable NAPI，再设置 `running=true` 并 Enable Interrupt。这样即使通知立即到达，后续 Poll Context 也已经准备完成。
 
-调节低：延迟低、中断率和 CPU 开销高。
+`rtw_pci_stop()` 先设置 `running=false`、关闭设备中断，然后 `synchronize_irq()`，停止 NAPI，最后释放仍排队的 DMA Buffer。因为 Handler 和 Poll 都可能访问 Ring，所以它们退出后才能 Unmap/Free。
 
-igc 包含自己的 ITR 策略与寄存器实现。
+```mermaid
+flowchart TD
+    START[napi enable] --> IRQON[running true and IRQ enable]
+    IRQON --> ACTIVE[data path active]
+    ACTIVE --> IRQOFF[running false and IRQ disable]
+    IRQOFF --> SYNC[synchronize IRQ]
+    SYNC --> NAPIOFF[synchronize and disable NAPI]
+    NAPIOFF --> RELEASE[release queued DMA buffers]
+```
 
-通用工程方法是测量 Packet Size、Queue Load、IRQ Rate、NAPI Budget、P50/P99 与 CPU 利用率。
+这条 Stop Contract 能迁移到其他 PCIe Driver：阻止新进入、关闭通知源、同步异步执行上下文、确认 Device 不再访问，最后释放 DMA 与 MMIO。
 
-不能复制另一个 NIC 的固定寄存器值。
+## 十、ASPM 代码体现标准能力与私有实现的边界
 
-## 十六、Watchdog 与 Hang Detection
+rtw88 先通过标准 PCIe Capability 读取 Link Control，确认 Host 对 CLKREQ/ASPM 的配置，再通过 Realtek 私有 DBI/MDIO 路径启用芯片内部对应模块。标准配置和设备私有开关都满足，机制才真正工作。
 
-Network Core 的 TX Watchdog 和 Driver 自己的统计/work 可检测 Queue 长期不前进。
+源码还针对部分 Chip/Bridge 组合协调 NAPI 与 Link Power，说明 ASPM 可能与高吞吐 RX 路径产生互操作问题。这个案例验证了第 11 篇的结论：Link Power 不能脱离业务状态和板级 CLKREQ# 单独调整。
 
-Hang 可能来自：
+但具体 Workaround 不具有通用性。另一个设备应依据自身 Capability、公开手册和平台信号设计，而不是复制 Realtek DBI Register 操作。
 
-- Doorbell/Descriptor 内存序。
-- Link Down。
-- Device DMA/Firmware 停止。
-- MSI-X 丢失但 Descriptor 已完成。
-- IOMMU Fault。
-- Queue State/Head Tail 异常。
+## 十一、Remove 与错误回滚怎样保持所有权完整
 
-恢复前要停止 Queue 与 DMA，不能直接 free skb/Ring。
+Probe 失败会依次撤销已经建立的 mac80211、NAPI、PCI Resource、PCI Claim、Core 和 Hardware Object。Remove 则先注销上层 Hardware，关闭中断和 NAPI，再销毁 Ring/BAR、Disable PCI Function、释放 IRQ 和 Core。
 
-reset 后旧 skb 必须明确失败/释放，不能等不存在的 Completion。
+阅读 Remove 时应按所有权提问：谁先阻止 mac80211 提交，谁让 IRQ/NAPI 退出，谁确保 DMA 不再引用 `skb`，谁最后解除 BAR。函数顺序不一定是 Probe 文本的严格镜像，但每个活动执行上下文必须早于其数据释放。
 
-## 十七、ndo_stop 的逆序拆卸
+Shutdown 只负责系统关机语义，可能执行 Chip Shutdown 并进入 D3hot；它不等于完整 Remove，因此不能用 Shutdown 回调替代正常解绑。
 
-Interface down 时：
+## 十二、本篇检查点与可迁移结论
 
-1. `netif_tx_stop_all_queues()`。
-2. 停止 Device RX/TX/DMA。
-3. 屏蔽中断。
-4. `synchronize_irq()`。
-5. 禁用 NAPI 并等待 Poll 结束。
-6. 清理 TX 未完成 skb 与 DMA Mapping。
-7. 回收 RX Buffer/Page。
-8. 释放 IRQ、Ring 与 Queue Vector。
+现在应当能够沿 `rtw_pci_probe()` 讲出 Core、PCI Claim、BAR/Ring、NAPI、Chip/mac80211、IRQ 的依赖，并描述 TX 的 Map/Descriptor/Kick/Completion/Unmap 与 RX 的预映射/IRQ/NAPI/Sync/Recycle。
 
-停止顺序确保没有 IRQ/NAPI 在 Ring 释放后继续访问。
+可以迁移的是 PCI Glue 生命周期、DMA ownership、IRQ/NAPI 停止合同和标准 Capability 边界；不能迁移的是 BAR2、Device ID、Descriptor Layout、Queue Register、DBI/MDIO Offset 和芯片 Workaround。真实设备案例的价值正是同时看见这两类内容。
 
-## 十八、PM 要同时处理 netdev 与 PCI State
+## 十三、小结：下一篇转向 Root Complex Bring-up
 
-Suspend 前检查 netdev 是否 running。
+Linux 6.12 `rtw88` 通过短小芯片 ID 模块和公共 PCI Glue，把 BAR2、DMA Descriptor Ring、单 Vector MSI/INTx、Threaded IRQ、NAPI、ASPM 与 mac80211 组合起来。它没有改变前面通用机制，只为每个机制填入 Realtek 设备协议。
 
-若 running，执行类似 stop 的数据面 quiesce，配置 WoL/PME。
+设备案例到这里结束。下一篇切换到 Host 侧：当 Linux 连 `pci_dev` 都无法创建时，如何从 RK356x Root Complex 的供电、REFCLK、PERST#、PHY、LTSSM、ATU 和配置访问逐层 Bring-up；这时修改 rtw88 ID 或 TX Ring 已经没有意义。
 
-保存 PCI State、关闭 Device、进入目标 D-state。
+**一手资料**
 
-Resume 后恢复 PCI Configuration/BAR/Bus Master，重置 Device 私有状态，若 netdev 原来 running 再重建 Ring/IRQ/NAPI。
-
-只 `pci_restore_state()` 不会恢复 NIC Descriptor Base、RSS、MAC Filter 与 PHY State。
-
-## 十九、AER 与 reset 如何进入网络驱动
-
-igc/同类驱动可通过 `pci_error_handlers` 参与 AER 恢复。
-
-`error_detected` 停止 netdev Queue 与数据面。
-
-frozen 时避免依赖 MMIO。
-
-`slot_reset` 恢复 PCI enable/bus master 与硬件。
-
-`resume` 重新开放网络接口。
-
-Reset Generation 用于隔离旧 Completion/Watchdog Work。
-
-若恢复失败，应让 netdev 保持 detached/down，而不是继续接收 skb。
-
-## 二十、remove 与 shutdown 的区别
-
-remove 用于 Driver Unbind/Hotplug：
-
-- `unregister_netdev()` 阻止新网络操作并触发 stop。
-- 取消 reset/watchdog/service work。
-- 释放硬件与 PCI 资源。
-- unmap BAR、release regions、disable device。
-- free netdev/adapter。
-
-shutdown 用于重启/关机。
-
-它要让 Device 停止 DMA，并根据 WoL/平台策略留下合适状态，但对象内存未必立即释放，因为内核进程即将结束。
-
-Kexec 场景尤其要求旧 Device 不再 DMA 到新内核未拥有的内存。
-
-## 二十一、源码阅读路线
-
-固定 Linux `v6.12`：
-
-1. `igc_main.c`：PCI probe/remove、netdev ops、Ring 与 NAPI 主路径。
-2. `igc.h`：adapter/ring/q_vector 等对象。
-3. `igc_hw.h` 与硬件文件：Variant 和寄存器操作。
-4. `igc_ethtool.c`：管理面与 Ring/Coalesce 配置。
-5. `igc_ptp.c`：时间戳作为扩展专题。
-
-每读一个函数，回答：
-
-- 当前对象由谁拥有。
-- DMA Mapping 何时建立/解除。
-- Queue Stop/Wake 条件是什么。
-- 哪个 callback 是用户可见发布点。
-- error/remove 如何取消异步路径。
-
-## 二十二、一手资料
-
-- [Linux v6.12 igc source](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/net/ethernet/intel/igc?h=v6.12)
-- [Linux 6.12 NAPI documentation](https://www.kernel.org/doc/html/v6.12/networking/napi.html)
-- [Linux network driver documentation](https://docs.kernel.org/networking/driver.html)
+- [Linux 6.12 stable rtw88 PCI source](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/net/wireless/realtek/rtw88/pci.c?h=linux-6.12.y)
+- [Linux 6.12 stable RTL8822CE glue](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/net/wireless/realtek/rtw88/rtw8822ce.c?h=linux-6.12.y)
 - [Linux 6.12 PCI driver API](https://www.kernel.org/doc/html/v6.12/driver-api/pci/pci.html)
-- [PCI-SIG specifications](https://pcisig.com/specifications)
-
-## 二十三、小结
-
-Linux `v6.12` 的 igc 展示了 PCIe NIC 从 Function 到网络栈的完整数据路径。
-
-probe 建立 PCI Resource、BAR、DMA Capability、adapter 与 `net_device`，`register_netdev()` 是用户可见发布点。
-
-TX 路径把 skb 映射成 Descriptor，Doorbell 前需要正确内存序，Completion 负责 unmap 和释放 skb。
-
-RX 路径预投 Page/Buffer，Device DMA 后由 NAPI 构造 skb 并交给 GRO/Network Stack。
-
-Queue Stop/Wake 把 Ring 背压传给网络栈。
-
-MSI-X、Queue Vector、NAPI 和 Interrupt Moderation共同决定多核吞吐与尾延迟。
-
-PM、AER、ndo_stop、remove 和 shutdown 都必须先停止 DMA/IRQ/NAPI，再释放 Ring 与 skb/page。
-
-可迁移的知识是对象所有权和 callback 合同；igc 的寄存器、Descriptor 与 Hardware Variant 只能用于理解 igc 本身。
+- [野火 Linux PCI 子系统章节（教学框架参考）](https://doc.embedfire.com/linux/rk356x/driver/zh/latest/linux_driver/subsystem_pci_subsystem.html)
