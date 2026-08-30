@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #10 · IOMMU、SWIOTLB、ATS、PRI、PASID 与 SVA"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #11 · IOMMU、SWIOTLB、ATS、PRI、PASID 与 SVA"
 description: "从 Descriptor 中的 DMA Address 出发，讲清 IOVA、Domain、IOMMU Group、IOTLB、Fault、SWIOTLB，再按 ATS、PRI、PASID、SVA 的依赖顺序建立共享地址空间模型。"
-pubDate: "2026-08-29"
+pubDate: "2026-08-30"
 series: pcie
-order: 10
+order: 11
 tags: ["PCIe", "IOMMU", "SVA", "Linux 6.12"]
 draft: false
 ---
@@ -14,7 +14,7 @@ draft: false
 
 本文以 Linux 6.12 为基线，从一个 `dma_map_single()` 结果进入 IOMMU Domain，再按依赖顺序扩展到共享虚拟地址。设备只作为地址请求者，不绑定某款网卡或加速器私有协议。
 
-## 一、先看问题：Descriptor 中的地址由谁解释
+## 一、Descriptor 中的地址由谁解释
 
 CPU 把 Payload Virtual Address 传给 `dma_map_single()`，DMA Layer 为指定 Device 返回 `dma_addr_t`。设备把这个数放入 PCIe Memory Request Address，Host Bridge/IOMMU 再决定最终访问哪个 Physical Page。
 
@@ -208,13 +208,13 @@ revoke new submissions
 
 若先撤销 Mapping，仍在运行的设备会产生 Fault；若 Fault Handler 又引用正在退出的 Process/Driver，就会形成更复杂的 Use-After-Free。因此 teardown 必须同时覆盖 Data Path、Fault Path 和 Address Space Lifetime。
 
-## 十四、本篇检查点
+## 十四、常见误解与审查重点
 
 现在应当能够解释 `dma_map_single()` 为什么可能返回 Direct Address、IOVA 或 SWIOTLB Bounce Address，并说明 Domain 是 Translation Context、IOMMU Group 是最小隔离单位、IOTLB 是 Translation Cache、Fault 是 Device Address Request 的证据。
 
 还应能按依赖关系说明 ATS 缓存翻译，PRI 请求缺页服务，PASID 标识地址空间，SVA 让 Device 使用 Process Virtual Address；Capability 存在不等于功能已经启用。
 
-## 十五、小结：下一篇进入电源状态与数据路径暂停
+## 十五、小结
 
 IOMMU 在 Device DMA Address 与 Host Physical Memory 之间建立可撤销、带权限的映射，SWIOTLB 则用 Bounce Copy 解决地址不可达。ATS、PRI、PASID 和 SVA 逐层把静态 DMA Mapping 扩展为设备缓存翻译、缺页恢复和进程地址共享。
 

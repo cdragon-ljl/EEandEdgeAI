@@ -1,20 +1,20 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #14 · rtw88 PCI Glue：BAR、DMA Ring、IRQ 与 NAPI"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #07 · rtw88 PCI 驱动源码分析"
 description: "以 Linux 6.12 RTL8822CE/rtw88 为局部源码案例，沿 ID Match、rtw_pci_probe、BAR2、DMA Descriptor Ring、MSI/INTx、NAPI、ASPM 和 Remove 组合前述 PCIe 机制。"
 pubDate: "2026-08-29"
 series: pcie
-order: 14
+order: 7
 tags: ["PCIe", "rtw88", "RTL8822CE", "Linux 6.12"]
 draft: false
 ---
 
-前十三篇已经分别讲过 Driver Match、BAR、DMA、Descriptor Ring、IRQ、NAPI、PM 和 Recovery。真实驱动不会把它们放在互不相干的示例中，因此本篇要解决的问题是：一块真实 PCIe 无线网卡怎样在一次 Probe 中建立这些资源，并在 TX、RX 和 Remove 中维持所有权？
+前六篇已经建立 PCIe 协议、枚举、BAR、Linux 子系统架构、核心结构和函数。现在用一块真实 PCIe 无线网卡观察这些机制怎样在同一个 Driver 中组合，并明确哪些部分属于 Linux PCI Glue、哪些属于 Realtek 私有实现。
 
 本文选择 Linux 6.12 主线 `rtw88` 的 RTL8822CE PCI Glue 作为局部案例。选择它是为了观察通用机制怎样落地，不是把系列改成 Realtek 驱动教程；Realtek 私有寄存器和 Descriptor Bit 只属于对应芯片，不能推广成 PCIe 规范。
 
 源码路径以 Linux v6.12 `drivers/net/wireless/realtek/rtw88/pci.c` 与 `rtw8822ce.c` 为准。野火章节用于参考“从对象到接口再到真实源码”的教学层次，本文的正文、图示和推导重新编写。
 
-## 一、先看问题：rtw88 由哪几层共同组成
+## 一、rtw88 由哪几层共同组成
 
 `rtw88` 不是一个单文件 Driver。RTL8822CE 模块负责 PCI ID 与 Chip Specification，公共 PCI Glue 负责 BAR、DMA、IRQ 和 NAPI，rtw88 Core 管理 Firmware/无线状态，mac80211/cfg80211 再把设备接入 Linux 无线子系统。
 
@@ -165,19 +165,19 @@ rtw88 先通过标准 PCIe Capability 读取 Link Control，确认 Host 对 CLKR
 
 ## 十一、Remove 与错误回滚怎样保持所有权完整
 
-Probe 失败会依次撤销已经建立的 mac80211、NAPI、PCI Resource、PCI Claim、Core 和 Hardware Object。Remove 则先注销上层 Hardware，关闭中断和 NAPI，再销毁 Ring/BAR、Disable PCI Function、释放 IRQ 和 Core。
+Probe 失败会依次撤销已经建立的 mac80211、NAPI、PCI Resource、PCI Claim、Core 和 Hardware Object。Linux 6.12 的 `rtw_pci_remove()` 则先注销上层 Hardware，关闭中断和 NAPI，再销毁 Ring/BAR、Disable PCI Function、释放 IRQ 和 Core。
 
 阅读 Remove 时应按所有权提问：谁先阻止 mac80211 提交，谁让 IRQ/NAPI 退出，谁确保 DMA 不再引用 `skb`，谁最后解除 BAR。函数顺序不一定是 Probe 文本的严格镜像，但每个活动执行上下文必须早于其数据释放。
 
 Shutdown 只负责系统关机语义，可能执行 Chip Shutdown 并进入 D3hot；它不等于完整 Remove，因此不能用 Shutdown 回调替代正常解绑。
 
-## 十二、本篇检查点与可迁移结论
+## 十二、常见误解与审查重点
 
 现在应当能够沿 `rtw_pci_probe()` 讲出 Core、PCI Claim、BAR/Ring、NAPI、Chip/mac80211、IRQ 的依赖，并描述 TX 的 Map/Descriptor/Kick/Completion/Unmap 与 RX 的预映射/IRQ/NAPI/Sync/Recycle。
 
 可以迁移的是 PCI Glue 生命周期、DMA ownership、IRQ/NAPI 停止合同和标准 Capability 边界；不能迁移的是 BAR2、Device ID、Descriptor Layout、Queue Register、DBI/MDIO Offset 和芯片 Workaround。真实设备案例的价值正是同时看见这两类内容。
 
-## 十三、小结：下一篇转向 Root Complex Bring-up
+## 十三、小结
 
 Linux 6.12 `rtw88` 通过短小芯片 ID 模块和公共 PCI Glue，把 BAR2、DMA Descriptor Ring、单 Vector MSI/INTx、Threaded IRQ、NAPI、ASPM 与 mac80211 组合起来。它没有改变前面通用机制，只为每个机制填入 Realtek 设备协议。
 

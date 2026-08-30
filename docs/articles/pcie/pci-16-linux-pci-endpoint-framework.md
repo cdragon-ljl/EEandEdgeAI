@@ -14,7 +14,7 @@ Endpoint 模式同时包含控制器硬件和要暴露的 Function 业务。若�
 
 本文以 Linux 6.12 为基线，使用主线 `pci_epf_test`/Host `pci_endpoint_test` 解释协作。仓库中的 `pci_epf_teaching.c` 是原创教学协议，只有目标 SoC Controller 真正支持 EP Mode 时才能运行。
 
-## 一、先看问题：谁负责配置空间，谁负责业务
+## 一、谁负责配置空间，谁负责业务
 
 一个 Endpoint 要完成四件事：让 Host 枚举出 Function，为 BAR 提供可访问 Backing Memory，把 Host/EP 地址相互转换，并向 Host 发出 Legacy/MSI/MSI-X 通知。控制器 IP 知道怎样编程这些硬件，却不知道产品要暴露什么业务。
 
@@ -225,13 +225,13 @@ Endpoint Framework 故障可以分成：Host 看不到 Function、能枚举但 B
 
 因此日志至少包含 EPC、EPF Instance、Function、BAR、Request ID、Host DMA Address、IRQ Type/Vector、Generation 和时间戳。单边日志无法证明跨机器协议完成。
 
-## 十四、本篇检查点
+## 十四、常见误解与审查重点
 
 现在应当能够区分 EPC、EPF、EPF Driver、ConfigFS 和 Host Driver，并按 Bind 顺序讲出 Header、BAR Backing、`pci_epc_set_bar()`、Address Translation 和 IRQ 如何建立。
 
 还应能解释 Host BAR Access 与 EP Outbound DMA 是两个方向，MSI/MSI-X 只通知完成，`pci_epf_test` 是公开测试协议而非产品模板，以及为什么 `unbind` 必须先停止 Host 可见行为。
 
-## 十五、小结：下一篇把单队列扩展成高吞吐产品路径
+## 十五、小结
 
 Linux Endpoint Framework 用 EPC 隔离控制器硬件，用 EPF 表达 Function 业务，用 ConfigFS 组装实例，再由 Host Driver 完成协议另一半。BAR、Address Translation、DMA 和 IRQ 都在双方明确 ownership 后才能安全工作。
 

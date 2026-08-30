@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #13 · TLP、MPS、MRRS、Tag、Credit 与性能"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #14 · TLP、MPS、MRRS、Tag、Credit 与性能"
 description: "从一笔 4096-byte 传输的理论计算出发，拆解 Link 编码、TLP 开销、MPS/MRRS、Tag、Credit、Outstanding、Queue Depth、Doorbell、IRQ 与 P99。"
-pubDate: "2026-08-29"
+pubDate: "2026-08-30"
 series: pcie
-order: 13
+order: 14
 tags: ["PCIe", "Performance", "MPS", "MRRS", "Linux 6.12"]
 draft: false
 ---
@@ -14,7 +14,7 @@ draft: false
 
 Linux 命令和概念以 Linux 6.12 为基线。真实设备是否允许修改 MPS/MRRS、Vector 或 Queue，需要以平台拓扑和 Driver 实现为准，不能用 `setpci` 在运行中盲目试值。
 
-## 一、先看问题：Gen3 x4 为什么不等于 3.94 GB/s 业务吞吐
+## 一、Gen3 x4 为什么不等于 3.94 GB/s 业务吞吐
 
 Gen3 每 Lane 为 8.0 GT/s，使用 128b/130b 编码。忽略 SKP、DLLP 和重放时，x4 单方向编码后上限近似为：
 
@@ -212,13 +212,13 @@ queueing latency
 
 所谓“稳定”不只是跑满一分钟。应覆盖冷启动、热重启、长稳、低负载省电、高负载、Reset Recovery 和温度变化，因为 Link 与 PM 问题常在状态切换时出现。
 
-## 十四、本篇检查点
+## 十四、常见误解与审查重点
 
 现在应当能够从 Gen3 x4 算出编码后上限，并用明确开销模型比较 MPS=256/512 的 Payload 效率。还应能用 Bandwidth-Delay Product 估算 Read 需要的 Outstanding/Tag 数，而不是把 MRRS 当成唯一性能开关。
 
 还应能区分 Queue Depth、Tag 和 Credit：Queue 是软件/设备请求容量，Tag 关联 Non-Posted Request，Credit 是逐 Link Buffer 合同。面对低性能，先定位 Link、Protocol、CPU、Device Engine 或 Upper Layer，再选择参数。
 
-## 十五、小结：下一篇阅读真实驱动怎样组合这些机制
+## 十五、小结
 
 PCIe 性能由物理编码、TLP 效率、MPS/MRRS、Tag/Credit、Queue、Doorbell、IRQ、DMA Mapping、IOMMU、NUMA 和设备内部能力串联决定。任何单项参数都只能改变其中一段，端到端上限仍由最慢环节决定。
 

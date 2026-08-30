@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #12 · AER、FLR、Hot Reset 与错误恢复"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #13 · AER、FLR、Hot Reset 与错误恢复"
 description: "从一次 AER 错误记录出发，沿 Root Port、PCI Core 和 pci_error_handlers 建立检测、隔离、复位、重建和恢复链，并比较 FLR、PM Reset、Secondary Bus Reset 与 Hot Reset。"
-pubDate: "2026-08-29"
+pubDate: "2026-08-30"
 series: pcie
-order: 12
+order: 13
 tags: ["PCIe", "AER", "Reset", "Linux 6.12"]
 draft: false
 ---
@@ -14,7 +14,7 @@ Advanced Error Reporting（AER）提供标准错误状态、Mask、Severity 和 
 
 本文以 Linux 6.12 为基线，从一次错误事件沿完整恢复链推导，再比较 FLR、PM Reset、Secondary Bus Reset、Hot Reset 和更大范围的复位。设备只作为错误源，不依赖某款芯片私有错误寄存器。
 
-## 一、先看问题：发现错误后为什么不能立即 reset
+## 一、发现错误后为什么不能立即 reset
 
 假设设备 TX Request 超时，同时 Root Port 记录 Non-Fatal Completion Timeout。如果 Driver 立即执行 FLR，却没有先停止提交和 Mask IRQ，另一个 CPU 可能继续写 Doorbell；如果 Reset 后直接 Free 旧 Buffer，设备或 Fabric 中的旧 DMA 还可能晚到。
 
@@ -75,6 +75,7 @@ Header Log 可以保存出错 TLP 的 Header DW，帮助判断 Requester/Complet
 功能驱动通过 `struct pci_error_handlers` 提供回调：
 
 ```c
+/* 回调共同组成 PCI Error Recovery 状态机，不是独立通知函数。 */
 static const struct pci_error_handlers demo_err_handlers = {
     .error_detected = demo_error_detected,
     .mmio_enabled = demo_mmio_enabled,
@@ -100,6 +101,7 @@ static struct pci_driver demo_driver = {
 `error_detected()` 接收 `pci_channel_state_t`，此时 MMIO 是否安全取决于 Channel State。Driver 应先把软件状态切到 Recovering，阻止新提交，并停止不依赖不可信 MMIO 的异步路径。
 
 ```c
+/* error_detected 阶段先隔离旧数据路径，不能假设 MMIO 仍然可靠。 */
 static pci_ers_result_t
 demo_error_detected(struct pci_dev *pdev,
                     pci_channel_state_t state)
@@ -128,6 +130,7 @@ demo_error_detected(struct pci_dev *pdev,
 `slot_reset()` 在 Reset 后调用，此时 PCI 配置和 BAR 访问应恢复，但设备私有状态通常回到复位值。Driver 需要重新 Enable、恢复 Bus Master、验证 Device ID/Version、重建 Ring Base、Producer/Consumer、Interrupt Route 和 Feature Register。
 
 ```c
+/* Reset 后重建 PCI 与设备私有状态，失败时保持业务入口关闭。 */
 static pci_ers_result_t demo_slot_reset(struct pci_dev *pdev)
 {
     struct demo_dev *demo = pci_get_drvdata(pdev);
@@ -243,13 +246,13 @@ cat /proc/interrupts
 
 需要做连续恢复压力，而不是单次手工 Reset。记录每代 Generation、在途 Request 数、恢复耗时、P99、IOMMU Fault 和 AER 增量，才能发现只在第二次或并发 Reset 中出现的状态泄漏。
 
-## 十四、本篇检查点
+## 十四、常见误解与审查重点
 
 现在应当能够从 AER Message 讲到 Root Port 状态、Source ID、PCI Core 和 `pci_error_handlers`，并说明 `error_detected()` 先隔离，`slot_reset()` 重建，`resume()` 最后开放业务。
 
 还应能按影响范围比较 FLR、PM Reset、Secondary Bus Reset 和 Hot Reset，解释 Timeout 为什么不自动归还 DMA ownership，以及 Generation 为什么只能隔离旧 Completion、不能替代硬件停止。
 
-## 十五、小结：下一篇把性能问题拆成可计算因素
+## 十五、小结
 
 AER 提供标准错误证据，Recovery 则需要 Driver、PCI Core、Root Port 和平台共同完成。正确顺序是检测、阻止新请求、隔离旧数据路径、选择最小安全 Reset Scope、重建设备，再恢复业务。
 

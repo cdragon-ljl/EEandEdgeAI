@@ -6,15 +6,25 @@ export function getStaticPaths() {
     'pci-01-pcie-architecture-basics': 'pci-01-topology-link-tlp',
     'pci-02-pcie-enumeration-config-space': 'pci-02-enumeration-config-space',
     'pci-03-bar-and-mmio': 'pci-03-bar-resource-atu-mmio',
-    'pci-04-linux-pci-driver-framework': 'pci-05-pci-driver-lifecycle-api',
-    'pci-05-pcie-interrupts-msi-msix': 'pci-07-intx-msi-msix-threaded-irq',
-    'pci-06-pcie-dma-data-movement': 'pci-08-dma-api-memory-order',
-    'pci-07-iommu-address-translation': 'pci-10-iommu-swiotlb-ats-pasid-sva',
-    'pci-08-pcie-device-driver-practice': 'pci-06-pci-explorer-capability-bar-sysfs',
-    'pci-09-pcie-performance-stability': 'pci-13-performance-tlp-mps-mrrs-credit',
+    'pci-04-linux-pci-driver-framework': 'pci-06-core-api-driver-lifecycle',
+    'pci-05-pcie-interrupts-msi-msix': 'pci-10-intx-msi-msix-threaded-irq',
+    'pci-06-pcie-dma-data-movement': 'pci-09-dma-descriptor-ring',
+    'pci-07-iommu-address-translation': 'pci-11-iommu-swiotlb-ats-pasid-sva',
+    'pci-08-pcie-device-driver-practice': 'pci-08-pci-explorer-capability-bar-sysfs',
+    'pci-09-pcie-performance-stability': 'pci-14-performance-tlp-mps-mrrs-credit',
     'pci-10-pcie-troubleshooting': 'pci-18-system-debug-lspci-aer-iommu',
     'pci-11-pcie-endpoint-hardware-link-bring-up': 'pci-15-rc-ep-hardware-link-bring-up',
     'pci-12-pcie-dma-ring-msix-high-throughput': 'pci-17-multiqueue-dma-msix-throughput',
+    'pci-04-linux-pci-core-bus-dev-ops': 'pci-05-core-structures-pci-dev-driver-bus-ops',
+    'pci-05-pci-driver-lifecycle-api': 'pci-06-core-api-driver-lifecycle',
+    'pci-06-pci-explorer-capability-bar-sysfs': 'pci-08-pci-explorer-capability-bar-sysfs',
+    'pci-07-intx-msi-msix-threaded-irq': 'pci-10-intx-msi-msix-threaded-irq',
+    'pci-08-dma-api-memory-order': 'pci-09-dma-descriptor-ring',
+    'pci-10-iommu-swiotlb-ats-pasid-sva': 'pci-11-iommu-swiotlb-ats-pasid-sva',
+    'pci-11-power-aspm-clkreq-runtime-pm': 'pci-12-power-aspm-clkreq-runtime-pm',
+    'pci-12-aer-flr-hot-reset-recovery': 'pci-13-aer-flr-hot-reset-recovery',
+    'pci-13-performance-tlp-mps-mrrs-credit': 'pci-14-performance-tlp-mps-mrrs-credit',
+    'pci-14-network-driver-ring-napi-msix': 'pci-07-rtw88-pci-driver-source-analysis',
   } as const;
 
   return Object.entries(redirects).map(([legacy, canonical]) => ({
@@ -47,7 +57,7 @@ const canonicalURL = new URL(target, Astro.site);
   <body>
     <main>
       <h1>PCIe 文章已迁移</h1>
-      <p>正在前往重写后的 Linux 6.12 系列文章。</p>
+      <p>正在前往按学习顺序重新组织的 Linux 6.12 系列文章。</p>
       <a href={target}>前往新文章</a>
     </main>
   </body>

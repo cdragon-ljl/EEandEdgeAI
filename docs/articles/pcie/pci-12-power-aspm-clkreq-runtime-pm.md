@@ -1,9 +1,9 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #11 · D-State、ASPM、CLKREQ# 与 Runtime PM"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #12 · D-State、ASPM、CLKREQ# 与 Runtime PM"
 description: "从设备空闲后怎样安全省电出发，区分 Function D-State 与 Link ASPM State，并沿 Runtime Suspend/Resume 讲清 DMA、IRQ、配置状态、D3cold、PME、L1SS 和 CLKREQ#。"
-pubDate: "2026-08-29"
+pubDate: "2026-08-30"
 series: pcie
-order: 11
+order: 12
 tags: ["PCIe", "Power Management", "ASPM", "Linux 6.12"]
 draft: false
 ---
@@ -14,7 +14,7 @@ PCIe 电源管理难懂，常见原因是把两套状态混在一起。D0/D3hot/
 
 本文固定 Linux 6.12，先沿一次 Runtime Suspend/Resume 建立主流程，再讲 PME、ASPM、L1SS 和 CLKREQ#。设备型号只作场景，不把某个平台的电源开关当成 PCIe 通用规则。
 
-## 一、先看问题：空闲设备为什么不能直接进入 D3
+## 一、空闲设备为什么不能直接进入 D3
 
 假设一个 PCIe 采集卡暂时没有用户请求。若 Driver 直接调用 `pci_set_power_state(pdev, PCI_D3hot)`，设备内部 DMA 可能仍在写 Host Memory，IRQ Handler 可能继续访问 BAR，Posted Stop Write 也可能还在 Root Complex 中排队。
 
@@ -133,6 +133,7 @@ prevent new submissions
 ```
 
 ```c
+/* Suspend 先收回 DMA/IRQ 所有权，再保存状态和进入 D3hot。 */
 static int demo_runtime_suspend(struct device *dev)
 {
     struct pci_dev *pdev = to_pci_dev(dev);
@@ -169,6 +170,7 @@ power resources / link available
 ```
 
 ```c
+/* Resume 先恢复配置和私有状态，最后才重新开放业务请求。 */
 static int demo_runtime_resume(struct device *dev)
 {
     struct pci_dev *pdev = to_pci_dev(dev);
@@ -222,13 +224,13 @@ lspci -s 0000:01:00.0 -vv
 
 可用“ASPM/Runtime PM 开启与关闭”的对比缩小范围，但最终修复要落到具体状态和时间：哪个 Queue 未停、哪个 Vector 未 Mask、Link 从哪个 State 唤醒失败、T_POWER_ON/Clock 是否满足、Driver Timeout 是否覆盖设计延迟。
 
-## 十三、本篇检查点
+## 十三、常见误解与审查重点
 
 现在应当能够区分 Function D0/D3hot/D3cold、Link L0/L1/L1SS 和 Linux Runtime PM，并解释它们可以组合而不是一一对应。还应能说明 `pci_save_state()` 只保存 PCI 配置，不保存私有 Ring/Firmware。
 
 面对一次 Suspend，应能按“停止新提交 -> 排空 DMA -> Mask/同步 IRQ -> 保存私有/PCI 状态 -> 进入低功耗”描述；Resume 则先恢复访问路径和状态，最后开放请求。因为所有权尚未收回时不能断电，所以 PM 首先是数据路径问题，其次才是功耗 API。
 
-## 十四、小结：下一篇进入错误检测与复位恢复
+## 十四、小结
 
 PCIe PM 由 Function D-State、Link ASPM State 和 Linux PM Framework 协同完成。D3cold 可能让配置空间消失，ASPM/L1SS 依赖两端 Capability 与 CLKREQ#/Reference Clock，PME 只发起唤醒，真正 Resume 仍要重建设备。
 

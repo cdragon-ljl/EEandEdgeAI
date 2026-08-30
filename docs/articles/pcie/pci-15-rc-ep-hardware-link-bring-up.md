@@ -14,7 +14,7 @@ draft: false
 
 Linux 6.12 是本文的软件基线。文章不会用一份固定 DTS 冒充所有 RK356x 板卡，而是说明每一层需要什么输入、产生什么可观察结果，以及没有结果时为什么不能继续调上层 Driver。
 
-## 一、先看问题：lspci 为空意味着流程停在哪里
+## 一、lspci 为空意味着流程停在哪里
 
 `lspci` 依赖 PCI Core 已经完成配置扫描。目标 Endpoint 完全不出现，说明失败发生在 `pci_dev` 创建之前，范围包括板级供电、Reference Clock、Reset、PHY、Link Training、RC 配置访问和 BDF 路由。
 
@@ -198,13 +198,13 @@ platform driver probe
 
 不要只收集成功证据。若 Config Request 没有 Completion，需要记录 Request 是否发出、Endpoint 是否收到、返回是否被 RC/桥丢弃；负面证据必须说明工具能观察到哪一段。
 
-## 十三、本篇检查点
+## 十三、常见误解与审查重点
 
 现在应当能够解释“`lspci` 看不到设备”为什么要从供电、REFCLK、PERST#、PHY、LTSSM 和 Config ATU 排查，而不是修改功能驱动。还应能区分 Configuration Path、Memory address translation 和 DMA Translation。
 
 面对 Link Up 但无 BDF，应检查 Config Window/ATU/Bus Routing；面对 BDF 可见但 BAR 访问失败，应进入 Memory Window/ATU；面对 Driver 不绑定，再检查 modalias、ID Table 与 Probe。这就是分层 Bring-up 的核心。
 
-## 十四、小结：下一篇让 Linux 设备扮演 Endpoint
+## 十四、小结
 
 Root Complex Bring-up 是一条严格依赖链：供电、REFCLK 和 PERST# 建立硬件前提，PHY 与 LTSSM 建立 Link，Config ATU 建立 BDF 访问，Host Window 与 Memory ATU 建立 BAR 路径，PCI Core 最后创建软件对象。
 

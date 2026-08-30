@@ -1,20 +1,20 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #07 · INTx、MSI、MSI-X 与线程化中断"
-description: "从设备完成一次 DMA 后如何通知 CPU 出发，依次讲清 INTx 电平、MSI Memory Write、MSI-X Table/PBA、Linux Vector API、线程化中断和卸载同步。"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #10 · INTx、MSI、MSI-X 与线程化中断"
+description: "先定义 PCIe 中断与设备事件，再讲 INTx 电平、MSI Memory Write、MSI-X Table/PBA、Linux Vector API、DMA Completion、线程化中断和卸载同步。"
 pubDate: "2026-08-29"
 series: pcie
-order: 7
+order: 10
 tags: ["PCIe", "Interrupt", "MSI-X", "Linux 6.12"]
 draft: false
 ---
 
-前一篇只读观察了 Capability，但还没有让设备产生任何异步事件。现在考虑第一个运行问题：驱动提交一项工作后不能一直循环读取状态寄存器，那么设备完成 DMA 时，怎样让某个 CPU 及时执行对应处理函数？
+中断（Interrupt）是设备在出现完成、数据到达或错误事件时异步请求 CPU 处理的机制。它让 CPU 不必持续轮询状态寄存器；在理解中断本身之后，本篇再用 DMA Completion 说明真实设备怎样通知完成。
 
 PCIe 保留了 INTx 兼容语义，也提供 MSI 和 MSI-X。三者最后都映射成 Linux IRQ，但“设备怎样产生通知、是否共享、可以分配多少 Vector、怎样撤销事件”完全不同。若只记 `request_irq()`，就无法解释中断风暴、丢中断和多队列亲和性。
 
 本文以 Linux 6.12 为基线，先走通一个完成事件，再逐层增加 Vector 和并发。设备寄存器只使用原创教学协议，不套用 Realtek 或 NVMe 私有 Offset。
 
-## 一、先看问题：完成事件怎样从设备到达 Handler
+## 一、设备事件怎样到达 Linux Handler
 
 假设驱动把 Descriptor 交给设备，设备完成后写回 Completion，并设置 Interrupt Status。通知路径至少包含设备事件、PCIe 消息或电平语义、Root Complex/Interrupt Controller、Linux IRQ Domain 和 Driver Handler。
 
@@ -44,6 +44,7 @@ sequenceDiagram
 设备有事件时设置本地 Status 并 Assert INTx。只要中断源没有清除，电平就持续有效；Handler 返回后 CPU 会再次进入。因此正确 Handler 必须判断事件是否属于本设备、保存必要状态、清除或 Mask 中断源，再安排后续处理。
 
 ```c
+/* 共享 INTx 必须先判断事件归属；没有本设备事件时返回 IRQ_NONE。 */
 static irqreturn_t demo_intx(int irq, void *data)
 {
     struct demo_dev *dev = data;
@@ -104,6 +105,7 @@ MSI-X Entry 可以单独 Mask，这让 Driver 能按 Queue 暂停通知而不影
 Linux 6.12 使用 `pci_alloc_irq_vectors()` 或 Affinity 版本统一申请 MSI-X、MSI 和 INTx：
 
 ```c
+/* 允许 MSI-X、MSI、INTx 降级，并使用返回值作为实际 Vector 数量。 */
 int nvec;
 
 nvec = pci_alloc_irq_vectors(pdev, 1, wanted,
@@ -130,6 +132,7 @@ if (nvec < 0)
 Hard IRQ Handler 运行在原子上下文，应快速读取/Mask 必要状态、记录事件并安排后续处理，不能睡眠或执行长时间事务。如果事件处理需要可睡眠总线访问、固件命令或复杂恢复，可以使用 `request_threaded_irq()`。
 
 ```c
+/* Top Half 只确认/Mask 事件，可睡眠工作放到 Thread Function。 */
 ret = request_threaded_irq(pci_irq_vector(pdev, 0),
                            demo_irq_top,
                            demo_irq_thread,
@@ -219,13 +222,13 @@ cat /sys/bus/pci/devices/BDF/msi_bus
 
 记录时要把 Queue ID、Vector Index、Linux IRQ、CPU、Cause、Producer/Consumer 和时间戳关联。单独一张 `/proc/interrupts` 截图只能证明总次数，不能定位一次 Request 为什么超时。
 
-## 十一、本篇检查点
+## 十一、常见误解与审查重点
 
 现在应当能够从设备完成事件讲到 Linux Handler：先发布 Completion，再通过 INTx Assert 或 MSI/MSI-X Memory Write 通知 Root Complex，IRQ Domain 映射为 Linux IRQ，Handler 消费 Queue 并按协议 Clear/Unmask。
 
 还应能解释 INTx 为什么共享且要 Deassert，MSI 为什么是一笔 Posted Write，MSI-X Table/PBA 为什么适合多队列，`pci_alloc_irq_vectors()` 为什么返回实际数量，以及 `free_irq()` 为什么必须早于 `pci_free_irq_vectors()`。
 
-## 十二、小结：下一篇进入 DMA Buffer 所有权
+## 十二、小结
 
 PCIe 中断不是独立于数据路径的“回调”。它通知 CPU 某个设备状态或 Completion 可能可用，真正的数据仍在 MMIO Status 或 DMA Ring 中。INTx、MSI 和 MSI-X 的差异决定共享、Vector 数量和 Mask 方式，Linux Vector API 再把这些差异收敛为 IRQ 生命周期。
 

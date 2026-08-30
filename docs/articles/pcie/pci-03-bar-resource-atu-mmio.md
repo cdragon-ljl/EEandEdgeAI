@@ -8,13 +8,27 @@ tags: ["PCIe", "BAR", "MMIO", "Linux 6.12"]
 draft: false
 ---
 
-第 02 篇结束时，Linux 已经发现一个 Function，也知道它的 BAR0 需要多大空间。但这并不等于 CPU 已经可以访问设备：BAR 里是哪个地址域，Linux `resource` 为什么又显示另一个地址，`pci_iomap()` 返回的指针与 PCIe TLP 中的地址究竟是什么关系？
+BAR（Base Address Register）是 PCI/PCIe Function 在配置空间中声明地址窗口需求的寄存器。它告诉系统窗口类型、大小和属性，系统再分配地址；BAR 本身不是驱动可以随意填写的业务寄存器，也不是 CPU 可直接解引用的普通指针。
 
 本文用一组**代表性示例值**走完地址路径。它们只用于计算和推导，不是某块 RK356x、RTL8822CE 或 FPGA 的实测结果。设备案例在这里不重要，重要的是不同平台都必须完成同样的“声明需求、分配窗口、转换地址、匹配 BAR、解码 offset”。
 
 Linux API 与 Resource 行为固定到 Linux 6.12。读完后，应能够从 `lspci`、sysfs `resource`、Device Tree `ranges` 和控制器 ATU 配置之间建立因果关系，而不是把所有数字统称为“物理地址”。
 
-## 一、先看问题：BAR 里的地址为什么不能直接解引用
+## 一、三类地址空间与 DBI 的位置
+
+PCI/PCIe 软件模型区分三类空间：
+
+| 空间 | 主要用途 | 常见访问者 |
+| --- | --- | --- |
+| Configuration Space | 发现 Function、读取身份、BAR 和 Capability | Firmware、PCI Core、管理工具 |
+| Memory Space | MMIO、设备寄存器、共享窗口与 DMA Memory Request | CPU Driver、PCIe Device |
+| I/O Space | 兼容传统 PCI I/O Port | 传统设备与特定体系结构 |
+
+Configuration Space 在 BAR 尚未分配时即可访问；Memory/I/O Space 则要经过资源分配和 Command Decode。现代嵌入式 PCIe 设备主要使用 Memory Space，I/O Space 较少见。
+
+DBI（DesignWare Bus Interface）是 Synopsys DesignWare 类 PCIe Controller 访问自身配置与控制寄存器的一种实现接口。它属于控制器实现，不是所有 PCIe Endpoint 都统一存在的第四类标准空间。
+
+## 二、从一组代表性地址理解完整路径
 
 假设 Endpoint 的 BAR0 声明 128 KiB 空间，PCI Core 给它分配 PCI Bus Address `0x4000_0000`。嵌入式 Root Complex 又把 CPU Physical `0xF800_0000`～`0xF801_FFFF` 映射到这段 PCI 地址。驱动最终通过 `pci_iomap()` 得到内核虚拟地址，但我们不伪造这个虚拟地址的固定数值。
 
@@ -34,7 +48,7 @@ Endpoint local register  = BAR0 local base + 0x100
 
 如果把 BAR Register 中的 `0x4000_0000` 当成 CPU 可直接解引用的物理地址，访问可能打到错误外设、触发外部 Abort 或读回全 1。因为地址转换由 Host Bridge 决定，所以功能驱动必须使用 PCI Core 已经建立的 Resource 和映射 API。
 
-## 二、BAR 首先声明窗口需求与属性
+## 三、BAR 类型、大小与属性
 
 BAR 是 Base Address Register 的缩写，位于 Type 0/Type 1 Configuration Header 中。它不是业务寄存器本身，而是 Function 向系统声明“我需要一段怎样的地址窗口”；窗口内部 offset 的含义才由设备协议定义。
 
@@ -53,7 +67,7 @@ BAR0 + 0x8000 : on-device SRAM aperture
 
 PCIe 只负责把整个 BAR Window 路由到 Function，设备内部再解释 offset。不同厂商可以让同一 offset 表示完全不同的功能，因此标准 Explorer 可以安全读取 BAR Resource 属性，却不能凭别家数据手册去读写未知设备 BAR。
 
-## 三、BAR sizing 怎样得到 128 KiB
+## 四、BAR sizing 怎样得到 128 KiB
 
 设备不能仅靠一个固定字段直接报告 BAR 大小。标准枚举方法是保存原值、向地址位写全 1、读回设备实现的 Mask、屏蔽属性位，再取反加一。设备未实现的低地址位读回 0，因此 Mask 同时表达大小和对齐要求。
 
@@ -80,7 +94,7 @@ size = ~(0xFFFE_0000) + 1
 
 因为 sizing 会暂时改写配置寄存器，所以它应在功能驱动尚未并发使用设备时完成。对已经启用 DMA 的设备使用 `setpci` 写全 1，不是“只读探测”，而是可能破坏正在运行的地址 Decode。
 
-## 四、Linux Resource Tree 记录分配结果与所有权
+## 五、Linux Resource Tree 记录分配结果与所有权
 
 PCI Core 将每个 BAR 表示为 `pci_dev->resource[]` 中的 `struct resource`，保存 CPU 侧起止地址和 `IORESOURCE_MEM`、`IORESOURCE_IO`、`IORESOURCE_PREFETCH` 等属性。它还把资源插入系统 I/O 或 iomem 树，从而表达 Host Window、Bridge Window 和 Endpoint BAR 的包含关系。
 
@@ -99,31 +113,36 @@ Resource Tree 解决的是范围分配和软件所有权，不自动建立 CPU �
 
 Bridge Window 必须覆盖下游 BAR 且属性兼容。若 Endpoint BAR0 已分配 `0x4000_0000`，但上游 Bridge Memory Base/Limit 不包含该范围，配置访问仍然可能成功，因为 Configuration Request 走 BDF 路由；普通 Memory Request 却会在桥处被挡住。
 
-## 五、驱动按 Request、Map、Access 的顺序取得 BAR
+## 六、驱动按 Request、Map、Access 的顺序取得 BAR
 
 功能驱动不应拿到 `pci_dev` 后立即解引用 Resource。正常顺序是先启用设备 Decode，再验证 BAR 类型和大小，申请 Resource 所有权，最后建立映射：
 
 ```c
 int ret;
 
+/* 先启用 Memory Decode；失败时尚未取得任何 BAR 所有权。 */
 ret = pci_enable_device_mem(pdev);
 if (ret)
     return ret;
 
+/* 验证 BAR0 类型，避免把 I/O Port 当成 MMIO 使用。 */
 if (!(pci_resource_flags(pdev, 0) & IORESOURCE_MEM)) {
     ret = -ENODEV;
     goto err_disable;
 }
 
+/* 设备协议要求至少 128 KiB，长度不足时不能访问后续 Offset。 */
 if (pci_resource_len(pdev, 0) < SZ_128K) {
     ret = -ENOSPC;
     goto err_disable;
 }
 
+/* 向 Linux Resource Tree 声明 BAR0 所有权，防止并发驱动访问。 */
 ret = pci_request_region(pdev, 0, "demo-bar0");
 if (ret)
     goto err_disable;
 
+/* 所有权成功后再映射为 __iomem；映射成功仍需验证设备协议。 */
 bar0 = pci_iomap(pdev, 0, 0);
 if (!bar0) {
     ret = -ENOMEM;
@@ -132,6 +151,7 @@ if (!bar0) {
 
 return 0;
 
+/* 错误回滚严格按资源获取的相反顺序执行。 */
 err_release:
     pci_release_region(pdev, 0);
 err_disable:
@@ -143,7 +163,7 @@ return ret;
 
 也可以使用 `pci_request_regions()` 申请 Function 的全部可请求 BAR，或使用 `pcim_*` Managed API 简化释放。但 Managed API 只负责对象生命周期，不能替代停机顺序；remove 时仍要先停止用户入口、IRQ 和 DMA，再让映射与 Resource 自动释放。
 
-## 六、MMIO 必须使用 I/O Accessor
+## 七、MMIO 必须使用 I/O Accessor
 
 `pci_iomap()` 返回 `void __iomem *`，这个类型提醒代码不能像普通 RAM 一样访问。驱动使用 `readb/readw/readl/readq` 与 `writeb/writew/writel/writeq`，让编译器和体系结构应用正确的 I/O 宽度、顺序和地址空间规则。
 
@@ -158,7 +178,7 @@ status = readl(bar0 + DEMO_REG_STATUS);
 
 寄存器字节序和 side effect 由设备协议定义：Read-Clear 会在读取后清零，W1C 要写 1 清位，Doorbell 写入会触发队列消费，FIFO Port 每次读取都可能 Pop 数据。因为这些行为不是 PCIe 通用规则，所以调试程序不能把“读 BAR 前 64 字节”当成对所有设备都安全。
 
-## 七、Posted Write 为什么需要按协议 Flush
+## 八、Posted Write 为什么需要按协议 Flush
 
 PCIe Memory Write 是 Posted Request，`writel()` 返回只说明 CPU/Root Complex 接受了写入，不保证 Endpoint 已经执行。若驱动随后立即关闭时钟、释放队列或执行 Reset，仍在桥和 RC 中排队的写可能晚到，形成难以复现的状态错误。
 
@@ -179,7 +199,7 @@ sequenceDiagram
 
 MMIO Flush 也不等于 DMA Barrier。CPU 填写 Descriptor 后通知设备，通常需要 `dma_wmb()` 保证普通内存先对设备可见，再 `writel()` Doorbell。因为它们约束不同地址空间，所以一个安全 readback 不能替代 Descriptor 所有权发布。
 
-## 八、RC/EP ATU 把不同地址域连接起来
+## 九、RC/EP ATU 把不同地址域连接起来
 
 嵌入式 Root Complex 常用 Address Translation Unit（ATU）把 CPU Physical Window 转换成 PCIe Address。Device Tree `ranges` 描述 Host Bridge 的 CPU/PCI 地址关系，控制器驱动据此建立 Outbound Region，PCI Core 再在可用 PCI Window 中分配 BAR。
 
@@ -199,7 +219,7 @@ Endpoint Controller 还可能使用 Inbound ATU，把 Host 对某个 BAR 的访�
 
 因为 Configuration Request 与 Memory Request 可能使用不同 ATU Region，所以“配置空间能读”只能证明 Config Path，不足以证明 Memory Path。这个区别是嵌入式 PCIe Bring-up 中最重要的分层之一。
 
-## 九、用户映射与停止顺序决定安全边界
+## 十、用户映射与停止顺序决定安全边界
 
 把 BAR 暴露给用户 `mmap()` 之前，驱动必须限制 BAR 和子范围、检查 Page Offset/Length 溢出、选择正确缓存属性，并定义设备移除后的 Fault 行为。控制寄存器通常不适合直接映射给任意用户，因为用户可以绕过锁、状态机和权限检查。
 
@@ -207,13 +227,13 @@ remove 或 Probe 回滚的顺序从“谁还可能访问这段 MMIO”推导：�
 
 若先解除映射再停止设备，IRQ Handler 或 Worker 可能继续访问失效 `__iomem`；若先释放 Resource 再撤销用户 VMA，另一个驱动可能获得同一区域而旧进程仍可访问。因此所有权和地址映射必须与异步执行上下文一起设计。
 
-## 十、本篇检查点
+## 十一、常见误区与安全边界
 
 现在应当能够把以下五个概念严格区分：BAR Register 表示设备窗口需求和 PCI 地址编码；Linux `resource` 表示 CPU 侧范围与软件所有权；`pci_request_regions()` 声明当前驱动占用；`pci_iomap()` 建立内核 I/O 映射；ATU 在 CPU、PCI 和 Endpoint Local 地址域之间转换。
 
 还应能够解释为什么 `pci_iomap()` 成功不等于访问成功，为什么 Configuration Space 可读不等于 Memory Window 正常，以及为什么 Posted Write Flush 与 DMA Barrier 是两个不同问题。如果这些边界仍然混在一起，后续驱动 Probe、DMA 和 Reset 会变成只能记顺序的 API 清单。
 
-## 十一、小结：下一篇进入 Linux PCI Core 对象
+## 十二、小结
 
 BAR 让 Endpoint 声明窗口大小、类型和属性，PCI Core 在 Host/Bridge Window 中分配地址并建立 `struct resource`。驱动先 Enable、验证、Request，再通过 `pci_iomap()` 获得 `__iomem`，并使用 MMIO Accessor 按寄存器协议访问。
 

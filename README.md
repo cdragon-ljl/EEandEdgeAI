@@ -22,7 +22,7 @@
 | [Linux BSP 开发实战](https://cdragon-ljl.github.io/EEandEdgeAI/bsp/) | 20 | 板级 bring-up、U-Boot、内核、设备树、rootfs、服务、OTA、维护与量产 |
 | [Linux 驱动开发实战](https://cdragon-ljl.github.io/EEandEdgeAI/linux-driver/) | 28 | 设备模型、内核资源、外设总线、DMA、存储、网络、多媒体与驱动可靠性 |
 | [USB 驱动开发实战](https://cdragon-ljl.github.io/EEandEdgeAI/usb/) | 14 | USB 协议与枚举、usbcore 对象、URB/并发、HID/Bulk、Gadget、xHCI/DWC3 与 usbmon |
-| [PCIe 驱动开发实战](https://cdragon-ljl.github.io/EEandEdgeAI/pcie/) | 18 | TLP/配置/BAR、PCI Core、MSI-X/DMA/IOMMU、PM/AER、Endpoint Framework 与系统调试 |
+| [PCIe 驱动开发实战](https://cdragon-ljl.github.io/EEandEdgeAI/pcie/) | 18 | PCIe 基础、Linux PCI 架构与核心 API、rtw88、Explorer、DMA/IRQ、IOMMU/PM/AER、RC/EP |
 | [音视频开发实战](https://cdragon-ljl.github.io/EEandEdgeAI/video-audio/) | 26 | V4L2、Media Controller、ALSA/ASoC、ISP、编解码、FFmpeg、GStreamer 与流媒体 |
 | [神经网络与深度学习](https://cdragon-ljl.github.io/EEandEdgeAI/deep-learning/) | 27 | 神经网络基础、CNN、RNN/LSTM、Transformer、视觉、生成、强化学习与 ARM 部署 |
 

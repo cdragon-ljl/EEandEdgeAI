@@ -7,17 +7,17 @@ export const pcieFiles = [
   'pci-01-topology-link-tlp.md',
   'pci-02-enumeration-config-space.md',
   'pci-03-bar-resource-atu-mmio.md',
-  'pci-04-linux-pci-core-bus-dev-ops.md',
-  'pci-05-pci-driver-lifecycle-api.md',
-  'pci-06-pci-explorer-capability-bar-sysfs.md',
-  'pci-07-intx-msi-msix-threaded-irq.md',
-  'pci-08-dma-api-memory-order.md',
+  'pci-04-linux-pci-subsystem-architecture.md',
+  'pci-05-core-structures-pci-dev-driver-bus-ops.md',
+  'pci-06-core-api-driver-lifecycle.md',
+  'pci-07-rtw88-pci-driver-source-analysis.md',
+  'pci-08-pci-explorer-capability-bar-sysfs.md',
   'pci-09-dma-descriptor-ring.md',
-  'pci-10-iommu-swiotlb-ats-pasid-sva.md',
-  'pci-11-power-aspm-clkreq-runtime-pm.md',
-  'pci-12-aer-flr-hot-reset-recovery.md',
-  'pci-13-performance-tlp-mps-mrrs-credit.md',
-  'pci-14-network-driver-ring-napi-msix.md',
+  'pci-10-intx-msi-msix-threaded-irq.md',
+  'pci-11-iommu-swiotlb-ats-pasid-sva.md',
+  'pci-12-power-aspm-clkreq-runtime-pm.md',
+  'pci-13-aer-flr-hot-reset-recovery.md',
+  'pci-14-performance-tlp-mps-mrrs-credit.md',
   'pci-15-rc-ep-hardware-link-bring-up.md',
   'pci-16-linux-pci-endpoint-framework.md',
   'pci-17-multiqueue-dma-msix-throughput.md',
@@ -28,32 +28,42 @@ export const pcieLegacyRedirects = {
   'pci-01-pcie-architecture-basics': 'pci-01-topology-link-tlp',
   'pci-02-pcie-enumeration-config-space': 'pci-02-enumeration-config-space',
   'pci-03-bar-and-mmio': 'pci-03-bar-resource-atu-mmio',
-  'pci-04-linux-pci-driver-framework': 'pci-05-pci-driver-lifecycle-api',
-  'pci-05-pcie-interrupts-msi-msix': 'pci-07-intx-msi-msix-threaded-irq',
-  'pci-06-pcie-dma-data-movement': 'pci-08-dma-api-memory-order',
-  'pci-07-iommu-address-translation': 'pci-10-iommu-swiotlb-ats-pasid-sva',
-  'pci-08-pcie-device-driver-practice': 'pci-06-pci-explorer-capability-bar-sysfs',
-  'pci-09-pcie-performance-stability': 'pci-13-performance-tlp-mps-mrrs-credit',
+  'pci-04-linux-pci-driver-framework': 'pci-06-core-api-driver-lifecycle',
+  'pci-05-pcie-interrupts-msi-msix': 'pci-10-intx-msi-msix-threaded-irq',
+  'pci-06-pcie-dma-data-movement': 'pci-09-dma-descriptor-ring',
+  'pci-07-iommu-address-translation': 'pci-11-iommu-swiotlb-ats-pasid-sva',
+  'pci-08-pcie-device-driver-practice': 'pci-08-pci-explorer-capability-bar-sysfs',
+  'pci-09-pcie-performance-stability': 'pci-14-performance-tlp-mps-mrrs-credit',
   'pci-10-pcie-troubleshooting': 'pci-18-system-debug-lspci-aer-iommu',
   'pci-11-pcie-endpoint-hardware-link-bring-up': 'pci-15-rc-ep-hardware-link-bring-up',
   'pci-12-pcie-dma-ring-msix-high-throughput': 'pci-17-multiqueue-dma-msix-throughput',
+  'pci-04-linux-pci-core-bus-dev-ops': 'pci-05-core-structures-pci-dev-driver-bus-ops',
+  'pci-05-pci-driver-lifecycle-api': 'pci-06-core-api-driver-lifecycle',
+  'pci-06-pci-explorer-capability-bar-sysfs': 'pci-08-pci-explorer-capability-bar-sysfs',
+  'pci-07-intx-msi-msix-threaded-irq': 'pci-10-intx-msi-msix-threaded-irq',
+  'pci-08-dma-api-memory-order': 'pci-09-dma-descriptor-ring',
+  'pci-10-iommu-swiotlb-ats-pasid-sva': 'pci-11-iommu-swiotlb-ats-pasid-sva',
+  'pci-11-power-aspm-clkreq-runtime-pm': 'pci-12-power-aspm-clkreq-runtime-pm',
+  'pci-12-aer-flr-hot-reset-recovery': 'pci-13-aer-flr-hot-reset-recovery',
+  'pci-13-performance-tlp-mps-mrrs-credit': 'pci-14-performance-tlp-mps-mrrs-credit',
+  'pci-14-network-driver-ring-napi-msix': 'pci-07-rtw88-pci-driver-source-analysis',
 };
 
 const topicMarkers = [
-  ['Root Complex', 'LTSSM', 'TLP', 'credit'],
-  ['BDF', 'pci_scan_child_bus', 'Type 0', 'Extended Capability'],
-  ['pci_request_regions', 'pci_iomap', 'posted write', 'ATU'],
-  ['pci_bus', 'pci_dev', 'pci_ops', 'pci_bus_read_config'],
-  ['pci_register_driver', 'pci_enable_device_mem', 'pci_restore_state', 'pci_set_drvdata'],
-  ['pci_cfg_access_lock', 'sysfs', 'capability', 'BAR'],
-  ['INTx', 'MSI-X', 'pci_alloc_irq_vectors', 'request_threaded_irq'],
-  ['dma_set_mask_and_coherent', 'dma_map_sg', 'dma_wmb', 'ownership'],
-  ['producer', 'consumer', 'phase bit', 'generation'],
+  ['PCI Express', '传统 PCI', 'Root Complex', 'Endpoint', 'Link', 'Lane', 'TLP'],
+  ['Configuration Space', 'BDF', 'Type 0', 'Type 1', 'ECAM', 'pci_scan_child_bus'],
+  ['BAR', 'Configuration Space', 'Memory Space', 'I/O Space', 'ATU', 'DBI', 'pci_iomap'],
+  ['硬件适配层', 'PCI Bus Core', '功能驱动层', '用户交互层'],
+  ['pci_dev', 'pci_driver', 'pci_bus', 'pci_device_id', 'pci_ops', 'pci_host_bridge'],
+  ['pci_register_driver', 'pci_enable_device_mem', 'pci_request_regions', 'pci_iomap', 'pci_set_master', 'pci_save_state'],
+  ['rtw88', 'rtw_pci_probe', 'BAR2', 'descriptor ring', 'NAPI', 'rtw_pci_remove'],
+  ['pci_cfg_access_lock', 'Standard Capability', 'Extended Capability', 'sysfs', 'lspci'],
+  ['Direct Memory Access', 'dma_set_mask_and_coherent', 'dma_map_single', 'Descriptor', 'Producer', 'Consumer', 'Doorbell'],
+  ['INTx', 'MSI', 'MSI-X', 'pci_alloc_irq_vectors', 'request_threaded_irq'],
   ['IOMMU group', 'SWIOTLB', 'ATS', 'PRI', 'PASID', 'SVA'],
   ['D3hot', 'ASPM', 'CLKREQ#', 'runtime PM'],
   ['pci_error_handlers', 'error_detected', 'FLR', 'secondary bus reset'],
   ['MPS', 'MRRS', 'credit', 'P99'],
-  ['rtw88', 'rtw_pci_probe', 'descriptor ring', 'PCI Glue'],
   ['PERST#', 'REFCLK', 'LTSSM', 'address translation'],
   ['pci_epc_set_bar', 'configfs', 'MSI-X', 'unbind'],
   ['multi-queue', 'doorbell', 'backpressure', 'generation'],
@@ -67,28 +77,30 @@ function articleBody(markdown) {
   return markdown.replace(/^---\r?\n[\s\S]+?\r?\n---\r?\n/, '');
 }
 
-function explanatoryParagraphs(body) {
-  return body.split(/\r?\n\s*\r?\n/).filter((paragraph) => {
-    const text = paragraph.replace(/`[^`]+`/g, '').trim();
-    return text.length >= 80 && !/^(?:#|```|\||[-*] )/.test(text);
-  });
+function assertAppearsBefore(body, earlier, later, message) {
+  const earlierIndex = body.indexOf(earlier);
+  const laterIndex = body.indexOf(later);
+  assert.notEqual(earlierIndex, -1, `${message}: missing ${earlier}`);
+  assert.notEqual(laterIndex, -1, `${message}: missing ${later}`);
+  assert.ok(earlierIndex < laterIndex, `${message}: ${earlier} must appear before ${later}`);
 }
 
-function assertTeachingStructure(file, index) {
-  const markdown = readFileSync(join('docs/articles/pcie', file), 'utf8');
-  const body = articleBody(markdown);
-  const h2 = [...body.matchAll(/^## (.+)$/gm)].map((match) => match[1]);
-  const opening = body.slice(0, 1800);
-
-  assert.match(opening, /问题|为什么|如何|先看/, `${file} must open with a concrete question`);
-  assert.ok(h2.length >= 8 && h2.length <= 18, `${file} must keep a readable section count`);
-  assert.ok(explanatoryParagraphs(body).length >= 18, `${file} needs explanatory prose, not only lists`);
-  assert.ok((body.match(/因为|所以|因此|这意味着/g) ?? []).length >= 8, `${file} needs causal explanation`);
-  assert.match(body, /本篇检查点/);
-  assert.match(body, index === 17 ? /系列收尾/ : /下一篇/);
+function codeBlocks(markdown) {
+  return [...markdown.matchAll(/```([^\r\n]*)\r?\n([\s\S]*?)```/g)]
+    .map((match) => ({ language: match[1].trim().toLowerCase(), code: match[2] }));
 }
 
-test('PCIe reference rewrite publishes the approved 18-article sequence', () => {
+function assertAnnotatedCodeBlocks(file, body) {
+  const languages = new Set(['c', 'cpp', 'bash', 'sh', 'shell', 'powershell']);
+  for (const block of codeBlocks(body)) {
+    const lines = block.code.split(/\r?\n/).filter((line) => line.trim());
+    if (!languages.has(block.language) || lines.length < 6) continue;
+    assert.match(block.code, /(^|\n)\s*(?:\/\*|\/\/|\*|#)/m,
+      `${file}: non-trivial ${block.language} block needs an explanatory comment`);
+  }
+}
+
+test('PCIe publishes the Wildfire-aligned 18-article sequence', () => {
   pcieFiles.forEach((file, index) => {
     const path = join('docs/articles/pcie', file);
     assert.ok(existsSync(path), `${path} must exist`);
@@ -100,7 +112,7 @@ test('PCIe reference rewrite publishes the approved 18-article sequence', () => 
     assert.match(markdown, /^draft: false$/m);
     assert.match(markdown, new RegExp(`title: .*#${String(index + 1).padStart(2, '0')}`));
     assert.match(body, /Linux 6\.12/);
-    assert.ok((body.match(/^```mermaid$/gm) ?? []).length >= 1, `${file} must use a diagram when structure or flow benefits`);
+    assert.ok((body.match(/^```mermaid$/gm) ?? []).length >= 1, `${file} must include a useful diagram`);
     assert.ok((body.match(officialSourcePattern) ?? []).length >= 2, `${file} must cite at least two official primary sources`);
     assert.doesNotMatch(body, forbiddenTemplatePattern);
     assert.match([...body.matchAll(/^## (.+)$/gm)].at(-1)?.[1] ?? '', /小结|总结|结语/);
@@ -111,17 +123,41 @@ test('PCIe reference rewrite publishes the approved 18-article sequence', () => 
   });
 });
 
-test('PCIe teaching structure explains mechanisms before constraints', () => {
-  pcieFiles.forEach(assertTeachingStructure);
+test('PCIe concepts are introduced before dependent APIs and examples', () => {
+  const read = (file) => articleBody(readFileSync(join('docs/articles/pcie', file), 'utf8'));
+
+  const first = read(pcieFiles[0]);
+  assert.match(first.slice(0, 1200), /PCI Express（PCIe）是|PCIe 是/);
+  assertAppearsBefore(first, 'PCI Express', 'readl(', 'PCIe foundation');
+
+  const bar = read(pcieFiles[2]);
+  assertAppearsBefore(bar, 'BAR（Base Address Register）', 'pci_iomap(', 'BAR foundation');
+
+  const architecture = read(pcieFiles[3]);
+  assertAppearsBefore(architecture, '硬件适配层', 'struct pci_dev', 'PCI subsystem architecture');
+
+  const dma = read(pcieFiles[8]);
+  assertAppearsBefore(dma, 'DMA（Direct Memory Access', 'dma_map_single(', 'DMA foundation');
+  assertAppearsBefore(dma, 'Descriptor（描述符）', 'Producer', 'descriptor foundation');
+
+  const irq = read(pcieFiles[9]);
+  assertAppearsBefore(irq, '中断', 'DMA Completion', 'IRQ foundation');
 });
 
-test('PCIe legacy slugs redirect to one canonical rewritten article', () => {
+test('PCIe non-trivial code examples are annotated', () => {
+  for (const file of pcieFiles) {
+    const body = articleBody(readFileSync(join('docs/articles/pcie', file), 'utf8'));
+    assertAnnotatedCodeBlocks(file, body);
+  }
+});
+
+test('PCIe legacy slugs redirect directly to final canonical articles', () => {
   const routePath = 'src/pages/pcie/[...legacy].astro';
   assert.ok(existsSync(routePath), `${routePath} must exist`);
   const source = readFileSync(routePath, 'utf8');
 
   for (const [legacy, canonical] of Object.entries(pcieLegacyRedirects)) {
-    assert.match(source, new RegExp(`['\"]${legacy}['\"]\\s*:\\s*['\"]${canonical}['\"]`));
+    assert.match(source, new RegExp(`['"]${legacy}['"]\\s*:\\s*['"]${canonical}['"]`));
   }
   assert.match(source, /http-equiv="refresh"/);
   assert.match(source, /rel="canonical"/);

@@ -14,7 +14,7 @@ PCIe 故障最浪费时间的做法，是不确定失败层就同时修改 Devic
 
 本文以 Linux 6.12 为基线，按七类常见现象组织决策树。命令只是取证工具，真正重点是每条输出能证明什么、不能证明什么，以及怎样与 BDF、Queue、Request ID 和时间线关联。
 
-## 一、先看问题：故障第一次出现在哪一层
+## 一、故障第一次出现在哪一层
 
 一个请求从硬件到业务至少经过以下层次：
 
@@ -40,6 +40,7 @@ flowchart TD
 在修改任何参数前，记录 Kernel、Driver/Firmware、SoC/Board Revision、BDF、Topology、Link、Resource、Driver Binding、IRQ、IOMMU Group、PM Policy 和错误日志。
 
 ```bash
+# 保存环境、拓扑、配置、绑定和 IRQ 基线；BDF 替换为目标 Function。
 uname -a
 lspci -tv
 lspci -nn -s 0000:01:00.0
@@ -94,6 +95,7 @@ cat /proc/iomem
 设备目录存在、`lspci -k` 没有目标 Driver 时，检查 modalias、模块、ID Table、Blacklist 和 Probe Error：
 
 ```bash
+# 将 BDF 替换为目标设备，区分“未匹配”和“Probe 返回错误”。
 DEV=/sys/bus/pci/devices/BDF
 cat "$DEV/modalias"
 readlink "$DEV/driver"
@@ -210,7 +212,7 @@ request-trace.csv      queue, id, dma, length, state, generation, time
 
 改动一次只改变一个假设，并保留 Before/After。若关闭 ASPM后问题消失，下一步仍要定位 CLKREQ、L1SS、Wake Latency或Driver Timeout，而不是把全局关闭省电当成最终结论。
 
-## 十三、本篇检查点
+## 十三、常见误解与审查重点
 
 现在应当能够从现象选择起点：设备不可见查硬件/Link/Config，BAR失败查 Resource/ATU，Driver不绑定查Match/Probe，IRQ不增查通知路径，DMA超时查ownership和Queue，IOMMU fault查IOVA生命周期，AER恢复失败查Quiesce/Reset/Rebuild。
 

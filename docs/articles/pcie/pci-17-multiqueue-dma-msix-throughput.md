@@ -14,7 +14,7 @@ Multi-Queue 不是简单复制数组。每个 Queue 需要 Descriptor、Producer
 
 本文以 Linux 6.12 为基线，用多队列网卡与 NVMe 作对照。设备只是说明同一架构模式的不同实现，私有寄存器和 Queue 数量不构成 PCIe 通用要求。
 
-## 一、先看问题：为什么单队列先卡在 CPU 而不是 Link
+## 一、为什么单队列先卡在 CPU 而不是 Link
 
 单队列通常只有一个 Producer Lock、一个 Completion Consumer 和一个 IRQ/Poll Context。多个 CPU 提交时争用同一 Cache Line，Completion 又集中到一个 CPU，最终某个 Core 满载而 PCIe Link 仍有空闲。
 
@@ -217,13 +217,13 @@ Generation 仍不能替代硬件停止；它只防止旧 Completion被新 Reques
 
 压力场景包括均匀流、单热点 Queue、CPU Hotplug、NUMA Cross-Node、Vector不足降级、Queue Reset和 Device Reset。只测“所有 Queue 同时顺序读写”不足以验证产品路径。
 
-## 十三、本篇检查点
+## 十三、常见误解与审查重点
 
 现在应当能够把一条高吞吐路径表示为 Queue Pair、MSI-X Vector、CPU、NUMA Memory和 Device Execution Context，并解释网卡 RSS/NAPI 与 NVMe blk-mq/CQ虽 API不同，却共享同一个 multi-queue 架构模式。
 
 还应能说明 Doorbell Batch、Interrupt Moderation和 Queue Depth如何影响吞吐与P99，为什么 `backpressure` 应优先局部化，Queue Generation与 Device Generation怎样隔离不同Reset Scope。
 
-## 十四、小结：下一篇用分层证据完成系列收尾
+## 十四、小结
 
 Multi-Queue 通过分片 Ring、Vector、CPU、Memory和Lock提高并行度，但有效Queue数受设备、Vector、CPU、Upper Layer和Memory共同限制。正确设计同时处理Affinity、NUMA、Batch、Moderation、Backpressure、False Sharing和Reset Generation。
 

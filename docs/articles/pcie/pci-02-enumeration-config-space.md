@@ -14,7 +14,7 @@ PCIe 用独立的 Configuration Space 打破这个循环。Host 不需要先知�
 
 本文以 `0000:01:00.0` 为代表性位置，沿 Linux 6.12 的扫描路径回答三个问题：BDF 如何定位 Function；Type 0/Type 1 Header 如何区分 Endpoint 与 Bridge；Linux 如何从 Root Bus 递归发现整个拓扑。
 
-## 一、先回答问题：没有 BAR 地址时怎样找到设备
+## 一、Configuration Space 解决未分配地址时的发现问题
 
 配置访问与普通 Memory Request 使用不同的寻址入口。Memory Request 依赖已经分配的地址，而 Configuration Request 可以按 Bus、Device、Function 和 Register Offset 定位目标，因此枚举阶段即使 BAR 仍为零，也能读取固定格式的配置头。
 
@@ -159,6 +159,8 @@ Extended Capability 从 `0x100` 开始，Header 中包含 16-bit ID、Version �
 以下命令分别回答不同问题：
 
 ```bash
+# 先看拓扑，再把 BDF 替换为目标 Function，逐层读取身份、能力与绑定关系。
+# 这些命令只读标准配置和 sysfs，不会访问设备私有 BAR。
 lspci -tv
 lspci -nn -s 0000:01:00.0
 lspci -vv -s 0000:01:00.0
@@ -171,13 +173,13 @@ readlink /sys/bus/pci/devices/0000:01:00.0/driver
 
 若配置空间可读、BAR 也有值，但驱动 MMIO 读取全 1，说明问题很可能已经越过配置枚举，进入 Command Memory Enable、Bridge Window、Host `ranges`、ATU 或 Endpoint 内部地址解码。这样的分层判断比反复 rescan 更有信息量，因为 rescan 只重新执行软件扫描，不会修复电气或地址窗口。
 
-## 十、本篇检查点
+## 十、枚举阶段的常见误解
 
 现在应当能够解释 `0000:01:00.0` 的每一段来源，并说明它为什么不是永久设备身份。还应能从 Type 0/Type 1 Header 判断对象是 Endpoint 还是 Bridge，并描述 Primary、Secondary、Subordinate Bus Number 如何支持递归路由。
 
 面对“设备看不到”的故障，应先区分 Link、Host Config Access、BDF Routing 和 Function Response；面对“设备可见但驱动不工作”，则把调查入口移动到 Driver Match 和 `probe()`。因为证据层次不同，所以不能用增加 `pci_device_id` 来修复一个尚未枚举出的设备。
 
-## 十一、小结：下一篇把 BAR 展开成完整地址路径
+## 十一、小结
 
 PCIe 用 Configuration Space 解决了普通地址尚未分配时的设备发现问题。BDF 提供本次拓扑位置，Type 0 Header 描述 Endpoint，Type 1 Header 和 Bus Number 描述 Bridge 路由，ECAM 或控制器配置窗口把 BDF 转换成 Configuration Request。
 

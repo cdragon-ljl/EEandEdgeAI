@@ -1,20 +1,20 @@
 ---
-title: "嵌入式知识体系 · PCIe 驱动开发实战 #06 · PCI Explorer、Capability、BAR 与 sysfs"
+title: "嵌入式知识体系 · PCIe 驱动开发实战 #08 · PCI Explorer、Capability、BAR 与 sysfs"
 description: "用只读 PCI Explorer 把 BDF、配置头、标准/扩展 Capability、BAR Resource、lspci 与 sysfs 对应起来，再解释未知设备访问和配置并发边界。"
 pubDate: "2026-08-29"
 series: pcie
-order: 6
+order: 8
 tags: ["PCIe", "Explorer", "Linux 6.12"]
 draft: false
 ---
 
-前五篇已经介绍了配置空间、BAR、`pci_dev` 和 `probe()`，但读者仍可能只在概念层理解它们。现在需要一个低风险观察点：不启动 DMA、不修改设备寄存器，只把 PCI Core 已经解析出的身份、Capability 和 Resource 输出出来。
+前七篇已经介绍配置空间、BAR、核心对象/API 和真实 `rtw88` Driver。现在通过一个低风险 Explorer 把这些知识对应到 `lspci`、sysfs 和 `pci_dev`，不启动 DMA、不修改未知设备寄存器。
 
 PCI Explorer 的价值不是再造一个 `lspci`，而是把用户看到的 BDF 和配置字段，与驱动回调中的 `struct pci_dev` 关联起来。通过这一步，读者可以验证“枚举完成后，功能驱动究竟拿到了什么”，再进入 IRQ 和 DMA。
 
 本文以 Linux 6.12 和仓库配套的 `pci_explorer.c` 为基础。Explorer 只匹配显式教学 ID，只读取标准 Configuration Space 与 Linux Resource；RTL8822CE/RTL8821CE 只用于展示标准 `lspci` 格式，不读取或写入它们的私有 BAR。
 
-## 一、先看问题：lspci 的一行怎样对应到 pci_dev
+## 一、从一行 lspci 对应到 pci_dev
 
 假设系统显示下面的代表性格式：
 
@@ -27,6 +27,7 @@ PCI Explorer 的价值不是再造一个 `lspci`，而是把用户看到的 BDF 
 在 Driver `probe(struct pci_dev *pdev, ...)` 中，对应信息已经缓存为：
 
 ```c
+/* 这些字段由 PCI Core 从标准配置头缓存，不需要先映射 BAR。 */
 pdev->vendor;
 pdev->device;
 pdev->subsystem_vendor;
@@ -63,6 +64,7 @@ flowchart TD
 只读 Explorer 不调用 `pci_set_master()`、DMA Allocation、`pci_alloc_irq_vectors()` 或设备私有 BAR 写。它只需要保存 `pdev`、读取标准配置字段，并发布只读 Attribute：
 
 ```c
+/* Probe 只建立只读快照和 sysfs，不启用 Bus Master、DMA 或 IRQ。 */
 static int explorer_probe(struct pci_dev *pdev,
                           const struct pci_device_id *id)
 {
@@ -94,6 +96,7 @@ static int explorer_probe(struct pci_dev *pdev,
 虽然 `pci_dev` 已缓存身份字段，Explorer 仍可读取少量标准寄存器与缓存值对照：
 
 ```c
+/* 每次配置读取都检查返回状态，失败时不能输出未初始化值。 */
 u16 command;
 u8 header_type;
 int ret;
@@ -159,6 +162,7 @@ Explorer 若需要通用遍历所有 Extended Capability，也要防止坏 Next 
 Explorer 可以安全读取 PCI Core 保存的 BAR Resource：
 
 ```c
+/* 只读取 PCI Core 保存的 Resource，不访问未知 BAR 内部寄存器。 */
 for (int bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
     resource_size_t start = pci_resource_start(pdev, bar);
     resource_size_t len = pci_resource_len(pdev, bar);
@@ -183,6 +187,7 @@ for (int bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
 `/sys/bus/pci/devices/0000:01:00.0/` 把 Driver Model、Resource 和配置访问暴露给用户。常见属性包括 `vendor`、`device`、`class`、`resource`、`config`、`driver`、`iommu_group`、`current_link_speed` 和 `current_link_width`，具体文件取决于平台和能力。
 
 ```bash
+# 将 BDF 替换为目标 Function；以下命令只读身份、资源、绑定和 IOMMU 关系。
 DEV=/sys/bus/pci/devices/0000:01:00.0
 cat "$DEV/vendor" "$DEV/device" "$DEV/class"
 cat "$DEV/resource"
@@ -219,6 +224,7 @@ D3cold 状态下 Function 的配置空间可能不可访问。Explorer 不应为
 Explorer 的 Probe 状态很少：私有对象、Snapshot 和 sysfs Group。若 Snapshot 失败，尚未发布 Group，直接返回即可；若 Group 创建成功，remove 只需先删除 Group，再清理 Driver Data，Managed Private Object 最后释放。
 
 ```c
+/* 先撤销用户可见 sysfs 入口，再让私有对象随设备生命周期释放。 */
 static void explorer_remove(struct pci_dev *pdev)
 {
     struct explorer *exp = pci_get_drvdata(pdev);
@@ -231,13 +237,13 @@ static void explorer_remove(struct pci_dev *pdev)
 
 如果 Show Callback 可能并发执行，还要用适合的引用或同步保证 `exp` 在最后一个回调退出前有效。Managed Allocation 的释放时机通常晚于 Driver `remove()` 返回，但具体并发合同仍应在代码中明确，而不是依赖“通常不会同时发生”。
 
-## 十一、本篇检查点
+## 十一、常见误解与审查重点
 
 现在应当能够从一行 `lspci` 输出追到 `pci_dev` 的身份字段、Capability Offset、`resource[]` 和 sysfs 路径，并说明它们分别证明枚举、标准能力、资源分配和 Driver Binding 的哪一层事实。
 
 还应能够解释为什么只读配置观察不需要 Bus Master，为什么 Capability 存在不等于功能启用，为什么 BAR Resource 可以读取而 BAR 内容不能通用盲读，以及 `pci_cfg_access_lock()` 为什么要短持有并在锁外格式化。
 
-## 十二、小结：下一篇进入设备通知路径
+## 十二、小结
 
 只读 Explorer 把前四篇的抽象对象落到了可观察证据：BDF 对应 `pci_dev`，标准/扩展 Capability 通过 Linux Helper 查找，BAR 通过 Resource API 报告，sysfs 和 `lspci` 从不同角度展示同一 Function。
 
